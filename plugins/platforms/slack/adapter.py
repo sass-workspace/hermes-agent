@@ -2983,6 +2983,11 @@ class SlackAdapter(BasePlatformAdapter):
             # field is always kept as the notification/accessibility fallback.
             blocks = self._maybe_blocks(content) if len(chunks) == 1 else None
 
+            # With blocks attached, ``text`` is only the notification/screen
+            # reader fallback, so it carries cleaned prose. Without them it IS
+            # the message body and must stay untouched.
+            notify = self.notification_text(content) if blocks else ""
+
             for i, chunk in enumerate(chunks):
                 kwargs = {
                     "channel": chat_id,
@@ -2991,6 +2996,8 @@ class SlackAdapter(BasePlatformAdapter):
                 }
                 if blocks and i == 0:
                     kwargs["blocks"] = blocks
+                    if notify:
+                        kwargs["text"] = notify
                 if thread_ts:
                     kwargs["thread_ts"] = thread_ts
                     # Only broadcast the first chunk of the first reply
@@ -3191,6 +3198,12 @@ class SlackAdapter(BasePlatformAdapter):
                 blocks = self._maybe_blocks(content)
                 if blocks:
                     update_kwargs["blocks"] = blocks
+                    # Same rule as send(): with blocks present, ``text`` is the
+                    # notification/accessibility fallback, not the body. This
+                    # path carries the final message whenever streaming is on.
+                    notify = self.notification_text(content)
+                    if notify:
+                        update_kwargs["text"] = notify
             try:
                 await self._get_client(
                     chat_id, team_id=self._metadata_team_id(metadata)
@@ -4233,6 +4246,78 @@ class SlackAdapter(BasePlatformAdapter):
         except Exception:  # pragma: no cover - renderer already guards itself
             logger.debug("[Slack] block render failed; using plain text", exc_info=True)
             return None
+
+    # Slack shows the ``text`` field — not the blocks — in push notifications,
+    # desktop banners and the sidebar preview. Sending the whole converted
+    # message there means a preview that opens on "*Titel* --- ``` | Prio |"
+    # instead of on words. Keep the full prose (screen readers read this field
+    # rather than block content) and strip only the layout scaffolding.
+    _NOTIFICATION_MAX = 600
+    _NOTIFICATION_STATE_EMOJI = "🔴🟡🔵🟢"
+
+    def notification_text(self, content: str) -> str:
+        """Return a readable plain-text fallback for a Block Kit payload.
+
+        Operates on the raw markdown (before mrkdwn conversion) because the
+        scaffolding is still structurally recognisable there — once
+        :meth:`format_message` has run, tables are already column-padded inside
+        a code fence and can no longer be flattened. The cleaned result is put
+        back through ``format_message`` at the end so control-character
+        escaping stays identical to the normal path.
+
+        Returns ``""`` when nothing readable survives; callers then keep the
+        ordinary converted text rather than sending an empty notification.
+        """
+        if not content or not content.strip():
+            return ""
+
+        out: List[str] = []
+        in_fence = False
+        for raw in content.splitlines():
+            line = raw.rstrip()
+            if re.match(r"^\s*(```|~~~)", line):
+                in_fence = not in_fence
+                continue
+            if in_fence:
+                continue
+            # Divider rules carry no spoken content.
+            if re.match(r"^\s{0,3}([-*_])(?:\s*\1){2,}\s*$", line):
+                continue
+            # Table separator rows, then real rows flattened to "a · b · c".
+            if re.match(r"^\s*\|?[\s:|-]*-{2,}[\s:|-]*\|?\s*$", line) and "|" in line:
+                continue
+            if line.strip().startswith("|"):
+                cells = [c.strip() for c in line.strip().strip("|").split("|")]
+                line = " · ".join(c for c in cells if c)
+            # Headings and list markers are layout, not words.
+            line = re.sub(r"^\s{0,3}#{1,6}\s+", "", line)
+            line = re.sub(r"^\s*[-*+]\s+", "", line)
+            line = re.sub(r"^\s*\d+[.)]\s+", "", line)
+            line = re.sub(r"^\s*>\s?", "", line)
+            # A date token speaks through its own fallback text.
+            line = re.sub(r"<!date\^[^^>]*\^[^|>]*\|([^>]*)>", r"\1", line)
+            # Links: keep the label, drop the URL.
+            line = re.sub(r"(?<!!)\[([^\]]+)\]\([^()]*(?:\([^()]*\)[^()]*)*\)", r"\1", line)
+            # Emphasis and code markers are silent decoration here.
+            line = re.sub(r"\*\*([^*]+)\*\*", r"\1", line)
+            line = re.sub(r"(?<!\*)\*([^*\n]+)\*(?!\*)", r"\1", line)
+            line = re.sub(r"~~?([^~\n]+)~~?", r"\1", line)
+            line = line.replace("`", "")
+            # State emoji are redundant with a word in the same row by rule,
+            # and Slack renders them as ":red_circle:" in a preview anyway.
+            line = re.sub(
+                rf"^[{self._NOTIFICATION_STATE_EMOJI}️]+\s*", "", line
+            )
+            line = line.strip()
+            if line:
+                out.append(line)
+
+        text = "\n".join(out).strip()
+        if not text:
+            return ""
+        if len(text) > self._NOTIFICATION_MAX:
+            text = text[: self._NOTIFICATION_MAX - 1].rstrip() + "…"
+        return self.format_message(text)
 
     def format_message(self, content: str) -> str:
         """Convert standard markdown to Slack mrkdwn format.

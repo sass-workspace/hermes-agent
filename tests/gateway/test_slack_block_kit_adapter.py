@@ -185,3 +185,61 @@ class TestMarkdownBlockMode:
         assert kwargs["blocks"][0]["text"] == RICH_TABLE_MD
 
 
+class TestNotificationFallback:
+    """With blocks attached, ``text`` is the notification / screen-reader
+    fallback rather than the body, so it carries readable prose instead of the
+    whole converted message — whose first ~150 characters are layout markers
+    and a column-padded table. Without blocks it IS the body and must stay
+    byte-for-byte untouched.
+    """
+
+    @pytest.mark.asyncio
+    async def test_blocks_present_text_is_cleaned_prose(self):
+        adapter, client = _make_adapter({"rich_blocks": True})
+        await adapter.send("C1", RICH_TABLE_MD)
+        kwargs = client.chat_postMessage.await_args.kwargs
+        assert kwargs["blocks"], "precondition: this content renders as blocks"
+        text = kwargs["text"]
+        assert text
+        assert "|" not in text
+        assert "```" not in text
+        assert "---" not in text
+        assert "Hermes" in text and "table" in text
+
+    @pytest.mark.asyncio
+    async def test_no_blocks_text_is_the_untouched_body(self):
+        adapter, client = _make_adapter()  # rich_blocks off
+        await adapter.send("C1", RICH_TABLE_MD)
+        kwargs = client.chat_postMessage.await_args.kwargs
+        assert "blocks" not in kwargs
+        assert kwargs["text"] == adapter.format_message(RICH_TABLE_MD)
+
+    @pytest.mark.asyncio
+    async def test_finalize_edit_also_gets_the_fallback(self):
+        adapter, client = _make_adapter({"rich_blocks": True})
+        await adapter.edit_message("C1", "111.222", RICH_TABLE_MD, finalize=True)
+        kwargs = client.chat_update.await_args.kwargs
+        assert kwargs["blocks"]
+        assert "|" not in kwargs["text"]
+        assert "Hermes" in kwargs["text"]
+
+    @pytest.mark.asyncio
+    async def test_intermediate_edit_keeps_the_full_text(self):
+        """Streaming flushes carry the body; only the final edit has blocks."""
+        adapter, client = _make_adapter({"rich_blocks": True})
+        await adapter.edit_message("C1", "111.222", RICH_TABLE_MD, finalize=False)
+        kwargs = client.chat_update.await_args.kwargs
+        assert "blocks" not in kwargs
+        assert kwargs["text"] == adapter.format_message(RICH_TABLE_MD)
+
+    @pytest.mark.asyncio
+    async def test_unsummarisable_content_keeps_the_converted_text(self):
+        """Nothing readable survives -> never send an empty notification."""
+        adapter, client = _make_adapter({"rich_blocks": True})
+        fence_only = "```\nx = 1\n```"
+        assert adapter.notification_text(fence_only) == ""
+        await adapter.send("C1", fence_only)
+        kwargs = client.chat_postMessage.await_args.kwargs
+        assert kwargs["text"] == adapter.format_message(fence_only)
+
+
