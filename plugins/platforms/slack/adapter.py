@@ -4652,6 +4652,83 @@ class SlackAdapter(BasePlatformAdapter):
         )
         return name
 
+    # Generous cap for forwarded source messages: a forwarded client request
+    # must survive whole (the legacy 500-char unfurl cap is for link
+    # previews, not first-class input), while still bounding a pathological
+    # payload.
+    _SHARED_MESSAGE_MAX_CHARS = 8000
+
+    async def _render_shared_message_attachment(
+        self, att: dict, team_id: str = "", existing_text: str = ""
+    ) -> str:
+        """Render one forwarded/shared Slack message as quoted source content.
+
+        Slack's "Forward message" composer delivers the shared source message
+        in the ``attachments`` array with both ``is_share`` and
+        ``is_msg_unfurl`` set, carrying the source text (``text``/``blocks``),
+        author (``author_name``/``author_subname``/``author_id``), source
+        channel (``channel_id``), timestamp (``ts``), permalink (``from_url``)
+        and ``files``. The rendered section keeps provenance explicit — the
+        source author is quoted evidence, never merged with the forwarding
+        user — and contains no Slack UI chrome.
+
+        Returns "" when the source text is already present in
+        ``existing_text`` (e.g. quoted via the composer as
+        ``rich_text_quote`` blocks and already extracted), so the same
+        content is never rendered twice. Files are not rendered here; they
+        ride the normal file-download path.
+        """
+        author = str(att.get("author_name") or att.get("author_subname") or "").strip()
+        source_channel_id = str(att.get("channel_id") or "")
+        source_ts = str(att.get("ts") or "")
+        permalink = str(att.get("from_url") or "")
+        body = str(att.get("text") or "").strip()
+        if not body:
+            body = _extract_text_from_slack_blocks(att.get("blocks") or []).strip()
+        if body and existing_text and body in existing_text:
+            return ""
+        files = [f for f in (att.get("files") or []) if isinstance(f, dict)]
+
+        channel_label = source_channel_id
+        if source_channel_id:
+            resolved = await self._resolve_channel_name(
+                source_channel_id,
+                team_id=str(att.get("channel_team") or team_id or ""),
+            )
+            if resolved and resolved != source_channel_id:
+                channel_label = f"#{resolved} ({source_channel_id})"
+
+        header_bits = ["Forwarded message"]
+        if author:
+            header_bits.append(f"from: {author}")
+        if channel_label:
+            header_bits.append(f"channel: {channel_label}")
+        if source_ts:
+            header_bits.append(f"ts: {source_ts}")
+        if files:
+            header_bits.append(f"{len(files)} attached file(s)")
+        header = "[" + " · ".join(header_bits) + "]"
+
+        if not body and not files:
+            return (
+                header
+                + "\n[Forwarded message could not be read: the Slack payload "
+                "contained no source text and no files]"
+            )
+
+        if len(body) > self._SHARED_MESSAGE_MAX_CHARS:
+            body = (
+                body[: self._SHARED_MESSAGE_MAX_CHARS - 16].rstrip()
+                + "\n… [truncated]"
+            )
+
+        parts = [header]
+        if body:
+            parts.append("\n".join("> " + line for line in body.splitlines()))
+        if permalink:
+            parts.append(f"[source: {permalink}]")
+        return "\n".join(parts)
+
     async def _humanize_user_mentions(
         self, text: str, chat_id: str = "", team_id: str = ""
     ) -> str:
@@ -6184,71 +6261,6 @@ class SlackAdapter(BasePlatformAdapter):
             if blocks_payload:
                 text = (text.strip() + "\n\n" + blocks_payload).strip()
 
-        # Extract link unfurls / rich attachments (e.g. Notion previews).
-        # Slack places unfurled link previews in the ``attachments`` array with
-        # fields like title, title_link/from_url, text, footer, and fallback.
-        # Without reading these, the agent never sees shared link previews.
-        slack_attachments = event.get("attachments") or []
-        if slack_attachments:
-            att_parts: list[str] = []
-            for att in slack_attachments:
-                att_title = att.get("title", "")
-                att_url = att.get("title_link", "") or att.get("from_url", "")
-                att_text = att.get("text", "")
-                att_footer = att.get("footer", "")
-                att_fallback = att.get("fallback", "")
-
-                # Skip message-type attachments (e.g. Slack bot messages with
-                # is_msg_unfurl) to avoid echoing our own content.
-                if att.get("is_msg_unfurl"):
-                    continue
-
-                # Build a readable representation.
-                if att_title and att_url:
-                    header = f"📎 [{att_title}]({att_url})"
-                elif att_title:
-                    header = f"📎 {att_title}"
-                elif att_url:
-                    header = f"📎 {att_url}"
-                else:
-                    header = None
-
-                # Prefer preview text, fall back to fallback description.
-                body = att_text or att_fallback or ""
-                if body:
-                    body = body.strip()
-                    if len(body) > 500:
-                        body = body[:497] + "..."
-
-                if header and body:
-                    section = f"{header}\n   {body}"
-                elif header:
-                    section = header
-                elif body:
-                    section = f"📎 {body}"
-                else:
-                    continue
-
-                # Deduplicate only when the fully rendered section is already
-                # present. The shared URL often already appears in the user's
-                # message text, and skipping on URL/title alone would hide the
-                # preview body we actually want the agent to see.
-                if section in text:
-                    continue
-
-                if att_footer:
-                    section = f"{section}\n   _{att_footer}_"
-
-                att_parts.append(section)
-
-            if att_parts:
-                attachment_text = "\n\n".join(att_parts)
-                text = (text.strip() + "\n\n" + attachment_text).strip()
-                logger.debug(
-                    "Slack: appended %d link unfurl(s) to message text",
-                    len(att_parts),
-                )
-
         channel_id = event.get("channel", "")
         ts = event.get("ts", "")
         outer_team_id = self._event_team_id(event, payload)
@@ -6320,6 +6332,92 @@ class SlackAdapter(BasePlatformAdapter):
                     channel_id,
                 )
                 return
+
+        # Attachment processing (link unfurls and forwarded/shared source
+        # messages) runs AFTER the early auth reject above: rendering a
+        # forwarded message resolves its source channel name via
+        # conversations.info, and unauthorized senders must not trigger
+        # API lookups.
+        # Extract link unfurls / rich attachments (e.g. Notion previews).
+        # Slack places unfurled link previews in the ``attachments`` array with
+        # fields like title, title_link/from_url, text, footer, and fallback.
+        # Without reading these, the agent never sees shared link previews.
+        slack_attachments = event.get("attachments") or []
+        if slack_attachments:
+            attachments_team_id = self._event_team_id(event, payload)
+            att_parts: list[str] = []
+            for att in slack_attachments:
+                # Forwarded/shared Slack messages (the "Forward message"
+                # composer) arrive as message-type attachments carrying BOTH
+                # ``is_share`` and ``is_msg_unfurl``, so they must be handled
+                # before the unfurl-echo skip below — which used to drop the
+                # entire forwarded source message (outer instruction arrived,
+                # client request did not). Their files are collected into the
+                # normal file-download path further down.
+                if att.get("is_share"):
+                    section = await self._render_shared_message_attachment(
+                        att, team_id=attachments_team_id, existing_text=text
+                    )
+                    if section and section not in text:
+                        att_parts.append(section)
+                    continue
+
+                att_title = att.get("title", "")
+                att_url = att.get("title_link", "") or att.get("from_url", "")
+                att_text = att.get("text", "")
+                att_footer = att.get("footer", "")
+                att_fallback = att.get("fallback", "")
+
+                # Skip message-type attachments (e.g. Slack bot messages with
+                # is_msg_unfurl) to avoid echoing our own content.
+                if att.get("is_msg_unfurl"):
+                    continue
+
+                # Build a readable representation.
+                if att_title and att_url:
+                    header = f"📎 [{att_title}]({att_url})"
+                elif att_title:
+                    header = f"📎 {att_title}"
+                elif att_url:
+                    header = f"📎 {att_url}"
+                else:
+                    header = None
+
+                # Prefer preview text, fall back to fallback description.
+                body = att_text or att_fallback or ""
+                if body:
+                    body = body.strip()
+                    if len(body) > 500:
+                        body = body[:497] + "..."
+
+                if header and body:
+                    section = f"{header}\n   {body}"
+                elif header:
+                    section = header
+                elif body:
+                    section = f"📎 {body}"
+                else:
+                    continue
+
+                # Deduplicate only when the fully rendered section is already
+                # present. The shared URL often already appears in the user's
+                # message text, and skipping on URL/title alone would hide the
+                # preview body we actually want the agent to see.
+                if section in text:
+                    continue
+
+                if att_footer:
+                    section = f"{section}\n   _{att_footer}_"
+
+                att_parts.append(section)
+
+            if att_parts:
+                attachment_text = "\n\n".join(att_parts)
+                text = (text.strip() + "\n\n" + attachment_text).strip()
+                logger.debug(
+                    "Slack: appended %d link unfurl(s) to message text",
+                    len(att_parts),
+                )
 
         # Build thread_ts for session keying.
         # In channels: fall back to ts so each top-level @mention starts a
@@ -6703,6 +6801,31 @@ class SlackAdapter(BasePlatformAdapter):
         media_types = list(thread_root_media_types)
         attachment_notices: List[str] = []
         files = event.get("files", [])
+        # Files belonging to forwarded/shared source messages
+        # (``attachments[].files`` on ``is_share`` attachments) ride the same
+        # download path as the trigger message's own files, in attachment
+        # order, so forwarded screenshots reach the agent without re-upload.
+        # They deliberately download with the OUTER event's team token (not
+        # the share's ``channel_team``): the event was delivered to this
+        # workspace, so its token is the one authorized to read the file —
+        # including Slack Connect files hosted in the source workspace, where
+        # this install may hold no token at all (verified live 2026-08-25).
+        seen_file_ids = {f.get("id") for f in files if isinstance(f, dict) and f.get("id")}
+        shared_files = []
+        for att in event.get("attachments") or []:
+            if not att.get("is_share"):
+                continue
+            for f in att.get("files") or []:
+                if not isinstance(f, dict):
+                    continue
+                file_id = f.get("id")
+                if file_id and file_id in seen_file_ids:
+                    continue
+                if file_id:
+                    seen_file_ids.add(file_id)
+                shared_files.append(f)
+        if shared_files:
+            files = list(files) + shared_files
         for f in files:
             # Slack Connect channels return stub file objects with
             # file_access="check_file_info" and no URL fields. We must
