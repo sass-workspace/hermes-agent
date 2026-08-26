@@ -600,10 +600,17 @@ def _parse_fields(inner: List[str], mrkdwn_fn) -> Optional[Block]:
         text = ln.strip()
         if not text:
             continue
+        # A code fence inside a fields grid cannot be represented — decline
+        # so the whole inner content renders through the normal pipeline
+        # with its fence intact.
+        if _FENCE_RE.match(ln):
+            return None
         if ":" in text:
             label, _, value = text.partition(":")
             label, value = label.strip(), value.strip()
-            if label and value:
+            # Not a label when the colon belongs to a URL scheme ("https://…"
+            # as the whole line) — that line is verbatim content.
+            if label and value and not value.startswith("//"):
                 text = f"*{label}*\n{value}"
         rendered = mrkdwn_fn(text)
         if len(rendered) > MAX_FIELD_TEXT:
@@ -627,6 +634,11 @@ def _parse_menu(inner: List[str], mrkdwn_fn) -> Optional[Block]:
     options: List[Dict[str, Any]] = []
     text_lines: List[str] = []
     for ln in inner:
+        # Fenced content cannot be represented in a section+overflow shape,
+        # and a fenced ``option:`` example must never become live — decline
+        # and let the normal pipeline render everything literally.
+        if _FENCE_RE.match(ln):
+            return None
         m = _CARD_KEY_RE.match(ln.strip())
         if m and m.group(1) == "option":
             bm = _BUTTON_RE.match(m.group(3).strip())
@@ -635,10 +647,12 @@ def _parse_menu(inner: List[str], mrkdwn_fn) -> Optional[Block]:
             label = bm.group(1).strip()
             reply_text = bm.group(2)
             url = bm.group(3)
-            if not label or "[" in label or "]" in label:
+            # Over-limit invalidates, never truncates (canon): a shortened
+            # label could misdescribe the instruction it triggers.
+            if not label or "[" in label or "]" in label or len(label) > MAX_OPTION_LABEL:
                 return None
             opt: Dict[str, Any] = {
-                "text": {"type": "plain_text", "text": label[:MAX_OPTION_LABEL]}
+                "text": {"type": "plain_text", "text": label}
             }
             if reply_text is not None:
                 value = reply_text.strip()
@@ -728,21 +742,24 @@ def strip_directives(content: str) -> str:
                 if km:
                     key, rest = km.group(1), km.group(3).strip()
                     if key in ("button", "option"):
-                        # A reply instruction is an instruction, not prose —
-                        # drop it even when the line is malformed and would
-                        # not have produced a button/option.
-                        if "reply:" in rest:
-                            continue
+                        # The LABEL is prose and survives; the reply
+                        # instruction and the URL are control data and never
+                        # reach the preview. A malformed reply line drops
+                        # whole (its instruction cannot be separated safely).
                         bm = _BUTTON_RE.match(rest)
-                        if bm and bm.group(2) is not None:
-                            continue
                         if bm:
-                            out.append(bm.group(1).strip())  # URL: label only
+                            out.append(bm.group(1).strip())
+                            continue
+                        if "reply:" in rest:
                             continue
                     if key == "image":
                         im = _BUTTON_RE.match(rest)
-                        if im:
-                            continue  # an image is not preview prose
+                        if im and im.group(3) and im.group(3).lower().startswith(
+                            ("http://", "https://")
+                        ):
+                            continue  # a rendered image is not preview prose
+                        # Non-image content (e.g. a refused scheme) stays
+                        # body text in the rich path — mirror that here.
                     out.append(rest)
                     continue
             out.append(line)

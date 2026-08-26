@@ -170,9 +170,11 @@ class TestStripDirectives:
         assert "title:" not in stripped
         assert "TUR-445 · Render-Test" in stripped
         assert "Kurzer Body" in stripped
-        # URL button label survives; reply button (instruction) disappears.
+        # Labels survive as prose; instructions and URLs never do.
         assert "Jira öffnen" in stripped
-        assert "Freigeben" not in stripped
+        assert "Freigeben" in stripped
+        assert "ja, TUR-445 freigeben" not in stripped
+        assert "elbdev.atlassian.net" not in stripped
 
     def test_footer_prefix_dropped_text_kept(self):
         assert strip_directives("-# Quelle: X") == "Quelle: X"
@@ -283,6 +285,27 @@ class TestFieldsDirective:
         blocks = render_blocks(":::fields\nnur ein Wert\n:::")
         assert blocks[0]["fields"][0]["text"] == "nur ein Wert"
 
+    def test_label_value_keeps_url_colons_intact(self):
+        blocks = render_blocks(
+            ":::fields\nTicket: https://elbdev.atlassian.net/browse/TUR-445\n:::"
+        )
+        assert "https://elbdev" in blocks[0]["fields"][0]["text"]
+
+    def test_bare_url_line_stays_verbatim(self):
+        def fake_mrkdwn(s):
+            return s
+
+        blocks = render_blocks(
+            ":::fields\nhttps://example.com/x\n:::", mrkdwn_fn=fake_mrkdwn
+        )
+        assert blocks[0]["fields"][0]["text"] == "https://example.com/x"
+
+    def test_fence_inside_fields_declines_to_literal(self):
+        md = ":::fields\n```\nDatum: 26. August 2026\n```\n:::"
+        blocks = render_blocks(md)
+        assert not any(b.get("fields") for b in blocks)
+        assert "Datum" in str(blocks)  # fence content survives literally
+
     def test_eleven_fields_fall_back(self):
         inner = "\n".join(f"K{i}: v" for i in range(11))
         blocks = render_blocks(f":::fields\n{inner}\n:::")
@@ -329,6 +352,25 @@ class TestMenuDirective:
         blocks = render_blocks(f":::menu\nText\noption: [A](reply: {big})\n:::")
         assert not any(b.get("accessory") for b in blocks)
 
+    def test_oversize_option_label_invalidates_never_truncates(self):
+        label = "L" * 80
+        blocks = render_blocks(f":::menu\nText\noption: [{label}](reply: tu es)\n:::")
+        assert not any(b.get("accessory") for b in blocks)
+        assert label in str(blocks)  # survives as plain content
+
+    def test_fenced_option_inside_menu_never_goes_live(self):
+        md = ":::menu\nText\n```\noption: [Secret](reply: do secret)\n```\n:::"
+        blocks = render_blocks(md)
+        assert not any(b.get("accessory") for b in blocks)
+        assert "do secret" in str(blocks)  # literal fenced example, not a control
+
+    def test_menu_fallback_keeps_labels_in_stripped_text(self):
+        # 6 options -> menu declines; the preview still names the choices.
+        opts = "\n".join(f"option: [O{i}](reply: tu {i})" for i in range(6))
+        stripped = strip_directives(f":::menu\nText\n{opts}\n:::")
+        assert "O0" in stripped and "O5" in stripped
+        assert "tu 0" not in stripped
+
 
 class TestCardImage:
     def test_image_key_becomes_hero_image(self):
@@ -354,6 +396,13 @@ class TestCardImage:
         stripped = strip_directives(md)
         assert "example.com" not in stripped
         assert "Body." in stripped
+
+    def test_refused_image_scheme_stays_prose_in_both_paths(self):
+        # The rich path keeps a non-http image line as body text; the
+        # stripped fallback must mirror that, not silently drop it.
+        md = ":::card\ntitle: T\nimage: [x](file:///etc/passwd)\n:::"
+        stripped = strip_directives(md)
+        assert "[x](file:///etc/passwd)" in stripped
 
 
 class TestSanitizeNewTypes:

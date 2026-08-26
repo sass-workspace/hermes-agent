@@ -155,6 +155,46 @@ class TestAgentReplyButton:
         assert any("In Prüfung" in str(b) for b in update_kwargs["blocks"])
 
     @pytest.mark.asyncio
+    async def test_menu_same_option_double_select_dispatches_once(self):
+        adapter, client = _make_adapter()
+        body, action = _click_body(value="")
+        action.pop("value", None)
+        action["action_id"] = "hermes_agent_menu"
+        action["selected_option"] = {
+            "text": {"type": "plain_text", "text": "A"},
+            "value": "tu a",
+        }
+        await adapter._handle_agent_reply_action(AsyncMock(), body, action)
+        await adapter._handle_agent_reply_action(AsyncMock(), body, action)
+        assert adapter.handle_message.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_menu_distinct_options_both_dispatch(self):
+        adapter, client = _make_adapter()
+        body, a1 = _click_body(value="")
+        a1.pop("value", None)
+        a1["action_id"] = "hermes_agent_menu"
+        a1["selected_option"] = {"text": {"type": "plain_text", "text": "A"}, "value": "tu a"}
+        import copy
+
+        a2 = copy.deepcopy(a1)
+        a2["selected_option"]["value"] = "tu b"
+        await adapter._handle_agent_reply_action(AsyncMock(), body, a1)
+        await adapter._handle_agent_reply_action(AsyncMock(), body, a2)
+        assert adapter.handle_message.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_unauthorized_menu_selection_ignored(self):
+        adapter, client = _make_adapter(authorized=False)
+        body, action = _click_body(value="")
+        action.pop("value", None)
+        action["action_id"] = "hermes_agent_menu"
+        action["selected_option"] = {"text": {"type": "plain_text", "text": "A"}, "value": "tu a"}
+        await adapter._handle_agent_reply_action(AsyncMock(), body, action)
+        adapter.handle_message.assert_not_awaited()
+        client.chat_update.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_url_menu_option_dispatches_nothing(self):
         adapter, client = _make_adapter()
         body, action = _click_body(value="")
