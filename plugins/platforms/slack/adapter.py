@@ -17,6 +17,7 @@ import os
 import re
 import time
 import unicodedata
+import weakref
 from dataclasses import dataclass, field
 from typing import Awaitable, Callable, ClassVar, Dict, Optional, Any, Tuple, List
 
@@ -886,6 +887,53 @@ _SOCKET_CLIENT_TASK_ATTRS = (
 _SOCKET_TASK_CANCEL_TIMEOUT_S = 3.0
 
 
+def _socket_client_tasks(client: Any) -> list:
+    """Live asyncio tasks currently bound to a SocketModeClient's attrs."""
+    tasks = []
+    for attr in _SOCKET_CLIENT_TASK_ATTRS:
+        task = getattr(client, attr, None)
+        if task is None or not callable(getattr(task, "cancel", None)):
+            continue
+        if callable(getattr(task, "done", None)) and task.done():
+            continue
+        tasks.append(task)
+    return tasks
+
+
+async def _quiesce_socket_client(client: Any, rounds: int = 5) -> bool:
+    """Cancel a client's tasks REPEATEDLY until none are alive (bounded).
+
+    A single snapshot-cancel is not enough: the SDK's
+    ``monitor_current_session()`` calls ``connect()`` on its own, and
+    ``connect()`` REBINDS the client's task attributes on the way — so a task
+    cancelled from a snapshot can already have a freshly created replacement
+    (slackapi/python-slack-sdk#1913). Against a closed aiohttp session that
+    replacement is a zombie: ``connect()`` retries "Session is closed" forever
+    on a ~ping_interval cadence (observed live: thousands of tracebacks over
+    one night). Re-snapshotting after every cancel round beats the moving
+    target; the bound keeps shutdown from hanging on a pathological client.
+
+    Returns True when the client ended quiescent.
+    """
+    for _ in range(max(1, rounds)):
+        tasks = _socket_client_tasks(client)
+        if not tasks:
+            return True
+        await _cancel_socket_tasks(tasks)
+        # One loop turn so a just-cancelled monitor's replacement (if any)
+        # lands in the attrs before the next snapshot.
+        await asyncio.sleep(0)
+    remaining = _socket_client_tasks(client)
+    if remaining:
+        logger.warning(
+            "[Slack] Socket Mode client still has %d live task(s) after "
+            "%d cancel rounds — giving up on quiescence for this round",
+            len(remaining), rounds,
+        )
+        return False
+    return True
+
+
 async def _cancel_socket_tasks(tasks: Any) -> None:
     """Cancel Socket Mode tasks and wait, with a bound, for them to finish.
 
@@ -1271,6 +1319,12 @@ class SlackAdapter(BasePlatformAdapter):
         # Allow at least this long after (re)connect before treating a missing
         # first ping/pong as evidence of a wedged transport.
         self._socket_first_ping_grace_s = 60.0
+        # Every SocketModeClient this adapter ever started. The watchdog sweeps
+        # it for ORPHANS — a client that is no longer self._handler's but still
+        # has live tasks (the #1913 rebind race can strand one mid-teardown,
+        # where it retries "Session is closed" forever). WeakSet: a quiesced,
+        # unreferenced client leaves on its own.
+        self._spawned_socket_clients: "weakref.WeakSet[Any]" = weakref.WeakSet()
 
     async def _close_workspace_clients(self) -> None:
         """Close any Slack SDK clients that may own aiohttp sessions."""
@@ -1415,6 +1469,9 @@ class SlackAdapter(BasePlatformAdapter):
             self._app, self._app_token, proxy=self._proxy_url
         )
         _apply_slack_proxy(self._handler.client, self._proxy_url)
+        client = getattr(self._handler, "client", None)
+        if client is not None:
+            self._spawned_socket_clients.add(client)
 
         task = asyncio.create_task(self._handler.start_async())
         self._socket_mode_task = task
@@ -1457,6 +1514,13 @@ class SlackAdapter(BasePlatformAdapter):
                     e,
                     exc_info=True,
                 )
+
+        # close_async() closed the shared aiohttp session; any task the
+        # snapshot cancel above missed (a monitor-recreated receiver) is now a
+        # zombie that would retry "Session is closed" forever. Re-snapshot and
+        # cancel until the client is actually quiet.
+        if client is not None:
+            await _quiesce_socket_client(client)
 
     async def _socket_transport_connected(self) -> Optional[bool]:
         """Best-effort check of current Socket Mode transport state."""
@@ -1559,6 +1623,14 @@ class SlackAdapter(BasePlatformAdapter):
                     # but the client keeps retrying; ping/pong staleness catches
                     # that wedged-zombie case that the bool check above misses.
                     await self._restart_socket_mode("ping/pong stale")
+
+                # Orphan sweep: a client that is no longer the current
+                # handler's but still runs tasks slipped through a teardown
+                # (the #1913 rebind race) — against its closed session those
+                # tasks retry "Session is closed" forever. Health checks above
+                # only ever see the CURRENT client, so orphans are invisible
+                # to them by construction; this sweep is their only reaper.
+                await self._sweep_orphaned_socket_clients()
             except asyncio.CancelledError:
                 raise
             except Exception:  # pragma: no cover - defensive logging
@@ -1566,6 +1638,31 @@ class SlackAdapter(BasePlatformAdapter):
                     "[Slack] Socket Mode watchdog iteration failed; continuing",
                     exc_info=True,
                 )
+
+    async def _sweep_orphaned_socket_clients(self) -> None:
+        """Quiesce every spawned SocketModeClient that is not the current one.
+
+        Zombie shape this ends (observed live, 2026-08-25/26: thousands of
+        ``slack_bolt.AsyncApp: Failed to connect (error: Session is closed);
+        Retrying...`` lines over one night): an old client orphaned by the
+        teardown/rebind race keeps its connect-retry loop against a session
+        that can never reopen. The current client is deliberately excluded —
+        its health belongs to the transport/ping checks.
+        """
+        current = getattr(self._handler, "client", None)
+        for client in list(self._spawned_socket_clients):
+            if client is current:
+                continue
+            tasks = _socket_client_tasks(client)
+            if not tasks:
+                self._spawned_socket_clients.discard(client)
+                continue
+            logger.warning(
+                "[Slack] Reaping %d task(s) of an orphaned Socket Mode "
+                "client (stale session; would retry forever)", len(tasks),
+            )
+            if await _quiesce_socket_client(client):
+                self._spawned_socket_clients.discard(client)
 
     def _on_socket_watchdog_done(self, task: asyncio.Task) -> None:
         if task is not self._socket_watchdog_task:
