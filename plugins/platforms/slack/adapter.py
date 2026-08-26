@@ -60,9 +60,9 @@ from gateway.platforms.base import (
 )
 
 try:  # sibling module; support both package and flat plugin-dir import
-    from .block_kit import render_blocks, sanitize_blocks
+    from .block_kit import render_blocks, sanitize_blocks, strip_directives
 except ImportError:  # pragma: no cover - plugin loaded outside package context
-    from block_kit import render_blocks, sanitize_blocks  # type: ignore
+    from block_kit import render_blocks, sanitize_blocks, strip_directives  # type: ignore
 
 
 logger = logging.getLogger(__name__)
@@ -1161,6 +1161,10 @@ class SlackAdapter(BasePlatformAdapter):
         # is later edited.
         self._processed_message_ts: Dict[str, float] = {}
         self._PROCESSED_MESSAGE_TS_MAX = 5000
+        # One dispatch per (team, message ts, instruction) for agent-authored
+        # reply buttons — a double-click must never run an instruction twice.
+        self._agent_reply_dispatched: set = set()
+        self._AGENT_REPLY_DISPATCHED_MAX = 2000
         # Track pending approval message_ts → resolved flag to prevent
         # double-clicks on approval buttons. Bounded: an approval prompt the
         # user never clicks would otherwise leak its entry forever. Keys may
@@ -2328,6 +2332,12 @@ class SlackAdapter(BasePlatformAdapter):
                 self._app.action(_action_id)(self._handle_slash_confirm_action)
 
             self._app.action("hermes_feedback")(self._handle_feedback_action)
+
+            # Agent-authored reply buttons (block_kit ``:::card`` directive):
+            # one fixed action_id; the value carries the instruction text and
+            # the handler dispatches it into the thread's session as the
+            # clicker's message (see _handle_agent_reply_action).
+            self._app.action("hermes_agent_reply")(self._handle_agent_reply_action)
 
             # Register Block Kit action handlers for clarify buttons
             # (interactive multiple-choice prompts; see tools/clarify_gateway.py).
@@ -4271,6 +4281,11 @@ class SlackAdapter(BasePlatformAdapter):
         if not content or not content.strip():
             return ""
 
+        # Directive scaffolding is layout, not words (same rationale as the
+        # heading/list stripping below); format_message would strip it too,
+        # but the line passes here must never see ":::" markers.
+        content = strip_directives(content)
+
         out: List[str] = []
         in_fence = False
         for raw in content.splitlines():
@@ -4334,6 +4349,14 @@ class SlackAdapter(BasePlatformAdapter):
         """
         if not content:
             return content
+
+        # Structured-output directive scaffolding (:::card fences, "-# "
+        # footers, card key prefixes) is Block-Kit-only syntax: the renderer
+        # consumes it, so any content reaching THIS mrkdwn conversion — the
+        # plain-text fallback, streaming partial edits, notification text —
+        # must shed the markers while keeping their content. Fenced examples
+        # survive untouched; the helper never raises.
+        content = strip_directives(content)
 
         content = _wrap_markdown_tables(content)
 
@@ -7712,6 +7735,130 @@ class SlackAdapter(BasePlatformAdapter):
                 "Failed to resolve slash-confirm from Slack button: %s",
                 exc,
                 exc_info=True,
+            )
+
+    async def _handle_agent_reply_action(self, ack, body, action) -> None:
+        """Handle a click on an agent-authored reply button (``:::card``).
+
+        Contract (the load-bearing decision of the button feature): a click
+        means exactly ONE thing — the authorized clicker's instruction text,
+        dispatched into the thread's session through the SAME inbound path a
+        typed reply takes (session keying, steer/queue, guards, audit all
+        included). There is deliberately no direct click→action wiring: a
+        button that mutated a business system without passing through the
+        session would bypass the profile's pre/post tool-call hooks.
+
+        Idempotency: one dispatch per (message, instruction) for the process
+        lifetime — a double-click updates nothing and dispatches nothing.
+        """
+        await ack()
+        try:
+            value = (action.get("value") or "").strip()
+            message = body.get("message", {}) or {}
+            msg_ts = message.get("ts", "")
+            thread_ts = message.get("thread_ts") or msg_ts
+            channel_id = (body.get("channel", {}) or {}).get("id", "")
+            team_id = (body.get("team", {}) or {}).get("id", "") or body.get(
+                "team_id", ""
+            )
+            user = body.get("user", {}) or {}
+            user_id = user.get("id", "")
+            user_name = user.get("name", "unknown")
+            if not value or not channel_id or not msg_ts:
+                return
+
+            if not self._is_interactive_user_authorized(
+                user_id,
+                channel_id=channel_id,
+                user_name=user_name,
+                team_id=team_id,
+            ):
+                logger.warning(
+                    "[Slack] Unauthorized agent-reply click by %s (%s) - ignoring",
+                    user_name,
+                    user_id,
+                )
+                return
+
+            click_key = (team_id, msg_ts, value)
+            if click_key in self._agent_reply_dispatched:
+                logger.debug(
+                    "[Slack] Duplicate agent-reply click ignored: %s", click_key
+                )
+                return
+            self._agent_reply_dispatched.add(click_key)
+            if len(self._agent_reply_dispatched) > self._AGENT_REPLY_DISPATCHED_MAX:
+                self._agent_reply_dispatched = set(
+                    list(self._agent_reply_dispatched)[
+                        -self._AGENT_REPLY_DISPATCHED_MAX // 2 :
+                    ]
+                )
+
+            # Mark the click on the card itself (chat.update, appended context
+            # line) so the actor is visible in the thread without an extra
+            # notification-generating post. Best-effort: a failed update never
+            # blocks the dispatch.
+            label = ((action.get("text") or {}).get("text") or "Auswahl").strip()
+            try:
+                blocks = list(message.get("blocks") or [])
+                blocks.append(
+                    {
+                        "type": "context",
+                        "elements": [
+                            {
+                                "type": "mrkdwn",
+                                "text": f"→ *{label}* · von {user_name}",
+                            }
+                        ],
+                    }
+                )
+                client = self._get_client(channel_id, team_id=team_id)
+                await client.chat_update(
+                    channel=channel_id,
+                    ts=msg_ts,
+                    text=message.get("text") or f"→ {label} · von {user_name}",
+                    blocks=sanitize_blocks(blocks),
+                )
+            except Exception:
+                logger.debug(
+                    "[Slack] agent-reply card update failed; dispatching anyway",
+                    exc_info=True,
+                )
+
+            # Dispatch the instruction through the normal inbound pipeline.
+            channel_name = await self._resolve_channel_name(
+                channel_id, team_id=team_id
+            )
+            user_display = await self._resolve_user_name(
+                user_id, chat_id=channel_id, team_id=team_id
+            )
+            source = self.build_source(
+                chat_id=channel_id,
+                chat_name=channel_name,
+                chat_type="dm" if channel_id.startswith("D") else "group",
+                user_id=user_id,
+                user_name=user_display or user_name,
+                thread_id=thread_ts,
+                scope_id=str(team_id) if team_id else None,
+            )
+            event = MessageEvent(
+                text=value,
+                message_type=MessageType.TEXT,
+                source=source,
+                raw_message=body,
+                message_id=str(action.get("action_ts") or msg_ts),
+                reply_to_message_id=thread_ts if thread_ts != msg_ts else None,
+                metadata={
+                    "slack_team_id": team_id,
+                    "slack_channel_id": channel_id,
+                    "slack_thread_ts": thread_ts,
+                    "slack_agent_reply_button": label,
+                },
+            )
+            await self.handle_message(event)
+        except Exception:
+            logger.error(
+                "[Slack] agent-reply action handler failed", exc_info=True
             )
 
     async def _handle_feedback_action(self, ack, body, action) -> None:

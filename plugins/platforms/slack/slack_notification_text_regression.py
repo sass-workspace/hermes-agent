@@ -36,7 +36,18 @@ def _load_functions():
     """
     src = ADAPTER.read_text(encoding="utf-8")
     tree = ast.parse(src)
-    ns: dict = {"re": re, "unicodedata": unicodedata, "List": list}
+    # block_kit is a dependency-free sibling (pure text transforms), so unlike
+    # the adapter it can simply be imported for the helpers the lifted
+    # functions call.
+    sys.path.insert(0, str(ADAPTER.parent))
+    from block_kit import strip_directives  # noqa: E402
+
+    ns: dict = {
+        "re": re,
+        "unicodedata": unicodedata,
+        "List": list,
+        "strip_directives": strip_directives,
+    }
 
     for node in tree.body:
         if isinstance(node, (ast.FunctionDef, ast.Assign)):
@@ -156,6 +167,25 @@ check("a capped preview is marked as truncated", long_out.endswith("…"), repr(
 # Escaping must match the normal path — this string goes to Slack as mrkdwn.
 esc = notify("Vergleich a < b & c > d")
 check("control characters are escaped", "&lt;" in esc and "&amp;" in esc, repr(esc))
+
+# Structured-output directives (:::card / :::report / "-# " footers) are
+# Block-Kit-only scaffolding: the preview shows their words, never their
+# markers, and a reply button's instruction never leaks into the preview.
+card = notify(
+    ":::card\n"
+    "title: TUR-445 · Antwort\n"
+    "subtitle: Entwurf — nicht gesendet\n"
+    "Kurzer Entwurfstext für den Kunden.\n"
+    "button: [Jira öffnen](https://elbdev.atlassian.net/browse/TUR-445)\n"
+    "button: [Freigeben](reply: ja, TUR-445 freigeben)\n"
+    ":::\n"
+    "-# Quelle: Asana Story"
+)
+check("directive markers never reach the preview", ":::" not in card, repr(card))
+check("card key prefixes are dropped", "title:" not in card and "button:" not in card, repr(card))
+check("card content survives", "TUR-445 · Antwort" in card and "Entwurfstext" in card, repr(card))
+check("footer text survives without its prefix", "Quelle: Asana Story" in card and "-#" not in card, repr(card))
+check("reply-button instruction never leaks", "freigeben" not in card, repr(card))
 
 print()
 print("%d passed, %d failed" % (PASS, FAIL))

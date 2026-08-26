@@ -39,6 +39,22 @@ MAX_HEADER_TEXT = 150
 MAX_TABLE_ROWS = 100
 MAX_TABLE_COLS = 20
 MAX_TABLE_CHARS = 10000  # aggregate across all cells
+# Card block limits (https://docs.slack.dev/reference/block-kit/blocks/card-block;
+# body cap verified live: chat.postMessage rejects >200 with invalid_blocks)
+MAX_CARD_TITLE = 150
+MAX_CARD_BODY = 200
+MAX_CARD_BUTTONS = 3
+MAX_BUTTON_VALUE = 2000
+# Carousel block limits (https://docs.slack.dev/reference/block-kit/blocks/carousel-block)
+MAX_CAROUSEL_CARDS = 10
+MIN_CAROUSEL_CARDS = 2  # ours, not Slack's: a one-card carousel is worse than a card
+# markdown block: 12k cumulative across all markdown blocks in one payload
+MAX_MARKDOWN_TEXT = 12000
+# Renderer headroom below the cumulative cap (mirrors the adapter's margin)
+MARKDOWN_SEGMENT_MAX = 11500
+# Fixed action_id for agent-authored reply buttons; the adapter registers ONE
+# Bolt handler for it and derives the session from the interaction payload.
+AGENT_REPLY_ACTION_ID = "hermes_agent_reply"
 
 Block = Dict[str, Any]
 
@@ -53,6 +69,15 @@ _ORDERED_RE = re.compile(r"^(\s*)(\d+)[.)]\s+(.*)$")
 _BULLET_RE = re.compile(r"^(\s*)[-*+]\s+(.*)$")
 _QUOTE_RE = re.compile(r"^\s{0,3}>\s?(.*)$")
 _TABLE_SEP_RE = re.compile(r"^\s*\|?\s*:?-{1,}:?\s*(\|\s*:?-{1,}:?\s*)+\|?\s*$")
+# Structured-output directives (agent-authored, deliberately explicit):
+#   :::card / :::report / :::carousel … :::   and   "-# " footer lines.
+# A ``` code fence always wins over these — canon documents the syntax inside
+# fences, and fenced examples must never trigger a live block.
+_DIRECTIVE_OPEN_RE = re.compile(r"^\s{0,3}:::\s*(card|report|carousel)\s*$")
+_DIRECTIVE_CLOSE_RE = re.compile(r"^\s{0,3}:::\s*$")
+_FOOTER_RE = re.compile(r"^\s{0,3}-#\s+(.+)$")
+_CARD_KEY_RE = re.compile(r"^(title|subtitle|button)(?:\((primary|danger)\))?:\s*(.+)$")
+_BUTTON_RE = re.compile(r"^\[([^\]]+)\]\(\s*(?:reply:\s*(.+?)|(\S+))\s*\)$")
 
 
 def _is_list_line(line: str) -> bool:
@@ -361,6 +386,253 @@ def _render_table(rows: List[str]) -> str:
 
 
 # ----------------------------------------------------------------------------
+# Structured-output directives — card / carousel / report / "-#" footer
+# ----------------------------------------------------------------------------
+
+
+def _scan_directive(lines: List[str], start: int) -> Optional[Tuple[List[str], int]]:
+    """Find the matching ``:::`` close for the directive opened at ``start``.
+
+    Directives nest (a carousel contains cards): an inner ``:::name`` line
+    increases depth, a bare ``:::`` closes the innermost. A ``` code fence
+    inside the directive is opaque — fenced ``:::`` lines are literal example
+    text and never alter the depth. Returns the inner lines and the index just
+    past the closing fence, or ``None`` when the fence is never closed (caller
+    then treats the marker as plain text).
+    """
+    depth = 1
+    i = start + 1
+    n = len(lines)
+    code_marker: Optional[str] = None
+    while i < n:
+        fm = _FENCE_RE.match(lines[i])
+        if code_marker is not None:
+            if lines[i].lstrip().startswith(code_marker):
+                code_marker = None
+            i += 1
+            continue
+        if fm:
+            code_marker = fm.group(1)
+            i += 1
+            continue
+        if _DIRECTIVE_OPEN_RE.match(lines[i]):
+            depth += 1
+        elif _DIRECTIVE_CLOSE_RE.match(lines[i]):
+            depth -= 1
+            if depth == 0:
+                return lines[start + 1 : i], i + 1
+        i += 1
+    return None
+
+
+def _parse_button(spec: str, style: Optional[str], index: int) -> Optional[Dict[str, Any]]:
+    """Parse one ``button:`` line body into a Block Kit button element.
+
+    Two schemes: ``[Label](https://…)`` → URL button (no handler needed) and
+    ``[Label](reply: <instruction>)`` → agent reply button whose value the
+    gateway dispatches into the thread's session as the clicker's instruction.
+    """
+    m = _BUTTON_RE.match(spec)
+    if not m:
+        return None
+    label = m.group(1).strip()
+    reply_text = m.group(2)
+    url = m.group(3)
+    if not label or "[" in label or "]" in label:
+        return None
+    btn: Dict[str, Any] = {
+        "type": "button",
+        "text": {"type": "plain_text", "text": label[:75], "emoji": True},
+    }
+    if style in ("primary", "danger"):
+        btn["style"] = style
+    if reply_text is not None:
+        text = reply_text.strip()
+        # A truncated instruction is a DIFFERENT instruction — decline rather
+        # than clamp, so the card falls back and nothing mutated is dispatched.
+        if not text or len(text) > MAX_BUTTON_VALUE:
+            return None
+        btn["action_id"] = AGENT_REPLY_ACTION_ID
+        btn["value"] = text
+    elif url and url.lower().startswith(("http://", "https://")):
+        btn["url"] = url
+        btn["action_id"] = f"hermes_card_url_{index}"
+    else:
+        return None
+    return btn
+
+
+def _parse_card(inner: List[str], mrkdwn_fn) -> Optional[Block]:
+    """Build a ``card`` block from the lines inside ``:::card … :::``.
+
+    ``title:`` / ``subtitle:`` (first occurrence each) and ``button:`` /
+    ``button(primary):`` / ``button(danger):`` are key lines; everything else
+    is the body, converted to mrkdwn. Returns ``None`` when the content does
+    not fit a card (no title AND no body, or any field over its documented
+    cap — the body cap is 200 chars, verified live) so the caller renders the
+    inner content through the normal pipeline instead of truncating it.
+    """
+    title: Optional[str] = None
+    subtitle: Optional[str] = None
+    buttons: List[Dict[str, Any]] = []
+    body_lines: List[str] = []
+    code_marker: Optional[str] = None
+    for ln in inner:
+        # Key lines are only live OUTSIDE ``` fences — a fenced example of a
+        # button line must never become a real button.
+        if code_marker is not None:
+            body_lines.append(ln)
+            if ln.lstrip().startswith(code_marker):
+                code_marker = None
+            continue
+        fmatch = _FENCE_RE.match(ln)
+        if fmatch:
+            code_marker = fmatch.group(1)
+            body_lines.append(ln)
+            continue
+        m = _CARD_KEY_RE.match(ln.strip())
+        if m:
+            key, style, rest = m.group(1), m.group(2), m.group(3).strip()
+            if key == "title" and title is None:
+                title = rest
+                continue
+            if key == "subtitle" and subtitle is None:
+                subtitle = rest
+                continue
+            if key == "button":
+                btn = _parse_button(rest, style, len(buttons))
+                if btn is not None:
+                    buttons.append(btn)
+                    continue
+        body_lines.append(ln)
+    body_md = "\n".join(body_lines).strip()
+    body = mrkdwn_fn(body_md) if body_md else ""
+    if not title and not body:
+        return None
+    if len(buttons) > MAX_CARD_BUTTONS:
+        return None
+    for value, cap in ((title, MAX_CARD_TITLE), (subtitle, MAX_CARD_TITLE), (body, MAX_CARD_BODY)):
+        if value and len(value) > cap:
+            return None
+    block: Block = {"type": "card"}
+    if title:
+        block["title"] = {"type": "mrkdwn", "text": title, "verbatim": False}
+    if subtitle:
+        block["subtitle"] = {"type": "mrkdwn", "text": subtitle, "verbatim": False}
+    if body:
+        block["body"] = {"type": "mrkdwn", "text": body, "verbatim": False}
+    if buttons:
+        block["actions"] = buttons
+    return block
+
+
+def _parse_carousel(inner: List[str], mrkdwn_fn) -> Optional[Block]:
+    """Build a ``carousel`` block from ``:::card`` fences inside a carousel.
+
+    Only card directives (and blank lines) are allowed inside; any other
+    content, an unparseable card, or a count outside [2, 10] returns ``None``
+    and the caller renders the inner content normally (cards then appear
+    vertically — never lost).
+    """
+    cards: List[Block] = []
+    i = 0
+    n = len(inner)
+    while i < n:
+        line = inner[i]
+        if not line.strip():
+            i += 1
+            continue
+        m = _DIRECTIVE_OPEN_RE.match(line)
+        if not m or m.group(1) != "card":
+            return None
+        scan = _scan_directive(inner, i)
+        if scan is None:
+            return None
+        card_lines, i = scan
+        card = _parse_card(card_lines, mrkdwn_fn)
+        if card is None:
+            return None
+        cards.append(card)
+    if not (MIN_CAROUSEL_CARDS <= len(cards) <= MAX_CAROUSEL_CARDS):
+        return None
+    return {"type": "carousel", "elements": cards}
+
+
+def _report_block(inner: List[str]) -> Optional[Block]:
+    """Build a native ``markdown`` block from ``:::report`` content.
+
+    The text is passed RAW (standard markdown, not mrkdwn) — Slack renders
+    headings, tables, task lists and syntax-highlighted code natively.
+    Declines over the cumulative-cap headroom so the caller falls back to the
+    normal pipeline instead of losing a long review.
+    """
+    text = "\n".join(inner).strip()
+    if not text or len(text) > MARKDOWN_SEGMENT_MAX:
+        return None
+    return {"type": "markdown", "text": text}
+
+
+def strip_directives(content: str) -> str:
+    """Remove directive scaffolding for plain-text / notification fallbacks.
+
+    Marker lines (``:::card``, ``:::``) disappear, ``-# `` and card key
+    prefixes are dropped while their content survives (a reply button keeps
+    only its label — the ``reply:`` target is an instruction, not prose), and
+    anything inside a ``` code fence is left untouched, so documented examples
+    stay verbatim. Never raises; returns the input on any unexpected shape.
+    """
+    if not content or (":::" not in content and "-#" not in content):
+        return content
+    try:
+        out: List[str] = []
+        code_marker: Optional[str] = None
+        depth = 0
+        for line in content.splitlines():
+            # Matched-fence tracking (not a blind toggle): a four-backtick
+            # fence containing a three-backtick example must stay one opaque
+            # region, closed only by its own marker.
+            if code_marker is not None:
+                out.append(line)
+                if line.lstrip().startswith(code_marker):
+                    code_marker = None
+                continue
+            fmatch = _FENCE_RE.match(line)
+            if fmatch:
+                code_marker = fmatch.group(1)
+                out.append(line)
+                continue
+            if _DIRECTIVE_OPEN_RE.match(line):
+                depth += 1
+                continue
+            if _DIRECTIVE_CLOSE_RE.match(line) and depth > 0:
+                depth -= 1
+                continue
+            fm = _FOOTER_RE.match(line)
+            if fm:
+                out.append(fm.group(1))
+                continue
+            if depth > 0:
+                km = _CARD_KEY_RE.match(line.strip())
+                if km:
+                    key, rest = km.group(1), km.group(3).strip()
+                    if key == "button":
+                        # A reply instruction is an instruction, not prose —
+                        # drop it even when the line is malformed and would
+                        # not have produced a button.
+                        if "reply:" in rest:
+                            continue
+                        bm = _BUTTON_RE.match(rest)
+                        if bm and bm.group(2) is not None:
+                            continue
+                    out.append(rest)
+                    continue
+            out.append(line)
+        return "\n".join(out)
+    except Exception:
+        return content
+
+
+# ----------------------------------------------------------------------------
 # Public entry point
 # ----------------------------------------------------------------------------
 
@@ -427,6 +699,65 @@ def render_blocks(
                     i += 1
                 i += 1  # consume closing fence
                 blocks.append(_preformatted_block("\n".join(body)))
+                continue
+
+            # Structured-output directive (:::card / :::report / :::carousel).
+            # Runs after the code-fence branch on purpose: a fenced example of
+            # the syntax must stay literal. A directive that cannot be
+            # expressed as its block (unclosed, over a hard cap, malformed)
+            # falls back to rendering its inner content through this same
+            # pipeline — a directive may restyle content, never lose it.
+            dm = _DIRECTIVE_OPEN_RE.match(line)
+            if dm:
+                scan = _scan_directive(lines, i)
+                if scan is None:
+                    para.append(line)
+                    i += 1
+                    continue
+                inner, i = scan
+                flush_para()
+                name = dm.group(1)
+                produced: Optional[Block] = None
+                if name == "card":
+                    produced = _parse_card(inner, fmt)
+                elif name == "carousel":
+                    produced = _parse_carousel(inner, fmt)
+                elif name == "report":
+                    produced = _report_block(inner)
+                if produced is not None:
+                    blocks.append(produced)
+                else:
+                    inner_text = "\n".join(inner)
+                    sub = render_blocks(inner_text, mrkdwn_fn=mrkdwn_fn)
+                    if sub:
+                        blocks.extend(sub)
+                    elif inner_text.strip():
+                        # Recursive rendering declined (e.g. too many blocks)
+                        # while the outer message still renders — the inner
+                        # content must survive as plain sections rather than
+                        # vanish (a directive restyles, never loses).
+                        for chunk in _split_text(fmt(inner_text), MAX_SECTION_TEXT):
+                            blocks.append(_section_block(chunk))
+                continue
+
+            # "-# " footer line(s) → one context block (small gray metadata).
+            fm = _FOOTER_RE.match(line)
+            if fm:
+                flush_para()
+                footer_lines = [fm.group(1)]
+                i += 1
+                while i < n:
+                    nxt = _FOOTER_RE.match(lines[i])
+                    if not nxt:
+                        break
+                    footer_lines.append(nxt.group(1))
+                    i += 1
+                blocks.append(
+                    {
+                        "type": "context",
+                        "elements": [{"type": "mrkdwn", "text": fmt("\n".join(footer_lines))}],
+                    }
+                )
                 continue
 
             # Horizontal rule → divider
@@ -617,6 +948,7 @@ def sanitize_blocks(blocks: Optional[List[Block]]) -> Optional[List[Block]]:
         return None
     try:
         out: List[Block] = []
+        markdown_budget = MAX_MARKDOWN_TEXT
         for block in blocks:
             if not isinstance(block, dict) or not block.get("type"):
                 continue
@@ -661,6 +993,52 @@ def sanitize_blocks(blocks: Optional[List[Block]]) -> Optional[List[Block]]:
             elif btype in ("rich_text", "actions", "context_actions"):
                 if not block.get("elements"):
                     continue
+
+            elif btype == "markdown":
+                # 12k cap is CUMULATIVE across all markdown blocks per payload.
+                txt = block.get("text") or ""
+                if not txt.strip() or markdown_budget <= 0:
+                    continue
+                if len(txt) > markdown_budget:
+                    block = dict(block)
+                    block["text"] = txt[: markdown_budget - 1].rstrip() + "…"
+                markdown_budget -= len(block.get("text") or "")
+
+            elif btype == "card":
+                # At least one of title/body/actions/hero_image must remain;
+                # clamp the documented field caps (body 200 verified live).
+                block = dict(block)
+                for field, cap in (
+                    ("title", MAX_CARD_TITLE),
+                    ("subtitle", MAX_CARD_TITLE),
+                    ("body", MAX_CARD_BODY),
+                    ("subtext", MAX_CARD_BODY),
+                ):
+                    obj = block.get(field)
+                    if isinstance(obj, dict):
+                        if not (obj.get("text") or "").strip():
+                            block.pop(field, None)
+                        else:
+                            block[field] = _clamp_text_obj(obj, cap)
+                if isinstance(block.get("actions"), list):
+                    block["actions"] = block["actions"][:MAX_CARD_BUTTONS]
+                    if not block["actions"]:
+                        block.pop("actions", None)
+                if not any(
+                    block.get(f) for f in ("title", "body", "actions", "hero_image")
+                ):
+                    continue
+
+            elif btype == "carousel":
+                elements = [
+                    el
+                    for el in (block.get("elements") or [])
+                    if isinstance(el, dict) and el.get("type") == "card"
+                ]
+                if not elements:
+                    continue
+                block = dict(block)
+                block["elements"] = elements[:MAX_CAROUSEL_CARDS]
 
             elif btype == "table":
                 if not block.get("rows"):

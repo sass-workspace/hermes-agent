@@ -78,6 +78,37 @@ class TestSendMessageBlocks:
 
 
     @pytest.mark.asyncio
+    async def test_card_directive_renders_card_and_clean_text_fallback(self):
+        adapter, client = _make_adapter({"rich_blocks": True})
+        md = (
+            ":::card\n"
+            "title: TUR-445 · Antwort\n"
+            "Kurzer Entwurf.\n"
+            "button: [Freigeben](reply: ja, TUR-445 freigeben)\n"
+            ":::\n"
+            "-# Quelle: Asana Story"
+        )
+        await adapter.send("C1", md)
+        kwargs = client.chat_postMessage.await_args.kwargs
+        assert [b["type"] for b in kwargs["blocks"]] == ["card", "context"]
+        assert kwargs["blocks"][0]["actions"][0]["action_id"] == "hermes_agent_reply"
+        # The text fallback (notifications, old clients) sheds the scaffolding
+        # and never carries the reply instruction.
+        assert ":::" not in kwargs["text"]
+        assert "title:" not in kwargs["text"]
+        assert "freigeben" not in kwargs["text"]
+        assert "TUR-445" in kwargs["text"]
+
+    @pytest.mark.asyncio
+    async def test_directives_without_rich_blocks_send_clean_plain_text(self):
+        adapter, client = _make_adapter()  # rich_blocks off
+        await adapter.send("C1", ":::card\ntitle: T\nBody.\n:::")
+        kwargs = client.chat_postMessage.await_args.kwargs
+        assert "blocks" not in kwargs
+        assert ":::" not in kwargs["text"]
+        assert "Body." in kwargs["text"]
+
+    @pytest.mark.asyncio
     async def test_feedback_buttons_opt_in_appended_to_blocks(self):
         adapter, client = _make_adapter({"rich_blocks": True, "feedback_buttons": True})
 
