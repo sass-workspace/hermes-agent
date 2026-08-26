@@ -55,6 +55,14 @@ MARKDOWN_SEGMENT_MAX = 11500
 # Fixed action_id for agent-authored reply buttons; the adapter registers ONE
 # Bolt handler for it and derives the session from the interaction payload.
 AGENT_REPLY_ACTION_ID = "hermes_agent_reply"
+# Same contract for overflow-menu selections (the handler reads
+# ``selected_option.value`` instead of ``value``; semantics are identical).
+AGENT_MENU_ACTION_ID = "hermes_agent_menu"
+# Section-block structural limits (https://docs.slack.dev/reference/block-kit)
+MAX_SECTION_FIELDS = 10
+MAX_FIELD_TEXT = 2000
+MAX_OVERFLOW_OPTIONS = 5
+MAX_OPTION_LABEL = 75
 
 Block = Dict[str, Any]
 
@@ -73,10 +81,12 @@ _TABLE_SEP_RE = re.compile(r"^\s*\|?\s*:?-{1,}:?\s*(\|\s*:?-{1,}:?\s*)+\|?\s*$")
 #   :::card / :::report / :::carousel … :::   and   "-# " footer lines.
 # A ``` code fence always wins over these — canon documents the syntax inside
 # fences, and fenced examples must never trigger a live block.
-_DIRECTIVE_OPEN_RE = re.compile(r"^\s{0,3}:::\s*(card|report|carousel)\s*$")
+_DIRECTIVE_OPEN_RE = re.compile(r"^\s{0,3}:::\s*(card|report|carousel|fields|menu)\s*$")
 _DIRECTIVE_CLOSE_RE = re.compile(r"^\s{0,3}:::\s*$")
 _FOOTER_RE = re.compile(r"^\s{0,3}-#\s+(.+)$")
-_CARD_KEY_RE = re.compile(r"^(title|subtitle|button)(?:\((primary|danger)\))?:\s*(.+)$")
+_CARD_KEY_RE = re.compile(
+    r"^(title|subtitle|button|image|option)(?:\((primary|danger)\))?:\s*(.+)$"
+)
 _BUTTON_RE = re.compile(r"^\[([^\]]+)\]\(\s*(?:reply:\s*(.+?)|(\S+))\s*\)$")
 
 
@@ -474,6 +484,7 @@ def _parse_card(inner: List[str], mrkdwn_fn) -> Optional[Block]:
     """
     title: Optional[str] = None
     subtitle: Optional[str] = None
+    hero_image: Optional[Dict[str, Any]] = None
     buttons: List[Dict[str, Any]] = []
     body_lines: List[str] = []
     code_marker: Optional[str] = None
@@ -499,6 +510,17 @@ def _parse_card(inner: List[str], mrkdwn_fn) -> Optional[Block]:
             if key == "subtitle" and subtitle is None:
                 subtitle = rest
                 continue
+            if key == "image" and hero_image is None:
+                im = _BUTTON_RE.match(rest)
+                if im and im.group(3) and im.group(3).lower().startswith(
+                    ("http://", "https://")
+                ):
+                    hero_image = {
+                        "type": "image",
+                        "image_url": im.group(3),
+                        "alt_text": im.group(1).strip()[:2000] or "Bild",
+                    }
+                    continue
             if key == "button":
                 btn = _parse_button(rest, style, len(buttons))
                 if btn is not None:
@@ -520,6 +542,8 @@ def _parse_card(inner: List[str], mrkdwn_fn) -> Optional[Block]:
         if value and len(value) > cap:
             return None
     block: Block = {"type": "card"}
+    if hero_image:
+        block["hero_image"] = hero_image
     if title:
         block["title"] = {"type": "mrkdwn", "text": title, "verbatim": False}
     if subtitle:
@@ -561,6 +585,86 @@ def _parse_carousel(inner: List[str], mrkdwn_fn) -> Optional[Block]:
     if not (MIN_CAROUSEL_CARDS <= len(cards) <= MAX_CAROUSEL_CARDS):
         return None
     return {"type": "carousel", "elements": cards}
+
+
+def _parse_fields(inner: List[str], mrkdwn_fn) -> Optional[Block]:
+    """Build a two-column key-value ``section`` (fields grid) from ``:::fields``.
+
+    Each non-empty line is one field. ``Label: value`` renders as a bold
+    label over its value (the Block Kit template convention); a line without
+    a colon is used verbatim. Declines (``None`` → normal pipeline) on zero
+    or more than 10 fields, or any field over the 2000-char cap.
+    """
+    fields: List[Dict[str, Any]] = []
+    for ln in inner:
+        text = ln.strip()
+        if not text:
+            continue
+        if ":" in text:
+            label, _, value = text.partition(":")
+            label, value = label.strip(), value.strip()
+            if label and value:
+                text = f"*{label}*\n{value}"
+        rendered = mrkdwn_fn(text)
+        if len(rendered) > MAX_FIELD_TEXT:
+            return None
+        fields.append({"type": "mrkdwn", "text": rendered})
+    if not fields or len(fields) > MAX_SECTION_FIELDS:
+        return None
+    return {"type": "section", "fields": fields}
+
+
+def _parse_menu(inner: List[str], mrkdwn_fn) -> Optional[Block]:
+    """Build a ``section`` with an overflow-menu accessory from ``:::menu``.
+
+    ``option:`` lines use the button grammar — ``[Label](reply: …)`` becomes a
+    selectable instruction (same click-means-instruction contract as reply
+    buttons, dispatched via ``AGENT_MENU_ACTION_ID``), ``[Label](https://…)``
+    opens the URL. Every other line is the section text. Declines on zero
+    text, zero valid options, more than 5 options, or an over-limit value —
+    a truncated instruction would be a different instruction.
+    """
+    options: List[Dict[str, Any]] = []
+    text_lines: List[str] = []
+    for ln in inner:
+        m = _CARD_KEY_RE.match(ln.strip())
+        if m and m.group(1) == "option":
+            bm = _BUTTON_RE.match(m.group(3).strip())
+            if bm is None:
+                return None
+            label = bm.group(1).strip()
+            reply_text = bm.group(2)
+            url = bm.group(3)
+            if not label or "[" in label or "]" in label:
+                return None
+            opt: Dict[str, Any] = {
+                "text": {"type": "plain_text", "text": label[:MAX_OPTION_LABEL]}
+            }
+            if reply_text is not None:
+                value = reply_text.strip()
+                if not value or len(value) > MAX_BUTTON_VALUE:
+                    return None
+                opt["value"] = value
+            elif url and url.lower().startswith(("http://", "https://")):
+                opt["url"] = url
+                opt["value"] = f"url_{len(options)}"
+            else:
+                return None
+            options.append(opt)
+        else:
+            text_lines.append(ln)
+    text_md = "\n".join(text_lines).strip()
+    if not text_md or not options or len(options) > MAX_OVERFLOW_OPTIONS:
+        return None
+    return {
+        "type": "section",
+        "text": {"type": "mrkdwn", "text": mrkdwn_fn(text_md)},
+        "accessory": {
+            "type": "overflow",
+            "action_id": AGENT_MENU_ACTION_ID,
+            "options": options,
+        },
+    }
 
 
 def _report_block(inner: List[str], remaining: int = MARKDOWN_SEGMENT_MAX) -> Optional[Block]:
@@ -623,15 +727,22 @@ def strip_directives(content: str) -> str:
                 km = _CARD_KEY_RE.match(line.strip())
                 if km:
                     key, rest = km.group(1), km.group(3).strip()
-                    if key == "button":
+                    if key in ("button", "option"):
                         # A reply instruction is an instruction, not prose —
                         # drop it even when the line is malformed and would
-                        # not have produced a button.
+                        # not have produced a button/option.
                         if "reply:" in rest:
                             continue
                         bm = _BUTTON_RE.match(rest)
                         if bm and bm.group(2) is not None:
                             continue
+                        if bm:
+                            out.append(bm.group(1).strip())  # URL: label only
+                            continue
+                    if key == "image":
+                        im = _BUTTON_RE.match(rest)
+                        if im:
+                            continue  # an image is not preview prose
                     out.append(rest)
                     continue
             out.append(line)
@@ -731,6 +842,10 @@ def render_blocks(
                     produced = _parse_card(inner, fmt)
                 elif name == "carousel":
                     produced = _parse_carousel(inner, fmt)
+                elif name == "fields":
+                    produced = _parse_fields(inner, fmt)
+                elif name == "menu":
+                    produced = _parse_menu(inner, fmt)
                 elif name == "report":
                     produced = _report_block(inner, remaining=markdown_budget)
                     if produced is not None:

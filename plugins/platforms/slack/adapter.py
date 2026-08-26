@@ -2338,6 +2338,9 @@ class SlackAdapter(BasePlatformAdapter):
             # the handler dispatches it into the thread's session as the
             # clicker's message (see _handle_agent_reply_action).
             self._app.action("hermes_agent_reply")(self._handle_agent_reply_action)
+            # Overflow-menu selections share the click-means-instruction
+            # contract and the same handler (value in selected_option.value).
+            self._app.action("hermes_agent_menu")(self._handle_agent_reply_action)
 
             # Register Block Kit action handlers for clarify buttons
             # (interactive multiple-choice prompts; see tools/clarify_gateway.py).
@@ -7753,7 +7756,14 @@ class SlackAdapter(BasePlatformAdapter):
         """
         await ack()
         try:
+            # Buttons carry the instruction in ``value``; overflow-menu
+            # selections carry it in ``selected_option.value`` (URL options
+            # carry a ``url_N`` placeholder there — the client opens the link,
+            # nothing is dispatched).
             value = (action.get("value") or "").strip()
+            if not value or value.startswith("url_"):
+                sel = (action.get("selected_option") or {}).get("value") or ""
+                value = "" if sel.startswith("url_") else sel.strip()
             message = body.get("message", {}) or {}
             msg_ts = message.get("ts", "")
             thread_ts = message.get("thread_ts") or msg_ts
@@ -7794,11 +7804,22 @@ class SlackAdapter(BasePlatformAdapter):
                     ]
                 )
 
+            # Resolve the display name up front so both the card marking and
+            # the dispatched event carry "Matien", not the login handle.
+            user_display = await self._resolve_user_name(
+                user_id, chat_id=channel_id, team_id=team_id
+            )
+            actor = (user_display or user_name or "unbekannt").strip()
+
             # Mark the click on the card itself (chat.update, appended context
             # line) so the actor is visible in the thread without an extra
             # notification-generating post. Best-effort: a failed update never
             # blocks the dispatch.
-            label = ((action.get("text") or {}).get("text") or "Auswahl").strip()
+            label = (
+                (action.get("text") or {}).get("text")
+                or ((action.get("selected_option") or {}).get("text") or {}).get("text")
+                or "Auswahl"
+            ).strip()
             try:
                 blocks = list(message.get("blocks") or [])
                 blocks.append(
@@ -7807,7 +7828,7 @@ class SlackAdapter(BasePlatformAdapter):
                         "elements": [
                             {
                                 "type": "mrkdwn",
-                                "text": f"→ *{label}* · von {user_name}",
+                                "text": f"→ *{label}* · von {actor}",
                             }
                         ],
                     }
@@ -7816,7 +7837,7 @@ class SlackAdapter(BasePlatformAdapter):
                 await client.chat_update(
                     channel=channel_id,
                     ts=msg_ts,
-                    text=message.get("text") or f"→ {label} · von {user_name}",
+                    text=message.get("text") or f"→ {label} · von {actor}",
                     blocks=sanitize_blocks(blocks),
                 )
             except Exception:
@@ -7829,15 +7850,12 @@ class SlackAdapter(BasePlatformAdapter):
             channel_name = await self._resolve_channel_name(
                 channel_id, team_id=team_id
             )
-            user_display = await self._resolve_user_name(
-                user_id, chat_id=channel_id, team_id=team_id
-            )
             source = self.build_source(
                 chat_id=channel_id,
                 chat_name=channel_name,
                 chat_type="dm" if channel_id.startswith("D") else "group",
                 user_id=user_id,
-                user_name=user_display or user_name,
+                user_name=actor,
                 thread_id=thread_ts,
                 scope_id=str(team_id) if team_id else None,
             )

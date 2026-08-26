@@ -269,6 +269,93 @@ class TestAdversarialInputs:
         assert blocks[0]["subtitle"]["text"] == "*Entwurf*"
 
 
+class TestFieldsDirective:
+    def test_label_value_lines_become_field_grid(self):
+        blocks = render_blocks(
+            ":::fields\nDatum: 26. August 2026\nBillable: vollständig\n:::"
+        )
+        assert _types(blocks) == ["section"]
+        fields = blocks[0]["fields"]
+        assert len(fields) == 2
+        assert fields[0]["text"] == "*Datum*\n26. August 2026"
+
+    def test_line_without_colon_used_verbatim(self):
+        blocks = render_blocks(":::fields\nnur ein Wert\n:::")
+        assert blocks[0]["fields"][0]["text"] == "nur ein Wert"
+
+    def test_eleven_fields_fall_back(self):
+        inner = "\n".join(f"K{i}: v" for i in range(11))
+        blocks = render_blocks(f":::fields\n{inner}\n:::")
+        assert "fields" not in str(_types(blocks)) or all(
+            "fields" not in b for b in blocks
+        )
+        assert "K10" in str(blocks)  # content survives
+
+    def test_empty_fields_render_nothing_invalid(self):
+        blocks = render_blocks("davor\n\n:::fields\n:::")
+        assert all(b["type"] == "section" and b.get("text") for b in blocks)
+
+
+class TestMenuDirective:
+    def test_menu_builds_overflow_accessory(self):
+        md = (
+            ":::menu\n"
+            "**TUR-445** · wartet auf QA\n"
+            "option: [In Prüfung](reply: TUR-445 in Prüfung setzen)\n"
+            "option: [Jira öffnen](https://elbdev.atlassian.net/browse/TUR-445)\n"
+            ":::"
+        )
+        blocks = render_blocks(md)
+        assert _types(blocks) == ["section"]
+        acc = blocks[0]["accessory"]
+        assert acc["type"] == "overflow"
+        assert acc["action_id"] == "hermes_agent_menu"
+        reply_opt, url_opt = acc["options"]
+        assert reply_opt["value"] == "TUR-445 in Prüfung setzen"
+        assert url_opt["url"].startswith("https://")
+        assert url_opt["value"] == "url_1"
+
+    def test_six_options_fall_back(self):
+        opts = "\n".join(f"option: [O{i}](reply: tu {i})" for i in range(6))
+        blocks = render_blocks(f":::menu\nText\n{opts}\n:::")
+        assert not any(b.get("accessory") for b in blocks)
+
+    def test_menu_without_text_falls_back(self):
+        blocks = render_blocks(":::menu\noption: [A](reply: b)\n:::")
+        assert not any(b.get("accessory") for b in blocks)
+
+    def test_oversize_menu_instruction_declines(self):
+        big = "x" * 2100
+        blocks = render_blocks(f":::menu\nText\noption: [A](reply: {big})\n:::")
+        assert not any(b.get("accessory") for b in blocks)
+
+
+class TestCardImage:
+    def test_image_key_becomes_hero_image(self):
+        md = (
+            ":::card\n"
+            "title: Deploy-Vorschau\n"
+            "image: [Screenshot der Startseite](https://example.com/shot.png)\n"
+            "Body.\n"
+            ":::"
+        )
+        blocks = render_blocks(md)
+        card = blocks[0]
+        assert card["hero_image"]["image_url"] == "https://example.com/shot.png"
+        assert card["hero_image"]["alt_text"] == "Screenshot der Startseite"
+
+    def test_non_http_image_stays_body_text(self):
+        md = ":::card\ntitle: T\nimage: [x](file:///etc/passwd)\n:::"
+        blocks = render_blocks(md)
+        assert "hero_image" not in blocks[0]
+
+    def test_image_line_stripped_from_notification_fallback(self):
+        md = ":::card\ntitle: T\nimage: [Alt](https://example.com/i.png)\nBody.\n:::"
+        stripped = strip_directives(md)
+        assert "example.com" not in stripped
+        assert "Body." in stripped
+
+
 class TestSanitizeNewTypes:
     def test_markdown_cumulative_budget(self):
         big = {"type": "markdown", "text": "a" * (MAX_MARKDOWN_TEXT - 100)}

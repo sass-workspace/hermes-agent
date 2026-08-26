@@ -79,13 +79,15 @@ class TestAgentReplyButton:
         assert event.source.thread_id == "100.000"
         assert event.source.chat_id == "C1"
         assert event.source.user_id == "U_MAT"
-        # The card was updated in place with the actor before dispatch.
+        # The dispatched event carries the RESOLVED display name, not the login.
+        assert event.source.user_name == "Matien"
+        # The card was updated in place with the actor (display name) before
+        # dispatch.
         update_kwargs = client.chat_update.await_args.kwargs
         assert update_kwargs["ts"] == "111.222"
-        assert any(
-            b["type"] == "context" and "Freigeben" in str(b)
-            for b in update_kwargs["blocks"]
-        )
+        marks = [b for b in update_kwargs["blocks"] if b["type"] == "context"]
+        assert any("Freigeben" in str(b) and "Matien" in str(b) for b in marks)
+        assert not any("matien\"" in str(b).lower() for b in marks)
 
     @pytest.mark.asyncio
     async def test_unauthorized_click_is_ignored(self):
@@ -133,3 +135,34 @@ class TestAgentReplyButton:
         adapter, _ = _make_adapter()
         src = Path(_repo, "plugins", "platforms", "slack", "adapter.py").read_text()
         assert 'self._app.action("hermes_agent_reply")' in src
+        assert 'self._app.action("hermes_agent_menu")' in src
+
+    @pytest.mark.asyncio
+    async def test_menu_selection_dispatches_selected_option_value(self):
+        adapter, client = _make_adapter()
+        body, action = _click_body(value="")
+        action.pop("value", None)
+        action.pop("text", None)
+        action["action_id"] = "hermes_agent_menu"
+        action["selected_option"] = {
+            "text": {"type": "plain_text", "text": "In Prüfung"},
+            "value": "TUR-445 in Prüfung setzen",
+        }
+        await adapter._handle_agent_reply_action(AsyncMock(), body, action)
+        event = adapter.handle_message.await_args.args[0]
+        assert event.text == "TUR-445 in Prüfung setzen"
+        update_kwargs = client.chat_update.await_args.kwargs
+        assert any("In Prüfung" in str(b) for b in update_kwargs["blocks"])
+
+    @pytest.mark.asyncio
+    async def test_url_menu_option_dispatches_nothing(self):
+        adapter, client = _make_adapter()
+        body, action = _click_body(value="")
+        action.pop("value", None)
+        action["action_id"] = "hermes_agent_menu"
+        action["selected_option"] = {
+            "text": {"type": "plain_text", "text": "Jira öffnen"},
+            "value": "url_0",
+        }
+        await adapter._handle_agent_reply_action(AsyncMock(), body, action)
+        adapter.handle_message.assert_not_awaited()
