@@ -240,6 +240,34 @@ class TestAdversarialInputs:
         md = "````\n```\n:::card\ntitle: Beispiel\n:::\n```\n````"
         assert strip_directives(md) == md
 
+    def test_second_report_over_cumulative_budget_falls_back_not_truncated(self):
+        # Slack caps ALL markdown blocks in one payload at 12k combined; two
+        # individually valid reports must not let the sanitizer truncate the
+        # tail — the second report degrades to sections with content intact.
+        a = "a" * 7000
+        b = "b" * 7000
+        blocks = render_blocks(f":::report\n{a}\n:::\n\n:::report\n{b}\n:::")
+        md_blocks = [x for x in blocks if x["type"] == "markdown"]
+        assert len(md_blocks) == 1 and md_blocks[0]["text"] == a
+        # Second report survived as plain sections (split at the 3000-char
+        # section cap, so count characters rather than one contiguous string).
+        blob = str(blocks)
+        assert blob.count("b") >= 7000
+        assert "…" not in blob
+
+    def test_card_title_and_subtitle_are_mrkdwn_converted(self):
+        # Authored **bold** must reach Slack as mrkdwn *bold* in card fields,
+        # same as in the body — raw ** shows stray asterisks.
+        def fake_mrkdwn(s):
+            return s.replace("**", "*")
+
+        blocks = render_blocks(
+            ":::card\ntitle: **TUR-445** · Antwort\nsubtitle: **Entwurf**\nBody\n:::",
+            mrkdwn_fn=fake_mrkdwn,
+        )
+        assert blocks[0]["title"]["text"] == "*TUR-445* · Antwort"
+        assert blocks[0]["subtitle"]["text"] == "*Entwurf*"
+
 
 class TestSanitizeNewTypes:
     def test_markdown_cumulative_budget(self):

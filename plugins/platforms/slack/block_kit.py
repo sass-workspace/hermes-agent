@@ -507,6 +507,11 @@ def _parse_card(inner: List[str], mrkdwn_fn) -> Optional[Block]:
         body_lines.append(ln)
     body_md = "\n".join(body_lines).strip()
     body = mrkdwn_fn(body_md) if body_md else ""
+    # Title/subtitle are mrkdwn text objects too — run them through the same
+    # converter as the body so authored ``**bold**`` becomes mrkdwn ``*bold*``
+    # instead of showing stray asterisks.
+    title = mrkdwn_fn(title) if title else title
+    subtitle = mrkdwn_fn(subtitle) if subtitle else subtitle
     if not title and not body:
         return None
     if len(buttons) > MAX_CARD_BUTTONS:
@@ -558,16 +563,19 @@ def _parse_carousel(inner: List[str], mrkdwn_fn) -> Optional[Block]:
     return {"type": "carousel", "elements": cards}
 
 
-def _report_block(inner: List[str]) -> Optional[Block]:
+def _report_block(inner: List[str], remaining: int = MARKDOWN_SEGMENT_MAX) -> Optional[Block]:
     """Build a native ``markdown`` block from ``:::report`` content.
 
     The text is passed RAW (standard markdown, not mrkdwn) — Slack renders
     headings, tables, task lists and syntax-highlighted code natively.
-    Declines over the cumulative-cap headroom so the caller falls back to the
-    normal pipeline instead of losing a long review.
+    ``remaining`` is what is left of the per-payload cumulative markdown
+    budget (Slack caps ALL markdown blocks in one message at 12k combined):
+    declining against it here means a second over-budget report falls back to
+    the normal pipeline with its content intact, instead of being truncated
+    by the outbound sanitizer's last-resort clamp.
     """
     text = "\n".join(inner).strip()
-    if not text or len(text) > MARKDOWN_SEGMENT_MAX:
+    if not text or len(text) > min(MARKDOWN_SEGMENT_MAX, remaining):
         return None
     return {"type": "markdown", "text": text}
 
@@ -665,6 +673,7 @@ def render_blocks(
         i = 0
         n = len(lines)
         para: List[str] = []
+        markdown_budget = MARKDOWN_SEGMENT_MAX  # cumulative across all reports
 
         def flush_para() -> None:
             if not para:
@@ -723,7 +732,9 @@ def render_blocks(
                 elif name == "carousel":
                     produced = _parse_carousel(inner, fmt)
                 elif name == "report":
-                    produced = _report_block(inner)
+                    produced = _report_block(inner, remaining=markdown_budget)
+                    if produced is not None:
+                        markdown_budget -= len(produced["text"])
                 if produced is not None:
                     blocks.append(produced)
                 else:
