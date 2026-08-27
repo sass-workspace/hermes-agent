@@ -2995,15 +2995,9 @@ class MCPServerTask:
         if not pids or self._is_http():
             return False
         for pid in pids:
-            # windows-footgun: ok — psutil.pid_exists handles Windows; the
-            # os.kill probe below only runs when psutil is unavailable.
-            import psutil
-
-            if not psutil.pid_exists(pid):
-                continue  # this one is dead
-            return True  # alive (signal permission irrelevant for liveness)
-            return False  # at least one child alive
-        return True
+            if _stdio_pid_alive(pid):
+                return False  # at least one child alive → never fail fast
+        return True  # every tracked child is gone
 
     async def _watch_stdio_children(self) -> None:
         """Poll child liveness while a stdio RPC is in flight (#81995).
@@ -5358,6 +5352,34 @@ def _try_acquire_mcp_discovery_lock() -> Any:
 # fails or times out.  PIDs are added after connection and removed on
 # normal server shutdown.
 _stdio_pids: Dict[int, str] = {}  # pid -> server_name
+
+
+def _stdio_pid_alive(pid: int) -> bool:
+    """Liveness probe for one tracked stdio child pid (#81995 fast-fail).
+
+    Uncertainty must never read as "dead": a false "dead" fails every call
+    on a healthy server before dispatch (the 786f37071 regression), while a
+    false "alive" merely lets a call wait out its tool timeout.
+
+    psutil first — it handles Windows, where ``os.kill(pid, 0)`` is not a
+    liveness probe. The ``os.kill`` fallback runs only when psutil cannot be
+    imported: ``ProcessLookupError`` is the one signal that the pid is gone;
+    ``PermissionError`` (exists, not ours to signal) and any other
+    ``OSError`` count as alive.
+    """
+    try:
+        import psutil
+    except ImportError:
+        psutil = None
+    if psutil is not None:
+        return bool(psutil.pid_exists(pid))
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except (PermissionError, OSError):
+        return True
+    return True
 
 # PIDs that survived their session context exit (SDK teardown failed to
 # terminate them).  These are detected in _run_stdio's finally block and
