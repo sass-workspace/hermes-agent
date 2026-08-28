@@ -29,6 +29,10 @@ def _make_adapter(extra=None):
     return a, client
 
 
+LONG_MD = "\n\n".join(
+    f"**Kunde {i}**\n\n- 🟡 **Freigabe** · [TUR-{i}](https://elbdev.atlassian.net/browse/TUR-{i}) — " + "warum " * 20
+    for i in range(8)
+)
 RICH_MD = "# Title\n\n- a\n  - nested\n\n---\n\nbody text"
 RICH_TABLE_MD = (
     "| Item | Status | Note |\n"
@@ -68,13 +72,44 @@ class TestSendMessageBlocks:
 
 
     @pytest.mark.asyncio
-    async def test_enabled_but_unrenderable_falls_back_to_text(self):
-        # 60 dividers -> renderer returns None -> no blocks kwarg, text stands
+    async def test_over_count_payload_is_partitioned_not_degraded(self):
+        # 60 dividers used to make the renderer decline (flat text); now the
+        # payload is split across consecutive posts, every one with blocks.
         adapter, client = _make_adapter({"rich_blocks": True})
         await adapter.send("C1", "\n\n".join(["---"] * 60))
-        kwargs = client.chat_postMessage.await_args.kwargs
-        assert "blocks" not in kwargs
-        assert kwargs["text"]
+        calls = client.chat_postMessage.await_args_list
+        assert len(calls) >= 2
+        assert all("blocks" in c.kwargs and len(c.kwargs["blocks"]) <= 50 for c in calls)
+        # top-level first post -> top-level follow-ups (never buried in a thread)
+        assert all("thread_ts" not in c.kwargs for c in calls)
+
+    @pytest.mark.asyncio
+    async def test_over_budget_follow_ups_inherit_thread_and_skip_broadcast(self, monkeypatch):
+        from plugins.platforms.slack import block_kit
+        monkeypatch.setattr(block_kit, "BLOCK_PAYLOAD_BUDGET", 1500)
+        adapter, client = _make_adapter({"rich_blocks": True, "feedback_buttons": True, "reply_broadcast": True})
+        md = LONG_MD
+        await adapter.send("C1", md, metadata={"thread_id": "999.111"})
+        calls = client.chat_postMessage.await_args_list
+        assert len(calls) >= 3
+        assert all(c.kwargs["thread_ts"] == "999.111" for c in calls)
+        assert calls[0].kwargs.get("reply_broadcast") is True
+        assert all("reply_broadcast" not in c.kwargs for c in calls[1:])
+        feedback = [c for c in calls if c.kwargs["blocks"][-1]["type"] == "context_actions"]
+        assert len(feedback) == 1 and feedback[0] is calls[-1]
+        assert all(c.kwargs["text"] and ":::" not in c.kwargs["text"] for c in calls[1:])
+
+    @pytest.mark.asyncio
+    async def test_size_rejection_after_partition_retries_flat_and_logs(self, caplog):
+        adapter, client = _make_adapter({"rich_blocks": True})
+        client.chat_postMessage = AsyncMock(
+            side_effect=[SlackRejectedBlocks("msg_blocks_too_long"), {"ts": "111.222"}]
+        )
+        with caplog.at_level("WARNING"):
+            await adapter.send("C1", RICH_MD)
+        assert client.chat_postMessage.await_count == 2
+        assert "blocks" not in client.chat_postMessage.await_args.kwargs
+        assert "BLOCK_PAYLOAD_BUDGET" in caplog.text
 
 
     @pytest.mark.asyncio
@@ -138,6 +173,19 @@ class TestEditMessageBlocks:
         assert "blocks" in kwargs and kwargs["blocks"]
         assert kwargs["text"]
 
+
+    @pytest.mark.asyncio
+    async def test_finalize_edit_posts_overflow_as_follow_ups(self, monkeypatch):
+        from plugins.platforms.slack import block_kit
+        monkeypatch.setattr(block_kit, "BLOCK_PAYLOAD_BUDGET", 1500)
+        adapter, client = _make_adapter({"rich_blocks": True})
+        await adapter.edit_message("C1", "111.222", LONG_MD, finalize=True, metadata={"thread_id": "111.222"})
+        client.chat_update.assert_awaited_once()
+        first = client.chat_update.await_args.kwargs["blocks"]
+        follow = client.chat_postMessage.await_args_list
+        assert len(follow) >= 1
+        assert all(c.kwargs["thread_ts"] == "111.222" for c in follow)
+        assert all(c.kwargs["blocks"] != first for c in follow)  # overflow only
 
     @pytest.mark.asyncio
     async def test_block_rejection_retries_edit_without_blocks_using_workspace_client(self):
@@ -274,3 +322,37 @@ class TestNotificationFallback:
         assert kwargs["text"] == adapter.format_message(fence_only)
 
 
+
+
+class TestFollowUpReviewFindings:
+    @pytest.mark.asyncio
+    async def test_rejected_follow_up_retries_with_its_full_text(self, monkeypatch):
+        from plugins.platforms.slack import block_kit
+        monkeypatch.setattr(block_kit, "BLOCK_PAYLOAD_BUDGET", 1500)
+        adapter, client = _make_adapter({"rich_blocks": True})
+        calls = []
+
+        async def post(**kwargs):
+            calls.append(kwargs)
+            if len(calls) == 2 and "blocks" in kwargs:
+                raise SlackRejectedBlocks("msg_blocks_too_long")
+            return {"ts": f"111.{len(calls)}"}
+
+        client.chat_postMessage = AsyncMock(side_effect=post)
+        await adapter.send("C1", LONG_MD)
+        rejected = calls[1]
+        retry = calls[2]
+        assert "blocks" not in retry
+        # the retry carries the group's whole content, not the 600-char notification
+        assert len(retry["text"]) > len(rejected["text"])
+        assert "TUR-" in retry["text"]
+
+    @pytest.mark.asyncio
+    async def test_editable_status_message_never_overflows(self, monkeypatch):
+        from plugins.platforms.slack import block_kit
+        monkeypatch.setattr(block_kit, "BLOCK_PAYLOAD_BUDGET", 1500)
+        adapter, client = _make_adapter({"rich_blocks": True})
+        await adapter.send("C1", LONG_MD, metadata={"expect_edits": True})
+        calls = client.chat_postMessage.await_args_list
+        assert len(calls) == 1
+        assert "blocks" not in calls[0].kwargs

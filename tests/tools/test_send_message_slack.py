@@ -137,3 +137,98 @@ def test_standalone_send_stops_on_non_token_error(monkeypatch, _standalone_send)
 
     assert result == {"error": "Slack API error: msg_too_long"}
     assert len(fake_session.calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# Block Kit parity for the standalone lane (2026-08-27: a `hermes cron run`
+# brief arrived as flat mrkdwn while the ticker's arrived with the layout).
+# ---------------------------------------------------------------------------
+
+_BRIEF_MD = "## Täglicher Exception-Brief · 27.08.2026\n\n**Turbogrün · Matien**\n\n" + "\n".join(
+    f"- 🟡 **Freigabe nötig** · [TUR-{i}](https://elbdev.atlassian.net/browse/TUR-{i}) — Feedback prüfen."
+    for i in range(6)
+)
+
+
+def test_standalone_send_renders_block_kit_when_rich_blocks_enabled(monkeypatch, _standalone_send):
+    fake_session = _SlackSession()
+    monkeypatch.setattr("aiohttp.ClientSession", lambda *args, **kwargs: fake_session)
+    pconfig = SimpleNamespace(enabled=True, token="good-token", extra={"rich_blocks": True})
+    result = asyncio.run(_standalone_send(pconfig, "C123", _BRIEF_MD, thread_id="1.2"))
+    assert result["success"] is True
+    assert len(fake_session.calls) == 1
+    body = fake_session.calls[0][1]
+    types = [b["type"] for b in body["blocks"]]
+    assert types[0] == "header" and "rich_text" in types
+    assert body["thread_ts"] == "1.2"
+    # the text is the notification fallback: words, no heading marks
+    assert "##" not in body["text"] and "Exception-Brief" in body["text"]
+
+
+def test_standalone_send_without_rich_blocks_stays_plain(monkeypatch, _standalone_send):
+    fake_session = _SlackSession()
+    monkeypatch.setattr("aiohttp.ClientSession", lambda *args, **kwargs: fake_session)
+    pconfig = SimpleNamespace(enabled=True, token="good-token", extra={})
+    asyncio.run(_standalone_send(pconfig, "C123", _BRIEF_MD))
+    assert "blocks" not in fake_session.calls[0][1]
+
+
+def test_standalone_send_partitions_over_budget_into_follow_ups(monkeypatch, _standalone_send):
+    from plugins.platforms.slack import block_kit
+    monkeypatch.setattr(block_kit, "BLOCK_PAYLOAD_BUDGET", 1200)
+    fake_session = _SlackSession()
+    monkeypatch.setattr("aiohttp.ClientSession", lambda *args, **kwargs: fake_session)
+    pconfig = SimpleNamespace(enabled=True, token="good-token", extra={"rich_blocks": True})
+    long_md = "\n\n".join(
+        f"**Kunde {i}**\n\n- 🟡 **Freigabe** · [TUR-{i}](https://elbdev.atlassian.net/browse/TUR-{i}) — " + "warum " * 20
+        for i in range(8)
+    )
+    result = asyncio.run(_standalone_send(pconfig, "C123", long_md, thread_id="1.2"))
+    assert result["success"] is True
+    calls = fake_session.calls
+    assert len(calls) >= 3
+    assert all("blocks" in body and body["thread_ts"] == "1.2" for _, body in calls)
+    assert result["message_id"] == "171.123"  # the first post's ts
+
+
+def test_standalone_send_size_rejection_retries_flat(monkeypatch, _standalone_send):
+    class _RejectBlocks(_SlackSession):
+        def post(self, url, *, headers, json, **kwargs):
+            self.calls.append((headers["Authorization"], json))
+            if "blocks" in json:
+                return _SlackPostContext(_SlackResponse({"ok": False, "error": "msg_blocks_too_long"}))
+            return _SlackPostContext(_SlackResponse({"ok": True, "ts": "171.123"}))
+
+    fake_session = _RejectBlocks()
+    monkeypatch.setattr("aiohttp.ClientSession", lambda *args, **kwargs: fake_session)
+    pconfig = SimpleNamespace(enabled=True, token="good-token", extra={"rich_blocks": True})
+    result = asyncio.run(_standalone_send(pconfig, "C123", _BRIEF_MD))
+    assert result["success"] is True
+    assert len(fake_session.calls) == 2
+    assert "blocks" not in fake_session.calls[1][1]
+    assert "TUR-1" in fake_session.calls[1][1]["text"]  # the full formatted body, not the notification
+
+
+def test_standalone_rejected_follow_up_retries_flat_with_full_text(monkeypatch, _standalone_send):
+    from plugins.platforms.slack import block_kit
+    monkeypatch.setattr(block_kit, "BLOCK_PAYLOAD_BUDGET", 1200)
+
+    class _RejectSecond(_SlackSession):
+        def post(self, url, *, headers, json, **kwargs):
+            self.calls.append((headers["Authorization"], json))
+            if len(self.calls) == 2 and "blocks" in json:
+                return _SlackPostContext(_SlackResponse({"ok": False, "error": "msg_blocks_too_long"}))
+            return _SlackPostContext(_SlackResponse({"ok": True, "ts": "171.123"}))
+
+    fake_session = _RejectSecond()
+    monkeypatch.setattr("aiohttp.ClientSession", lambda *args, **kwargs: fake_session)
+    pconfig = SimpleNamespace(enabled=True, token="good-token", extra={"rich_blocks": True})
+    long_md = "\n\n".join(
+        f"**Kunde {i}**\n\n- 🟡 **Freigabe** · [TUR-{i}](https://elbdev.atlassian.net/browse/TUR-{i}) — " + "warum " * 20
+        for i in range(8)
+    )
+    result = asyncio.run(_standalone_send(pconfig, "C123", long_md))
+    assert result["success"] is True
+    rejected, retry = fake_session.calls[1][1], fake_session.calls[2][1]
+    assert "blocks" in rejected and "blocks" not in retry
+    assert len(retry["text"]) > len(rejected["text"]) and "TUR-" in retry["text"]

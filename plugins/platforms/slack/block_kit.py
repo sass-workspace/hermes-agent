@@ -28,6 +28,7 @@ adapter state — so it is trivially unit-testable.
 
 from __future__ import annotations
 
+import json
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -63,6 +64,16 @@ MAX_SECTION_FIELDS = 10
 MAX_FIELD_TEXT = 2000
 MAX_OVERFLOW_OPTIONS = 5
 MAX_OPTION_LABEL = 75
+
+# Payload budget — measured live 2026-08-28 (#iris-ops render-test thread,
+# chat.postMessage and chat.update alike): a rich_text payload is accepted up
+# to ≈24.5 kB of serialized JSON (``msg_blocks_too_long`` beyond), a
+# ``markdown`` block up to ≈13 kB, section blocks past 30 kB. The budgets sit
+# well under the measured limits; an over-budget payload is PARTITIONED into
+# consecutive posts by the adapter, never degraded to flat text.
+BLOCK_PAYLOAD_BUDGET = 20000
+MARKDOWN_GROUP_BUDGET = 11500  # a group carrying a markdown block
+SPLIT_LEAD_TYPES = ("header", "divider")  # preferred group openers
 
 Block = Dict[str, Any]
 
@@ -199,8 +210,11 @@ def _nonempty_elements(elements: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 
 def _header_block(text: str) -> Optional[Block]:
-    # header blocks are plain_text only, 150 char cap.
-    clean = re.sub(r"[*_~`]", "", text).strip()
+    # header blocks are plain_text only, 150 char cap. A markdown link would
+    # reach the reader verbatim (observed live 2026-08-27), so it reduces to
+    # its label — the URL belongs on the first body line by canon.
+    clean = _LINK_RE.sub(lambda m: m.group(1), text)
+    clean = re.sub(r"[*_~`]", "", clean).strip()
     if not clean:
         # Emphasis-/whitespace-only header (e.g. "# ***" or "#   ") reduces to
         # empty; Slack rejects an empty plain_text with invalid_blocks. Skip it
@@ -611,7 +625,14 @@ def _parse_fields(inner: List[str], mrkdwn_fn) -> Optional[Block]:
             # Not a label when the colon belongs to a URL scheme ("https://…"
             # as the whole line) — that line is verbatim content.
             if label and value and not value.startswith("//"):
-                text = f"*{label}*\n{value}"
+                # Bold the label AFTER conversion: a literal ``*label*`` fed
+                # to the markdown→mrkdwn converter is read as markdown italic
+                # and comes out as ``_label_`` (observed live 2026-08-27).
+                rendered = f"*{mrkdwn_fn(label)}*\n{mrkdwn_fn(value)}"
+                if len(rendered) > MAX_FIELD_TEXT:
+                    return None
+                fields.append({"type": "mrkdwn", "text": rendered})
+                continue
         rendered = mrkdwn_fn(text)
         if len(rendered) > MAX_FIELD_TEXT:
             return None
@@ -679,6 +700,74 @@ def _parse_menu(inner: List[str], mrkdwn_fn) -> Optional[Block]:
             "options": options,
         },
     }
+
+
+def _directive_fallback_markdown(name: str, inner: List[str]) -> str:
+    """Markdown for a directive that could not become its block.
+
+    A declined ``:::card`` (body over the 200-char cap, four buttons, …) used
+    to re-render its raw lines, leaking ``title:`` / ``subtitle:`` /
+    ``button:`` as prose (observed live 2026-08-27). Key lines are rewritten
+    into their nearest plain-markdown form instead: title → bold line,
+    subtitle → plain line, URL buttons/options → links, reply buttons → the
+    label alone (the instruction is control data, never prose), images
+    dropped. Fenced regions stay untouched; ``fields`` inner lines are already
+    readable ``Label: Wert`` prose and a declined ``carousel`` keeps its
+    ``:::card`` fences so the cards still render (vertically) — both pass
+    through unchanged.
+    """
+    if name not in ("card", "menu"):
+        return "\n".join(inner)
+    out: List[str] = []
+    code_marker: Optional[str] = None
+    seen_title = seen_subtitle = seen_image = False
+    for ln in inner:
+        if code_marker is not None:
+            out.append(ln)
+            if ln.lstrip().startswith(code_marker):
+                code_marker = None
+            continue
+        fmatch = _FENCE_RE.match(ln)
+        if fmatch:
+            code_marker = fmatch.group(1)
+            out.append(ln)
+            continue
+        stripped = ln.strip()
+        km = _CARD_KEY_RE.match(stripped)
+        if not km:
+            out.append(ln)
+            continue
+        key, rest = km.group(1), km.group(3).strip()
+        # Mirror the parser exactly: only the FIRST title / subtitle / image
+        # line is a key line; a later ``title: …`` is body text and stays.
+        if key == "title":
+            if seen_title:
+                out.append(ln)
+                continue
+            seen_title = True
+            out.append(f"**{rest}**")
+        elif key == "subtitle":
+            if seen_subtitle:
+                out.append(ln)
+                continue
+            seen_subtitle = True
+            out.append(rest)
+        elif key in ("button", "option"):
+            bm = _BUTTON_RE.match(rest)
+            if bm and bm.group(3):
+                out.append(f"[{bm.group(1).strip()}]({bm.group(3)})")
+            elif bm:
+                out.append(bm.group(1).strip())
+            elif "reply:" not in rest:
+                out.append(rest)
+        elif key == "image":
+            im = _BUTTON_RE.match(rest)
+            is_image = bool(im and im.group(3) and im.group(3).lower().startswith(("http://", "https://")))
+            if is_image and not seen_image:
+                seen_image = True  # dropped, like the parser's hero image
+            else:
+                out.append(ln if seen_image or not is_image else rest)
+    return "\n".join(out)
 
 
 def _report_block(inner: List[str], remaining: int = MARKDOWN_SEGMENT_MAX) -> Optional[Block]:
@@ -870,7 +959,7 @@ def render_blocks(
                 if produced is not None:
                     blocks.append(produced)
                 else:
-                    inner_text = "\n".join(inner)
+                    inner_text = _directive_fallback_markdown(name, inner)
                     sub = render_blocks(inner_text, mrkdwn_fn=mrkdwn_fn)
                     if sub:
                         blocks.extend(sub)
@@ -999,10 +1088,9 @@ def render_blocks(
 
         if not blocks:
             return None
-        if len(blocks) > MAX_BLOCKS:
-            # Too structurally complex to express safely — let the caller fall
-            # back to plain text rather than truncating and losing content.
-            return None
+        # No MAX_BLOCKS decline here: the adapter partitions an over-budget or
+        # over-count payload into consecutive posts (``partition_blocks``);
+        # declining would degrade the whole message to flat text.
         return blocks
     except Exception:
         # Never let a rendering bug drop a message.
@@ -1207,3 +1295,197 @@ def sanitize_blocks(blocks: Optional[List[Block]]) -> Optional[List[Block]]:
     except Exception:
         # A sanitizer bug must never take down the send path.
         return None
+
+
+# ----------------------------------------------------------------------------
+# Payload budget — partition an over-budget block list into consecutive posts
+# ----------------------------------------------------------------------------
+
+def payload_size(blocks: Optional[List[Block]]) -> int:
+    """Serialized byte size of ``blocks`` as Slack receives them (0 on error)."""
+    if not blocks:
+        return 0
+    try:
+        return len(
+            json.dumps(blocks, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        )
+    except Exception:
+        return 0
+
+
+def _group_budget(group: List[Block]) -> int:
+    return (
+        MARKDOWN_GROUP_BUDGET
+        if any(b.get("type") == "markdown" for b in group)
+        else BLOCK_PAYLOAD_BUDGET
+    )
+
+
+def partition_blocks(
+    blocks: Optional[List[Block]],
+    budget: Optional[int] = None,
+    max_blocks: Optional[int] = None,
+) -> List[List[Block]]:
+    """Split ``blocks`` into groups Slack accepts as one message each.
+
+    Greedy: a group closes when adding the next block would exceed the byte
+    budget (``MARKDOWN_GROUP_BUDGET`` once a group carries a markdown block)
+    or ``max_blocks``. A closed group is trimmed back to its last header /
+    divider so that lead-in opens the NEXT post rather than trailing this
+    one; a trailing divider is dropped. A single block larger than the budget
+    travels alone — never split inside a block. Always returns at least one
+    group; on any unexpected shape returns ``[blocks]`` unchanged.
+    """
+    if not blocks:
+        return []
+    budget = BLOCK_PAYLOAD_BUDGET if budget is None else budget
+    max_blocks = MAX_BLOCKS if max_blocks is None else max_blocks
+    try:
+        groups: List[List[Block]] = []
+        cur: List[Block] = []
+        for block in blocks:
+            # Invariant: ``cur`` always fits. After a back-off the carried
+            # tail plus the new block is re-checked through the same test,
+            # so a group can never leave here over budget.
+            while True:
+                candidate = cur + [block]
+                limit = min(budget, _group_budget(candidate))
+                if not cur or (len(cur) < max_blocks and payload_size(candidate) <= limit):
+                    cur = candidate
+                    break
+                # Prefer opening the next group with the last lead block.
+                cut = len(cur)
+                for i in range(len(cur) - 1, 0, -1):
+                    if cur[i].get("type") in SPLIT_LEAD_TYPES:
+                        cut = i
+                        break
+                head, tail = cur[:cut], cur[cut:]
+                while head and head[-1].get("type") == "divider":
+                    head.pop()
+                if head and tail:
+                    groups.append(head)
+                    cur = tail  # re-evaluated with ``block`` on the next pass
+                else:
+                    groups.append(cur)
+                    cur = []
+        if cur:
+            groups.append(cur)
+        return groups or [list(blocks)]
+    except Exception:
+        return [list(blocks)]
+
+
+def _inline_mrkdwn(elements: Any) -> str:
+    out = ""
+    for e in elements or []:
+        if not isinstance(e, dict):
+            continue
+        t = e.get("type")
+        if t == "text":
+            s = str(e.get("text", ""))
+            st = e.get("style") or {}
+            if st.get("code"):
+                s = f"`{s}`"
+            if st.get("bold"):
+                s = f"*{s}*"
+            if st.get("italic"):
+                s = f"_{s}_"
+            if st.get("strike"):
+                s = f"~{s}~"
+            out += s
+        elif t == "link":
+            out += f"<{e.get('url', '')}|{e.get('text') or e.get('url', '')}>"
+        elif t == "emoji":
+            out += f":{e.get('name', '')}:"
+        elif t == "user":
+            out += f"<@{e.get('user_id', '')}>"
+        elif t == "date":
+            out += str(e.get("fallback") or "")
+    return out
+
+
+def group_mrkdwn_text(group: List[Block]) -> str:
+    """The WHOLE content of a block group as flat mrkdwn — the body of a
+    follow-up that Slack rejected with its blocks. Never truncates; a
+    rejected overflow post must still carry its overflow."""
+    lines: List[str] = []
+    try:
+        for b in group:
+            t = b.get("type")
+            if t == "header":
+                lines.append(f"*{b['text']['text']}*")
+            elif t == "section":
+                if b.get("text"):
+                    lines.append(str(b["text"].get("text", "")))
+                for f in b.get("fields") or []:
+                    lines.append(str(f.get("text", "")))
+            elif t == "context":
+                lines.append(" ".join(str(e.get("text", "")) for e in b.get("elements", []) if isinstance(e, dict)))
+            elif t == "divider":
+                lines.append("———")
+            elif t == "markdown":
+                lines.append(str(b.get("text", "")))
+            elif t == "card":
+                for k in ("title", "subtitle", "body"):
+                    if b.get(k):
+                        lines.append(str(b[k].get("text", "")))
+            elif t == "rich_text":
+                for el in b.get("elements", []):
+                    et = el.get("type")
+                    if et == "rich_text_list":
+                        mark = "1. " if el.get("style") == "ordered" else "• "
+                        for sec in el.get("elements", []):
+                            lines.append("  " * int(el.get("indent", 0) or 0) + mark + _inline_mrkdwn(sec.get("elements")))
+                    elif et == "rich_text_quote":
+                        lines.append("> " + _inline_mrkdwn(el.get("elements")))
+                    elif et == "rich_text_preformatted":
+                        lines.append("```\n" + _inline_mrkdwn(el.get("elements")) + "\n```")
+                    else:
+                        lines.append(_inline_mrkdwn(el.get("elements")))
+            elif t == "table":
+                for row in b.get("rows", []):
+                    lines.append(" · ".join(_inline_mrkdwn(c.get("elements")) if isinstance(c, dict) else str(c) for c in row))
+            lines.append("")
+    except Exception:
+        pass
+    text = "\n".join(lines).strip()
+    return text or group_notification_text(group, 0, 1)
+
+
+def group_notification_text(group: List[Block], index: int, total: int) -> str:
+    """Plain words for the ``text`` fallback of a follow-up post."""
+    words: List[str] = []
+
+    def _walk(el: Any) -> None:
+        if isinstance(el, dict):
+            t = el.get("type")
+            if t in ("plain_text", "mrkdwn") and isinstance(el.get("text"), str):
+                words.append(el["text"])
+                return
+            if t == "text" and isinstance(el.get("text"), str):
+                words.append(el["text"])
+                return
+            if t == "link":
+                words.append(str(el.get("text") or el.get("url") or ""))
+                return
+            if t == "markdown" and isinstance(el.get("text"), str):
+                words.append(el["text"])
+                return
+            for v in el.values():
+                _walk(v)
+        elif isinstance(el, list):
+            for v in el:
+                _walk(v)
+
+    try:
+        _walk(group)
+        text = " ".join(w.strip() for w in words if w and w.strip())
+        text = re.sub(r"[*_~`#]+", "", text)
+        text = re.sub(r"\s+", " ", text).strip()
+    except Exception:
+        text = ""
+    if not text:
+        return f"(Teil {index + 1}/{total})"
+    if len(text) > 600:
+        text = text[:599].rstrip() + "…"
+    return text

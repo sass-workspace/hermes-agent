@@ -220,7 +220,10 @@ class TestAdversarialInputs:
         blocks = render_blocks(md)
         blob = str(blocks)
         assert "before" in blob and "after" in blob
-        assert "---" in blob  # the card's inner content did not vanish
+        # the card's inner content did not vanish: the rules now render as
+        # dividers (the renderer no longer declines above 50 blocks — the
+        # adapter partitions instead)
+        assert sum(1 for b in blocks if b["type"] == "divider") >= 50
 
     def test_oversize_reply_instruction_declines_never_truncates(self):
         big = "x" * 2100
@@ -449,3 +452,71 @@ class TestSanitizeNewTypes:
 
     def test_carousel_without_cards_dropped(self):
         assert sanitize_blocks([{"type": "carousel", "elements": []}]) is None
+
+
+def _walk(node):
+    if isinstance(node, dict):
+        yield node
+        for v in node.values():
+            yield from _walk(v)
+    elif isinstance(node, list):
+        for v in node:
+            yield from _walk(v)
+
+
+class TestRenderDefects20260827:
+    """The render defects from the 2026-08-27 screenshots, pinned."""
+
+    def test_fields_label_is_bold_after_real_conversion(self):
+        import re
+
+        def italic_rule(s):
+            # the converter's single-asterisk rule: *x* → _x_ (markdown italic)
+            return re.sub(r"(?<!\*)\*(\S(?:[^*\n]*?\S)?)\*(?!\*)", r"_\1_", s)
+
+        blocks = render_blocks(":::fields\nDatum: 27.08.2026\nDauer: 3h 30m\n:::", mrkdwn_fn=italic_rule)
+        fields = blocks[0]["fields"]
+        assert fields[0]["text"] == "*Datum*\n27.08.2026"
+        assert fields[1]["text"] == "*Dauer*\n3h 30m"
+
+    def test_header_link_reduces_to_its_label(self):
+        blocks = render_blocks("## Evidenz · [JU-252](https://elbdev.atlassian.net/browse/JU-252)\n\nText.")
+        assert blocks[0]["type"] == "header"
+        assert blocks[0]["text"]["text"] == "Evidenz · JU-252"
+
+    def test_declined_card_never_leaks_key_lines(self):
+        body = "Die Anfrage ist bereits erfasst. " * 12  # > 200 chars -> card declines
+        md = (
+            ":::card\n"
+            "title: Turbogrün · Bereits in Bearbeitung\n"
+            "subtitle: TUR-451 · Umsetzung läuft\n"
+            f"{body}\n"
+            "button: [Jira öffnen](https://elbdev.atlassian.net/browse/TUR-451)\n"
+            "button(primary): [Freigeben](reply: ja, TUR-451 freigeben)\n"
+            "image: [Preview](https://example.com/p.png)\n"
+            ":::"
+        )
+        blocks = render_blocks(md)
+        assert not any(b["type"] == "card" for b in blocks)
+        flat = str(blocks)
+        assert "title:" not in flat and "subtitle:" not in flat and "button" not in flat
+        assert "reply:" not in flat and "freigeben" not in flat
+        assert "example.com/p.png" not in flat
+        # title bold, URL button as a markdown link (identity mrkdwn_fn here)
+        assert "**Turbogrün · Bereits in Bearbeitung**" in flat
+        assert "[Jira öffnen](https://elbdev.atlassian.net/browse/TUR-451)" in flat
+
+    def test_declined_menu_keeps_labels_not_instructions(self):
+        md = ":::menu\nWähle:\n" + "\n".join(f"option: [Option {i}](reply: mach {i})" for i in range(7)) + "\n:::"
+        flat = str(render_blocks(md))
+        assert "option:" not in flat and "mach 3" not in flat and "Option 3" in flat
+
+
+class TestFallbackMirrorsParser:
+    def test_second_title_line_is_body_text(self):
+        body = "Die Anfrage ist bereits erfasst. " * 12
+        md = f":::card\ntitle: Echt\n{body}\ntitle: this is a literal field name\n:::"
+        flat = str(render_blocks(md))
+        assert "**Echt**" in flat
+        assert "title: this is a literal field name" in flat
+        assert "**this is a literal field name**" not in flat

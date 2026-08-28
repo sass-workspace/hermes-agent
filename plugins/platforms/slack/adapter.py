@@ -61,9 +61,15 @@ from gateway.platforms.base import (
 )
 
 try:  # sibling module; support both package and flat plugin-dir import
-    from .block_kit import render_blocks, sanitize_blocks, strip_directives
+    from .block_kit import (
+        render_blocks, sanitize_blocks, strip_directives,
+        partition_blocks, group_notification_text, group_mrkdwn_text, payload_size,
+    )
 except ImportError:  # pragma: no cover - plugin loaded outside package context
-    from block_kit import render_blocks, sanitize_blocks, strip_directives  # type: ignore
+    from block_kit import (  # type: ignore
+        render_blocks, sanitize_blocks, strip_directives,
+        partition_blocks, group_notification_text, group_mrkdwn_text, payload_size,
+    )
 
 
 logger = logging.getLogger(__name__)
@@ -3096,7 +3102,12 @@ class SlackAdapter(BasePlatformAdapter):
             # that had to be split is pathological for Block Kit's 50-block /
             # 3000-char limits, so those fall back to plain text. The ``text``
             # field is always kept as the notification/accessibility fallback.
-            blocks = self._maybe_blocks(content) if len(chunks) == 1 else None
+            groups = self._block_groups(content) if len(chunks) == 1 else None
+            if groups and len(groups) > 1 and (metadata or {}).get("expect_edits"):
+                # An editable status message is later edited in place by its
+                # ts alone; overflow posts would go stale. Keep it one post.
+                groups = None
+            blocks = groups[0] if groups else None
 
             # With blocks attached, ``text`` is only the notification/screen
             # reader fallback, so it carries cleaned prose. Without them it IS
@@ -3127,15 +3138,18 @@ class SlackAdapter(BasePlatformAdapter):
                     if kwargs.get("blocks") and self._is_block_payload_rejection(e):
                         retry_kwargs = dict(kwargs)
                         retry_kwargs.pop("blocks", None)
-                        logger.info(
-                            "[Slack] Block Kit payload rejected; retrying send without blocks: %s",
-                            e,
-                        )
+                        self._log_block_rejection(e, kwargs.get("blocks"), "send")
+                        groups = None  # the layout is gone; no follow-ups
                         last_result = await self._get_client(
                             chat_id, team_id=team_id
                         ).chat_postMessage(**retry_kwargs)
                     else:
                         raise
+
+            # Overflow block groups → consecutive posts in the same context
+            # (thread when this was a thread reply, else top-level).
+            if groups and len(groups) > 1 and last_result:
+                await self._post_block_followups(chat_id, groups, thread_ts, team_id)
 
             # Clear Slack Assistant status as soon as the final message is posted.
             if thread_ts:
@@ -3309,8 +3323,10 @@ class SlackAdapter(BasePlatformAdapter):
             # edits stay plain mrkdwn — re-deriving a full block layout on every
             # progressive flush would be wasteful and jittery. ``text`` is kept
             # as the fallback either way.
+            groups: Optional[List[list]] = None
             if finalize:
-                blocks = self._maybe_blocks(content)
+                groups = self._block_groups(content)
+                blocks = groups[0] if groups else None
                 if blocks:
                     update_kwargs["blocks"] = blocks
                     # Same rule as send(): with blocks present, ``text`` is the
@@ -3323,6 +3339,15 @@ class SlackAdapter(BasePlatformAdapter):
                 await self._get_client(
                     chat_id, team_id=self._metadata_team_id(metadata)
                 ).chat_update(**update_kwargs)
+                if groups and len(groups) > 1:
+                    # The edited message keeps group 1; overflow follows in
+                    # the same context (its thread, else top-level).
+                    await self._post_block_followups(
+                        chat_id,
+                        groups,
+                        self._resolve_thread_ts(None, metadata),
+                        self._metadata_team_id(metadata),
+                    )
             except Exception as e:
                 if update_kwargs.get("blocks") and self._is_block_payload_rejection(e):
                     retry_kwargs = dict(update_kwargs)
@@ -3330,10 +3355,7 @@ class SlackAdapter(BasePlatformAdapter):
                     # flat text update path; otherwise Slack can preserve the
                     # prior block layout for an edited message.
                     retry_kwargs["blocks"] = []
-                    logger.info(
-                        "[Slack] Block Kit payload rejected; retrying edit without blocks: %s",
-                        e,
-                    )
+                    self._log_block_rejection(e, update_kwargs.get("blocks"), "edit")
                     await self._get_client(
                         chat_id, team_id=self._metadata_team_id(metadata)
                     ).chat_update(**retry_kwargs)
@@ -4315,6 +4337,7 @@ class SlackAdapter(BasePlatformAdapter):
         recoverable_codes = {
             "invalid_blocks",
             "msg_too_long",
+            "msg_blocks_too_long",
             "too_many_blocks",
         }
         response = getattr(error, "response", None)
@@ -4444,18 +4467,106 @@ class SlackAdapter(BasePlatformAdapter):
         when Slack rejects the payload (e.g. a surface without ``markdown``
         block support).
         """
+        groups = self._block_groups(content)
+        return groups[0] if groups else None
+
+    def _block_groups(self, content: str) -> Optional[List[list]]:
+        """Render ``content`` into one or more Block Kit payloads.
+
+        The first group is the message itself; further groups are overflow
+        the caller posts as consecutive follow-ups (``_post_block_followups``).
+        Partitioning replaces the old "decline above 50 blocks / let Slack
+        reject and retry flat" behaviour: a long brief now costs a second
+        post, never its layout. The feedback block rides on the LAST group
+        (one per response); ``sanitize_blocks`` runs per group because its
+        cumulative markdown budget is a per-payload limit.
+        """
         if self._markdown_blocks_enabled():
             md_blocks = self._markdown_block_payload(content)
             if md_blocks:
-                return sanitize_blocks(self._append_feedback_block(md_blocks))
+                sanitized = sanitize_blocks(self._append_feedback_block(md_blocks))
+                return [sanitized] if sanitized else None
         if not self._rich_blocks_enabled():
             return None
         try:
             blocks = render_blocks(content, mrkdwn_fn=self.format_message)
-            return sanitize_blocks(self._append_feedback_block(blocks))
+            if not blocks:
+                return None
+            groups = partition_blocks(blocks)
+            if not groups:
+                return None
+            groups[-1] = self._append_feedback_block(groups[-1]) or groups[-1]
+            out: List[list] = []
+            for g in groups:
+                sg = sanitize_blocks(g)
+                if sg:
+                    out.append(sg)
+            return out or None
         except Exception:  # pragma: no cover - renderer already guards itself
             logger.debug("[Slack] block render failed; using plain text", exc_info=True)
             return None
+
+    async def _post_block_followups(
+        self,
+        chat_id: str,
+        groups: List[list],
+        thread_ts: Optional[str],
+        team_id: Optional[str],
+    ) -> None:
+        """Post overflow block groups as consecutive messages.
+
+        Follow-ups inherit the first post's context: ``thread_ts`` when it
+        was a thread reply, otherwise top-level — a brief's second half must
+        never hide under the first as "1 Antwort". Each carries its own
+        plain-text fallback; a rejected follow-up is retried without blocks
+        (its own text), and a failure never fails the already-delivered
+        first message. Never ``reply_broadcast``.
+        """
+        total = len(groups)
+        for idx, group in enumerate(groups[1:], 1):
+            kwargs: Dict[str, Any] = {
+                "channel": chat_id,
+                "text": group_notification_text(group, idx, total),
+                "mrkdwn": True,
+                "blocks": group,
+            }
+            if thread_ts:
+                kwargs["thread_ts"] = thread_ts
+            try:
+                try:
+                    result = await self._get_client(chat_id, team_id=team_id).chat_postMessage(**kwargs)
+                except Exception as e:
+                    if self._is_block_payload_rejection(e):
+                        self._log_block_rejection(e, group, "follow-up")
+                        retry = dict(kwargs)
+                        retry.pop("blocks", None)
+                        # The flat retry must carry the WHOLE overflow, not the
+                        # 600-char notification text.
+                        retry["text"] = group_mrkdwn_text(group)
+                        result = await self._get_client(chat_id, team_id=team_id).chat_postMessage(**retry)
+                    else:
+                        raise
+                ts = (result or {}).get("ts") if result else None
+                if ts:
+                    self._bot_message_ts.add(self._workspace_message_marker(team_id, str(ts)))
+            except Exception as e:
+                logger.warning(
+                    "[Slack] Block Kit follow-up %d/%d to %s failed: %s", idx + 1, total, chat_id, e
+                )
+        self._trim_bot_message_timestamps()
+
+    def _log_block_rejection(self, error: BaseException, blocks: Optional[list], where: str) -> None:
+        """Size rejections after partitioning are a budget-tuning signal (WARNING);
+        ``invalid_blocks`` is a renderer bug (INFO, retried flat as before)."""
+        message = str(error)
+        if "msg_too_long" in message or "msg_blocks_too_long" in message or "too_many_blocks" in message:
+            logger.warning(
+                "[Slack] Block Kit payload rejected by size on %s (%d bytes, %d blocks) — "
+                "lower BLOCK_PAYLOAD_BUDGET: %s",
+                where, payload_size(blocks), len(blocks or []), error,
+            )
+        else:
+            logger.info("[Slack] Block Kit payload rejected on %s; retrying without blocks: %s", where, error)
 
     # Slack shows the ``text`` field — not the blocks — in push notifications,
     # desktop banners and the sidebar preview. Sending the whole converted
@@ -9836,6 +9947,29 @@ async def _standalone_upload_file(
     return {"success": True, "message_id": message_id, "raw": result}
 
 
+def _standalone_block_groups(pconfig, message: str) -> Optional[List[list]]:
+    """Block Kit groups for the standalone lane — same switches as the adapter
+    (``rich_blocks`` / ``markdown_blocks`` / ``feedback_buttons`` in the
+    platform ``extra``), evaluated on a config-only adapter shell."""
+    if not message or not message.strip():
+        return None
+    try:
+        shell = SlackAdapter.__new__(SlackAdapter)
+        shell.config = pconfig
+        return shell._block_groups(message)
+    except Exception:
+        logger.debug("[Slack] _standalone_send: block render failed; plain text", exc_info=True)
+        return None
+
+
+def _standalone_notification_text(message: str) -> str:
+    try:
+        shell = SlackAdapter.__new__(SlackAdapter)
+        return shell.notification_text(message)
+    except Exception:
+        return ""
+
+
 async def _standalone_send(
     pconfig,
     chat_id,
@@ -10072,22 +10206,73 @@ async def _standalone_send(
             "channel_not_found",
         }
         last_error = "unknown"
+        # Block Kit parity with the live adapter: a cron job run from the CLI
+        # (``hermes cron run``) used to arrive as flat mrkdwn while the same
+        # job from the ticker arrived with the full layout (observed live
+        # 2026-08-27). Same renderer, same partitioning, same text fallback.
+        groups = _standalone_block_groups(pconfig, message)
         async with aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=30), **_sess_kw
         ) as session:
-            payload = {"channel": chat_id, "text": formatted, "mrkdwn": True}
-            if thread_id:
-                payload["thread_ts"] = thread_id
-            for tok in tokens:
+
+            async def _post(tok: str, body: Dict[str, Any]) -> Dict[str, Any]:
                 headers = {
                     "Authorization": f"Bearer {tok}",
                     "Content-Type": "application/json",
                 }
                 async with session.post(
-                    url, headers=headers, json=payload, **_req_kw
+                    url, headers=headers, json=body, **_req_kw
                 ) as resp:
-                    data = await resp.json()
+                    return await resp.json()
+
+            payload: Dict[str, Any] = {"channel": chat_id, "text": formatted, "mrkdwn": True}
+            if groups:
+                payload["blocks"] = groups[0]
+                notify = _standalone_notification_text(message)
+                if notify:
+                    payload["text"] = notify
+            if thread_id:
+                payload["thread_ts"] = thread_id
+            for tok in tokens:
+                data = await _post(tok, payload)
+                if not data.get("ok") and payload.get("blocks") and data.get("error") in (
+                    "invalid_blocks", "msg_too_long", "msg_blocks_too_long", "too_many_blocks",
+                ):
+                    logger.warning(
+                        "[Slack] _standalone_send: Block Kit payload rejected (%s, %d bytes); "
+                        "retrying without blocks", data.get("error"), payload_size(payload["blocks"]),
+                    )
+                    flat = {k: v for k, v in payload.items() if k != "blocks"}
+                    flat["text"] = formatted
+                    data = await _post(tok, flat)
+                    groups = None
                 if data.get("ok"):
+                    if groups and len(groups) > 1:
+                        for idx, group in enumerate(groups[1:], 1):
+                            follow: Dict[str, Any] = {
+                                "channel": chat_id,
+                                "text": group_notification_text(group, idx, len(groups)),
+                                "mrkdwn": True,
+                                "blocks": group,
+                            }
+                            if thread_id:
+                                follow["thread_ts"] = thread_id
+                            fdata = await _post(tok, follow)
+                            if not fdata.get("ok") and fdata.get("error") in (
+                                "invalid_blocks", "msg_too_long", "msg_blocks_too_long", "too_many_blocks",
+                            ):
+                                logger.warning(
+                                    "[Slack] _standalone_send: follow-up %d/%d blocks rejected (%s); retrying flat",
+                                    idx + 1, len(groups), fdata.get("error"),
+                                )
+                                flat_follow = {k: v for k, v in follow.items() if k != "blocks"}
+                                flat_follow["text"] = group_mrkdwn_text(group)
+                                fdata = await _post(tok, flat_follow)
+                            if not fdata.get("ok"):
+                                logger.warning(
+                                    "[Slack] _standalone_send: follow-up %d/%d failed: %s",
+                                    idx + 1, len(groups), fdata.get("error"),
+                                )
                     return {
                         "success": True,
                         "platform": "slack",

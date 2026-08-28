@@ -108,10 +108,80 @@ class TestTables:
 
 class TestLimits:
 
-    def test_too_many_blocks_returns_none(self):
-        # 60 dividers => 60 blocks > MAX_BLOCKS => decline (caller uses text)
+    def test_too_many_blocks_no_longer_declines(self):
+        # 60 dividers => 60 blocks. The renderer used to return None (caller
+        # fell back to flat text); the adapter now partitions instead.
         md = "\n\n".join(["---"] * (MAX_BLOCKS + 10))
-        assert render_blocks(md) is None
+        blocks = render_blocks(md)
+        assert blocks is not None and len(blocks) == MAX_BLOCKS + 10
+
+
+class TestPayloadPartition:
+    """partition_blocks: <= budget and <= MAX_BLOCKS per group, never inside a block."""
+
+    def _brief(self, clients=8, items=6, heading="**Kunde {c} · Matien**"):
+        parts = ["## Täglicher Exception-Brief · 27. August 2026", ""]
+        for c in range(clients):
+            parts.append(heading.format(c=c))
+            parts.append("")
+            for i in range(items):
+                k = 400 + c * 10 + i
+                parts.append(
+                    f"- 🟡 **Freigabe nötig** · [TUR-{k}](https://elbdev.atlassian.net/browse/TUR-{k}) "
+                    "— Warenkorb-Rabatt ist veröffentlichungsbereit; Feedback zu Banner und Farbe muss geprüft werden."
+                )
+            parts.append("")
+        return "\n".join(parts)
+
+    def test_payload_size_counts_serialized_bytes(self):
+        from plugins.platforms.slack.block_kit import payload_size
+        assert payload_size(None) == 0
+        assert 0 < payload_size(render_blocks("hallo")) < payload_size(render_blocks("hallo " * 500))
+
+    def test_under_budget_stays_one_group(self):
+        from plugins.platforms.slack.block_kit import partition_blocks
+        blocks = render_blocks(self._brief(clients=2, items=3))
+        assert partition_blocks(blocks) == [blocks]
+
+    def test_over_budget_splits_and_respects_limits(self):
+        from plugins.platforms.slack.block_kit import partition_blocks, payload_size
+        blocks = render_blocks(self._brief(clients=8, items=6))
+        groups = partition_blocks(blocks, budget=6000)
+        assert len(groups) > 1
+        assert [b for g in groups for b in g] == blocks  # order preserved, nothing lost
+        for g in groups:
+            assert payload_size(g) <= 6000 or len(g) == 1
+            assert len(g) <= MAX_BLOCKS
+            assert g[-1]["type"] != "divider"
+
+    def test_block_count_alone_splits(self):
+        from plugins.platforms.slack.block_kit import partition_blocks
+        groups = partition_blocks(render_blocks("\n\n".join(["---"] * (MAX_BLOCKS + 10))))
+        assert len(groups) >= 2 and all(len(g) <= MAX_BLOCKS for g in groups)
+
+    def test_header_opens_the_next_group(self):
+        from plugins.platforms.slack.block_kit import partition_blocks
+        blocks = render_blocks(self._brief(clients=6, items=6, heading="## Kunde {c}"))
+        groups = partition_blocks(blocks, budget=5000)
+        assert len(groups) > 1
+        assert all(g[0]["type"] == "header" for g in groups[1:])
+
+    def test_markdown_group_uses_the_lower_budget(self):
+        from plugins.platforms.slack.block_kit import partition_blocks, MARKDOWN_GROUP_BUDGET, payload_size
+        report = ":::report\n" + "\n".join(f"- Zeile {i} " + "x" * 80 for i in range(120)) + "\n:::"
+        md = "Vorab.\n\n" + report + "\n\n" + "\n".join(f"- Punkt {i} " + "y" * 200 for i in range(40))
+        groups = partition_blocks(render_blocks(md))
+        assert len(groups) >= 2
+        for g in groups:
+            if any(b["type"] == "markdown" for b in g):
+                assert payload_size(g) <= MARKDOWN_GROUP_BUDGET or len(g) == 1
+
+    def test_group_notification_text_is_plain_words(self):
+        from plugins.platforms.slack.block_kit import group_notification_text
+        blocks = render_blocks("**Kunde 1**\n\n- 🟡 **Freigabe** · [TUR-1](https://x/1) — warum")
+        text = group_notification_text(blocks, 1, 2)
+        assert "TUR-1" in text and "*" not in text and "https://" not in text
+        assert group_notification_text([{"type": "divider"}], 1, 3) == "(Teil 2/3)"
 
 
 class TestEmptyContentGuards:
@@ -234,3 +304,23 @@ class TestSplitTextFenceBalanced:
             )
 
 
+
+
+class TestPartitionReviewFindings:
+    """Codex review 2026-08-28: the carried tail must be re-checked."""
+
+    def test_backed_off_tail_never_leaves_over_budget(self):
+        from plugins.platforms.slack.block_kit import partition_blocks, payload_size
+        items = "\n".join(f"- Punkt {i} " + "x" * 200 for i in range(50))
+        md = f"p\n\n## Header\n\n{items}\n\n{items}"
+        blocks = render_blocks(md)
+        groups = partition_blocks(blocks)
+        for g in groups:
+            assert payload_size(g) <= 20000 or len(g) == 1, [payload_size(x) for x in groups]
+        assert [b for g in groups for b in g] == blocks
+
+    def test_group_mrkdwn_text_carries_the_whole_group(self):
+        from plugins.platforms.slack.block_kit import group_mrkdwn_text
+        md = "## Titel\n\n**Lead**\n\n- 🟡 **Freigabe** · [TUR-1](https://x/1) — warum\n- zweiter Punkt\n\n-# Quelle: Jira"
+        text = group_mrkdwn_text(render_blocks(md))
+        assert "*Titel*" in text and "<https://x/1|TUR-1>" in text and "zweiter Punkt" in text and "Quelle: Jira" in text

@@ -476,6 +476,26 @@ class TestStructuredOutputAfterSeal:
         assert ":::" not in kwargs["text"]  # notification text, no scaffolding
 
     @pytest.mark.asyncio
+    async def test_long_streamed_final_seals_once_and_overflows_into_follow_ups(self, monkeypatch):
+        from plugins.platforms.slack import block_kit
+        monkeypatch.setattr(block_kit, "BLOCK_PAYLOAD_BUDGET", 1500)
+        adapter, client = _make_adapter({"rich_blocks": True})
+        body = "\n\n".join(
+            f"**Kunde {i}**\n\n- 🟡 **Freigabe** · [TUR-{i}](https://elbdev.atlassian.net/browse/TUR-{i}) — " + "warum " * 20
+            for i in range(8)
+        )
+        await adapter.send_draft("D1", 7, body, metadata=META)
+        result = await adapter.send("D1", body, metadata=META)
+        assert result.success and result.message_id == "123.456"
+        assert client.chat_stopStream.await_count == 1
+        client.chat_update.assert_awaited_once()
+        first = client.chat_update.await_args.kwargs["blocks"]
+        follow = client.chat_postMessage.await_args_list
+        assert len(follow) >= 1  # overflow only
+        assert all(c.kwargs["blocks"] != first for c in follow)
+        assert all(c.kwargs["thread_ts"] == META["thread_id"] for c in follow)
+
+    @pytest.mark.asyncio
     async def test_block_rejection_retries_without_blocks_no_post(self):
         adapter, client = _make_adapter({"rich_blocks": True})
         await adapter.send_draft("D1", 7, CARD_MD, metadata=META)
