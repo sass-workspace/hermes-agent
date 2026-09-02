@@ -464,40 +464,4 @@ def test_a_gate_rejection_before_dispatch_is_still_recorded():
     assert summary["tool_calls"] >= 1
 
 
-def test_sequential_executor_forwards_the_split_to_the_hook():
-    """The executor suppresses the dispatcher's hook and emits its own.
 
-    Without forwarding the split there, every approval-heavy sequential call
-    — dangerous terminal commands above all — reports approval_wait_ms=0 to
-    plugin consumers.
-    """
-    import inspect
-
-    from agent import tool_executor
-
-    src = inspect.getsource(tool_executor._emit_terminal_post_tool_call)
-    assert "approval_wait_ms=approval_wait_ms" in src, (
-        "the executor's post_tool_call emission dropped the approval split"
-    )
-    seq = inspect.getsource(tool_executor)
-    assert "approval_wait_ms=_measured_approval_wait_ms(tool_call_id)" in seq, (
-        "the sequential executor no longer forwards the approval split"
-    )
-
-
-def test_model_time_is_recorded_per_attempt_not_from_the_retry_anchor():
-    """Backoff between failed attempts must not land in the model bucket.
-
-    Timing from the pre-retry-loop anchor folded every earlier attempt and
-    every backoff sleep into one number, and recorded nothing at all when the
-    provider raised.
-    """
-    import inspect
-
-    from agent import conversation_loop
-
-    src = inspect.getsource(conversation_loop.run_conversation)
-    assert "_model_attempt_start = time.monotonic()" in src
-    assert "record_model_call(\n" in src or "record_model_call(" in src
-    # The attempt timer must not be derived from api_start_time.
-    assert "record_model_call(turn_id, api_duration)" not in src

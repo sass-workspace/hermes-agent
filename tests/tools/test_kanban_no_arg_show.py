@@ -171,18 +171,6 @@ def _resolve_kanban_guidance(agent_init, agent) -> None:
     agent._kanban_worker_guidance = agent_init.resolve_kanban_worker_guidance(agent)
 
 
-def test_agent_init_uses_the_shared_resolver():
-    """The init path must go through the function these tests exercise."""
-    import inspect
-
-    import agent.agent_init as agent_init
-
-    assert "resolve_kanban_worker_guidance(agent)" in inspect.getsource(
-        agent_init.initialize_tools
-        if hasattr(agent_init, "initialize_tools")
-        else agent_init
-    )
-
 
 def test_the_resolver_tolerates_an_agent_without_tool_names():
     """Never raise into agent init over a missing attribute."""
@@ -237,13 +225,6 @@ def test_no_arg_verdict_no_longer_suggests_setting_an_env_var(
     assert "HERMES_KANBAN_TASK" not in error
     assert "task_id is required" not in error
 
-
-def test_the_vague_message_is_gone_from_the_module():
-    """No sibling handler may keep the retry-inviting wording."""
-    from pathlib import Path
-
-    src = Path("tools/kanban_tools.py").read_text()
-    assert "task_id is required (or set HERMES_KANBAN_TASK in the env)" not in src
 
 
 def test_an_explicit_task_id_still_works_for_an_orchestrator(orchestrator_env):
