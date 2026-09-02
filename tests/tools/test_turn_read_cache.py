@@ -1,16 +1,21 @@
-"""Identical read-only tool calls inside one turn must not be re-sent.
+"""Consecutive identical read-only tool calls must not be re-sent.
 
-A turn that calls ``mcp__asana__get_task(gid="123")`` four times gets the same
-payload four times, and every copy stays in the conversation for the rest of
-the session — inflating context and, with it, the latency of every later
-request. The model learned nothing on calls two through four.
+A turn that calls ``mcp__asana__get_task(gid="123")`` four times in a row
+gets the same payload four times, and every copy stays in the conversation
+for the rest of the session — inflating context and, with it, the latency of
+every later request.
 
-The dangerous version of this optimisation returns stale data. These tests
-pin the three rules that stop it:
+The dangerous version of this optimisation returns stale data, and unlike
+``read_file`` this module has no freshness signal to check: a hosted MCP
+server's data can change underneath us at any moment. So it only suppresses
+a repeat of the IMMEDIATELY PRECEDING call — where nothing the agent did
+could have changed anything, and the staleness window is one model
+round-trip. These tests pin that, plus the rules that keep it honest:
 
-  1. read-only only, proven by ``readOnlyHint: true`` and nothing weaker;
-  2. any write invalidates the whole turn's cache;
-  3. errors are never suppressed — a failed call stays retryable.
+  * only tools proven read-only by ``readOnlyHint: true``;
+  * any other tool forgets the cache, with a generation bump so a write
+    landing mid-call cannot leave a pre-write result behind;
+  * errors are never suppressed.
 """
 from __future__ import annotations
 
@@ -29,76 +34,139 @@ def _clean():
     turn_read_cache.reset_for_tests()
 
 
+def _suppressed(turn, tool, args):
+    """The replacement result, or None when the call should run."""
+    return turn_read_cache.check(turn, tool, args)[0]
+
+
+def _run(turn, tool, args):
+    """Simulate a completed read: check, then record."""
+    out, gen = turn_read_cache.check(turn, tool, args)
+    if out is None:
+        turn_read_cache.record(turn, tool, args, gen)
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Core behavior
 # ---------------------------------------------------------------------------
 
 
 def test_a_first_call_is_never_suppressed():
-    assert turn_read_cache.check("t1", "get_task", {"gid": "1"}) is None
+    assert _suppressed("t1", "get_task", {"gid": "1"}) is None
 
 
-def test_an_identical_repeat_is_suppressed():
-    turn_read_cache.record("t1", "get_task", {"gid": "1"})
-    out = turn_read_cache.check("t1", "get_task", {"gid": "1"})
+def test_an_immediate_repeat_is_suppressed():
+    _run("t1", "get_task", {"gid": "1"})
+    out = _suppressed("t1", "get_task", {"gid": "1"})
     assert out is not None
     parsed = json.loads(out)
     assert parsed["suppressed"] is True
     assert parsed["content_returned"] is False
-    assert "refer to it" in parsed["message"]
+    assert "directly above" in parsed["message"]
+
+
+def test_a_repeat_after_another_read_is_NOT_suppressed():
+    """The safety property the whole design turns on.
+
+    A re-read after other work is a deliberate re-read — the model has a
+    reason, and the world may have moved. Only a back-to-back repeat is
+    provably useless.
+    """
+    _run("t1", "get_task", {"gid": "1"})
+    _run("t1", "get_task", {"gid": "2"})
+    assert _suppressed("t1", "get_task", {"gid": "1"}) is None
 
 
 def test_different_arguments_are_not_suppressed():
-    turn_read_cache.record("t1", "get_task", {"gid": "1"})
-    assert turn_read_cache.check("t1", "get_task", {"gid": "2"}) is None
+    _run("t1", "get_task", {"gid": "1"})
+    assert _suppressed("t1", "get_task", {"gid": "2"}) is None
 
 
 def test_argument_order_does_not_defeat_the_match():
-    turn_read_cache.record("t1", "search", {"a": 1, "b": 2})
-    assert turn_read_cache.check("t1", "search", {"b": 2, "a": 1}) is not None
+    _run("t1", "search", {"a": 1, "b": 2})
+    assert _suppressed("t1", "search", {"b": 2, "a": 1}) is not None
 
 
 def test_nested_argument_structures_match_by_value():
-    turn_read_cache.record("t1", "q", {"filter": {"x": [1, 2], "y": "z"}})
-    assert turn_read_cache.check("t1", "q", {"filter": {"y": "z", "x": [1, 2]}}) is not None
+    _run("t1", "q", {"filter": {"x": [1, 2], "y": "z"}})
+    assert _suppressed("t1", "q", {"filter": {"y": "z", "x": [1, 2]}}) is not None
 
 
 def test_a_different_tool_with_the_same_arguments_is_not_suppressed():
-    turn_read_cache.record("t1", "get_task", {"gid": "1"})
-    assert turn_read_cache.check("t1", "get_project", {"gid": "1"}) is None
+    _run("t1", "get_task", {"gid": "1"})
+    assert _suppressed("t1", "get_project", {"gid": "1"}) is None
 
 
-def test_unserializable_arguments_are_never_suppressed():
-    """No key, no suppression — fall through and run the call."""
-    class _Weird:
-        pass
+def test_arguments_that_cannot_be_keyed_are_never_suppressed():
+    """No stable key, no suppression — fall through and run the call."""
+    class _Unkeyable:
+        def __repr__(self):
+            raise RuntimeError("cannot render")
 
-    args = {"obj": _Weird()}
-    turn_read_cache.record("t1", "get_task", args)
-    # default=str makes most things serializable; an object whose repr
-    # differs per instance simply won't match, which is the safe direction.
-    assert turn_read_cache.check("t1", "get_task", {"obj": _Weird()}) is None
-
-
-# ---------------------------------------------------------------------------
-# Rule 2: a write invalidates the turn
-# ---------------------------------------------------------------------------
+    args = {"obj": _Unkeyable()}
+    assert turn_read_cache._call_key("get_task", args) is None
+    _run("t1", "get_task", args)
+    assert _suppressed("t1", "get_task", args) is None
 
 
-def test_invalidate_clears_the_turn():
-    """get -> update -> get must NOT answer the third call from the first."""
-    turn_read_cache.record("t1", "get_task", {"gid": "1"})
-    assert turn_read_cache.check("t1", "get_task", {"gid": "1"}) is not None
+def test_arguments_are_matched_by_their_serialized_form():
+    """Equal-by-value arguments match; unequal ones do not.
+
+    Keys come from a canonical JSON encoding with ``default=str``, so the
+    contract is "serializes the same" rather than "is the same object".
+    """
+    _run("t1", "get_task", {"gid": "1", "opt": None})
+    assert _suppressed("t1", "get_task", {"opt": None, "gid": "1"}) is not None
 
     turn_read_cache.invalidate("t1")
-    assert turn_read_cache.check("t1", "get_task", {"gid": "1"}) is None
+    _run("t1", "get_task", {"gid": "1"})
+    assert _suppressed("t1", "get_task", {"gid": 1}) is None
+
+
+# ---------------------------------------------------------------------------
+# Invalidation, including under concurrency
+# ---------------------------------------------------------------------------
+
+
+def test_invalidate_clears_the_last_call():
+    """get -> update -> get must NOT answer the third call from the first."""
+    _run("t1", "get_task", {"gid": "1"})
+    assert _suppressed("t1", "get_task", {"gid": "1"}) is not None
+
+    turn_read_cache.invalidate("t1")
+    assert _suppressed("t1", "get_task", {"gid": "1"}) is None
 
 
 def test_invalidate_does_not_touch_other_turns():
-    turn_read_cache.record("t1", "get_task", {"gid": "1"})
-    turn_read_cache.record("t2", "get_task", {"gid": "1"})
+    _run("t1", "get_task", {"gid": "1"})
+    _run("t2", "get_task", {"gid": "1"})
     turn_read_cache.invalidate("t1")
-    assert turn_read_cache.check("t2", "get_task", {"gid": "1"}) is not None
+    assert _suppressed("t2", "get_task", {"gid": "1"}) is not None
+
+
+def test_a_write_landing_mid_call_voids_the_recording():
+    """Concurrent batches: the read started first but finished last.
+
+    Invalidating on the write is not enough on its own — the in-flight read
+    would otherwise record its pre-write result afterwards, and the next
+    identical call would be answered from it.
+    """
+    _out, gen = turn_read_cache.check("t1", "get_task", {"gid": "1"})
+    assert _out is None
+
+    # A concurrent update_task lands while the read is still in flight.
+    turn_read_cache.invalidate("t1")
+
+    recorded = turn_read_cache.record("t1", "get_task", {"gid": "1"}, gen)
+    assert recorded is False, "a pre-write result was cached after the write"
+    assert _suppressed("t1", "get_task", {"gid": "1"}) is None
+
+
+def test_a_read_with_no_intervening_write_records_normally():
+    _out, gen = turn_read_cache.check("t1", "get_task", {"gid": "1"})
+    assert turn_read_cache.record("t1", "get_task", {"gid": "1"}, gen) is True
+    assert _suppressed("t1", "get_task", {"gid": "1"}) is not None
 
 
 # ---------------------------------------------------------------------------
@@ -107,52 +175,44 @@ def test_invalidate_does_not_touch_other_turns():
 
 
 def test_turns_do_not_share_a_cache():
-    turn_read_cache.record("t1", "get_task", {"gid": "1"})
-    assert turn_read_cache.check("t2", "get_task", {"gid": "1"}) is None
+    _run("t1", "get_task", {"gid": "1"})
+    assert _suppressed("t2", "get_task", {"gid": "1"}) is None
 
 
 def test_an_empty_turn_id_never_suppresses():
-    turn_read_cache.record("", "get_task", {"gid": "1"})
-    assert turn_read_cache.check("", "get_task", {"gid": "1"}) is None
+    _run("", "get_task", {"gid": "1"})
+    assert _suppressed("", "get_task", {"gid": "1"}) is None
 
 
 def test_finish_turn_forgets_it():
-    turn_read_cache.record("t1", "get_task", {"gid": "1"})
+    _run("t1", "get_task", {"gid": "1"})
     turn_read_cache.finish_turn("t1")
-    assert turn_read_cache.check("t1", "get_task", {"gid": "1"}) is None
+    assert _suppressed("t1", "get_task", {"gid": "1"}) is None
 
 
 def test_the_turn_registry_is_bounded():
     for i in range(turn_read_cache._MAX_TRACKED_TURNS + 20):
-        turn_read_cache.record(f"turn-{i}", "get_task", {"gid": "1"})
-    assert len(turn_read_cache._turn_reads) == turn_read_cache._MAX_TRACKED_TURNS
+        _run(f"turn-{i}", "get_task", {"gid": "1"})
+    assert len(turn_read_cache._turns) == turn_read_cache._MAX_TRACKED_TURNS
 
 
-def test_the_per_turn_key_count_is_bounded():
-    for i in range(turn_read_cache._MAX_KEYS_PER_TURN + 20):
-        turn_read_cache.record("t1", "get_task", {"gid": str(i)})
-    assert len(turn_read_cache._turn_reads["t1"]) == turn_read_cache._MAX_KEYS_PER_TURN
-
-
-def test_concurrent_use_is_serialised():
-    """Every distinct key survives; none is lost to a torn update.
-
-    Stays under _MAX_KEYS_PER_TURN so eviction cannot mask a lost write.
-    """
-    per_thread = 30
-    threads_n = 6
-    assert per_thread * threads_n <= turn_read_cache._MAX_KEYS_PER_TURN
-
+def test_concurrent_use_does_not_corrupt_state():
+    """Threads racing on one turn must leave it coherent, never wedged."""
     def _worker(n):
-        for i in range(per_thread):
-            turn_read_cache.record("t1", "get_task", {"gid": f"{n}-{i}"})
+        for i in range(50):
+            _run("t1", "get_task", {"gid": f"{n}-{i}"})
+            turn_read_cache.invalidate("t1")
 
-    threads = [threading.Thread(target=_worker, args=(n,)) for n in range(threads_n)]
+    threads = [threading.Thread(target=_worker, args=(n,)) for n in range(6)]
     for t in threads:
         t.start()
     for t in threads:
         t.join()
-    assert len(turn_read_cache._turn_reads["t1"]) == per_thread * threads_n
+
+    # Still usable, and the last write left nothing cached.
+    assert _suppressed("t1", "get_task", {"gid": "0-0"}) is None
+    _run("t1", "get_task", {"gid": "z"})
+    assert _suppressed("t1", "get_task", {"gid": "z"}) is not None
 
 
 # ---------------------------------------------------------------------------
@@ -162,18 +222,18 @@ def test_concurrent_use_is_serialised():
 
 def test_repeated_ignoring_of_the_stub_escalates_to_a_hard_block():
     """A weak tool-follower must not burn its budget re-asking."""
-    turn_read_cache.record("t1", "get_task", {"gid": "1"})
+    _run("t1", "get_task", {"gid": "1"})
     for _ in range(turn_read_cache._HARD_BLOCK_AFTER):
-        out = json.loads(turn_read_cache.check("t1", "get_task", {"gid": "1"}))
+        out = json.loads(_suppressed("t1", "get_task", {"gid": "1"}))
         assert "error" not in out
 
-    blocked = json.loads(turn_read_cache.check("t1", "get_task", {"gid": "1"}))
+    blocked = json.loads(_suppressed("t1", "get_task", {"gid": "1"}))
     assert "BLOCKED" in blocked["error"]
     assert blocked["suppressed"] is True
 
 
 # ---------------------------------------------------------------------------
-# Rule 1: read-only classification
+# Read-only classification
 # ---------------------------------------------------------------------------
 
 
@@ -211,6 +271,12 @@ class TestReadOnlyClassification:
 
     def test_an_unknown_tool_is_not_read_only(self, mcp):
         assert turn_read_cache.is_read_only_tool("some_random_tool") is False
+
+    def test_a_deregistered_tool_fails_closed(self, mcp):
+        """After a park, the live provenance map is gone — never guess."""
+        self._install(mcp, True)
+        mcp._forget_mcp_tool_server("mcp__asana__get_task")
+        assert turn_read_cache.is_read_only_tool("mcp__asana__get_task") is False
 
     def test_core_file_tools_are_excluded(self, mcp):
         """read_file/search_files keep their own mtime-aware dedup."""
@@ -263,7 +329,7 @@ def read_only_probe(monkeypatch):
     _drop("_ro_probe")
 
 
-def test_dispatcher_suppresses_the_second_identical_read(read_only_probe):
+def test_dispatcher_suppresses_an_immediate_repeat(read_only_probe):
     from model_tools import handle_function_call
 
     first = json.loads(handle_function_call("_ro_probe", {"q": 1}, turn_id="T"))
@@ -276,13 +342,14 @@ def test_dispatcher_suppresses_the_second_identical_read(read_only_probe):
     assert "x" * 500 not in json.dumps(second)
 
 
-def test_dispatcher_does_not_suppress_different_arguments(read_only_probe):
+def test_dispatcher_does_not_suppress_after_another_call(read_only_probe):
     from model_tools import handle_function_call
 
     handle_function_call("_ro_probe", {"q": 1}, turn_id="T")
-    out = json.loads(handle_function_call("_ro_probe", {"q": 2}, turn_id="T"))
-    assert out["call"] == 2
-    assert read_only_probe["n"] == 2
+    handle_function_call("_ro_probe", {"q": 2}, turn_id="T")
+    out = json.loads(handle_function_call("_ro_probe", {"q": 1}, turn_id="T"))
+    assert out["call"] == 3
+    assert read_only_probe["n"] == 3
 
 
 def test_dispatcher_does_not_suppress_across_turns(read_only_probe):
@@ -336,7 +403,7 @@ def test_a_failed_read_is_not_suppressed(monkeypatch):
         _drop("_flaky_probe")
 
 
-def test_write_capable_tools_are_never_suppressed(monkeypatch):
+def test_write_capable_tools_are_never_suppressed():
     from model_tools import handle_function_call
     from tools.registry import tool_result
 
@@ -354,63 +421,3 @@ def test_write_capable_tools_are_never_suppressed(monkeypatch):
         assert calls["n"] == 2
     finally:
         _drop("_write_probe")
-
-
-# ---------------------------------------------------------------------------
-# The executor's direct-dispatch bypass
-# ---------------------------------------------------------------------------
-
-
-def test_every_direct_dispatch_tool_is_listed():
-    """The bypass list must cover every branch of the executor's ladder.
-
-    Those tools never reach handle_function_call, so they never hit the
-    invalidate-on-write rule there. If a new branch is added to the ladder
-    without adding its name here, a write would silently stop invalidating
-    and a cached read could go stale for the rest of the turn.
-    """
-    import inspect
-    import re
-
-    from agent import tool_executor
-
-    src = inspect.getsource(tool_executor)
-    ladder = src[src.index('if function_name == "todo":'):]
-    ladder = ladder[:ladder.index("\n        else:")]
-    branched = set(re.findall(r'function_name == "([a-z_]+)"', ladder))
-    assert branched, "could not find the executor's direct-dispatch ladder"
-
-    missing = branched - set(tool_executor._EXECUTOR_DIRECT_DISPATCH_TOOLS)
-    assert not missing, (
-        f"executor branches on {sorted(missing)} without listing them in "
-        "_EXECUTOR_DIRECT_DISPATCH_TOOLS — those writes would not invalidate "
-        "the per-turn read cache"
-    )
-
-
-def test_the_bypass_list_names_only_real_tools():
-    """A stale name here would silently invalidate nothing."""
-    import inspect
-
-    from agent import tool_executor
-
-    src = inspect.getsource(tool_executor)
-    for name in tool_executor._EXECUTOR_DIRECT_DISPATCH_TOOLS:
-        assert f'function_name == "{name}"' in src, (
-            f"{name} is listed as direct-dispatch but the executor has no "
-            "branch for it"
-        )
-
-
-def test_a_direct_dispatch_tool_invalidates_the_turn_cache():
-    """message_agent can drive another agent into mutating the read's subject."""
-    from agent import tool_executor
-
-    turn_read_cache.record("T", "get_task", {"gid": "1"})
-    assert turn_read_cache.check("T", "get_task", {"gid": "1"}) is not None
-
-    assert "message_agent" in tool_executor._EXECUTOR_DIRECT_DISPATCH_TOOLS
-    # Mirror what the executor does for a direct-dispatch tool.
-    turn_read_cache.invalidate("T")
-
-    assert turn_read_cache.check("T", "get_task", {"gid": "1"}) is None

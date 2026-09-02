@@ -1562,12 +1562,13 @@ def handle_function_call(
         # A write invalidates the whole turn's cache: get → update → get must
         # not answer the third call with the pre-update state.
         _suppressible = False
+        _read_generation = 0
         try:
             from tools import turn_read_cache
 
             _suppressible = turn_read_cache.is_read_only_tool(function_name)
             if _suppressible:
-                _suppressed = turn_read_cache.check(
+                _suppressed, _read_generation = turn_read_cache.check(
                     turn_id or "", function_name, function_args,
                 )
                 if _suppressed is not None:
@@ -1678,19 +1679,6 @@ def handle_function_call(
             except Exception:
                 logger.debug("turn latency: tool call not recorded", exc_info=True)
 
-        # Remember this read so an identical repeat later in the turn is
-        # answered from it. Errors are deliberately NOT recorded — a failed
-        # call has to stay retryable.
-        if _suppressible and not _tool_result_is_error(result):
-            try:
-                from tools import turn_read_cache
-
-                turn_read_cache.record(
-                    turn_id or "", function_name, function_args,
-                )
-            except Exception:
-                logger.debug("turn read cache record failed", exc_info=True)
-
         _emit_post_tool_call_hook(
             function_name=function_name,
             function_args=function_args,
@@ -1741,6 +1729,24 @@ def handle_function_call(
                         break
         except Exception as _hook_err:
             logger.debug("transform_tool_result hook error: %s", _hook_err)
+
+        # Remember this read as the turn's most recent call, so an
+        # immediately-following identical repeat can be answered from it.
+        # Recorded HERE, after transform_tool_result, so the cache's notion
+        # of "the result directly above" is the text the model actually got.
+        # Errors are deliberately not recorded — a failed call stays
+        # retryable — and the generation check drops this if a write landed
+        # while the call was in flight.
+        if _suppressible and not _tool_result_is_error(result):
+            try:
+                from tools import turn_read_cache
+
+                turn_read_cache.record(
+                    turn_id or "", function_name, function_args,
+                    _read_generation,
+                )
+            except Exception:
+                logger.debug("turn read cache record failed", exc_info=True)
 
         return result
 
