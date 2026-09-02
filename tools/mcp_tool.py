@@ -4639,6 +4639,35 @@ def _record_tool_trust_metadata(
                 hints[name] = _annotation_read_only_hint(tool)
 
 
+def is_read_only_mcp_tool(registry_tool_name: str) -> bool:
+    """True when this registered MCP tool is annotated ``readOnlyHint: true``.
+
+    Reuses the per-tool hints captured at discovery for the trust gate — the
+    same fail-closed rule applies, so a missing or malformed annotation reads
+    as write-capable. Consumed by ``tools/turn_read_cache.py`` to decide
+    whether an identical repeat call inside one turn can be answered from the
+    earlier result instead of re-fetching the payload.
+
+    ``registry_tool_name`` is the name as registered with the tool registry
+    (``mcp__<server>__<tool>``); the hints are keyed by the server's own tool
+    name, so resolve through the provenance map rather than parsing.
+    """
+    with _lock:
+        server_name = _mcp_tool_server_names.get(registry_tool_name)
+        if not server_name:
+            return False
+        hints = _tool_read_only_hints.get(server_name) or {}
+    # Registry names are prefixed AND sanitized, so the transform is not
+    # reversible by string surgery. Compare forwards instead: derive each
+    # candidate's registry name the same way registration did.
+    for bare_name, read_only in hints.items():
+        if read_only is not True:
+            continue
+        if mcp_prefixed_tool_name(server_name, bare_name) == registry_tool_name:
+            return True
+    return False
+
+
 def _trust_gate_check(server_name: str, tool_name: str) -> Optional[str]:
     """Consult the approval path for write-capable tools on untrusted servers.
 
