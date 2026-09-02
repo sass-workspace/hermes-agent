@@ -215,6 +215,46 @@ def approval_wait_timer():
         record_approval_wait(time.monotonic() - started)
 
 
+# --- Handing a measured split across threads --------------------------------
+#
+# The tool dispatcher measures the split on the thread the tool actually ran
+# on, which is the only thread where the mark and the wait are both visible.
+# The sequential executor emits its own post_tool_call hook from a DIFFERENT
+# thread (it hands the call to a worker), so it cannot measure it — a mark
+# taken there would always read zero. It reads the dispatcher's measurement
+# instead, keyed by tool_call_id, which is unique per call and therefore
+# race-free between concurrent tools.
+_MAX_PUBLISHED_CALLS = 256
+_published_call_waits: "OrderedDict[str, int]" = OrderedDict()
+_published_lock = threading.Lock()
+
+
+def publish_call_approval_wait(tool_call_id: str, approval_wait_ms: int) -> None:
+    """Publish one call's measured approval wait for another thread to read."""
+    if not tool_call_id:
+        return
+    try:
+        with _published_lock:
+            _published_call_waits[tool_call_id] = int(approval_wait_ms)
+            _published_call_waits.move_to_end(tool_call_id)
+            while len(_published_call_waits) > _MAX_PUBLISHED_CALLS:
+                _published_call_waits.popitem(last=False)
+    except Exception:
+        logger.debug("turn latency: publishing approval wait failed", exc_info=True)
+
+
+def take_call_approval_wait(tool_call_id: str) -> int:
+    """Pop the published approval wait for ``tool_call_id`` (0 if none)."""
+    if not tool_call_id:
+        return 0
+    try:
+        with _published_lock:
+            return int(_published_call_waits.pop(tool_call_id, 0))
+    except Exception:
+        logger.debug("turn latency: reading approval wait failed", exc_info=True)
+        return 0
+
+
 # ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
@@ -316,4 +356,6 @@ def reset_for_tests() -> None:
     """Drop all tracked turns and this thread's approval counter. Tests only."""
     with _registry_lock:
         _records.clear()
+    with _published_lock:
+        _published_call_waits.clear()
     _approval_thread_state.total = 0.0

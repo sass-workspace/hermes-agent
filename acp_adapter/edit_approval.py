@@ -250,8 +250,21 @@ def maybe_require_edit_approval(tool_name: str, arguments: dict[str, Any]) -> st
     if proposal is None:
         return None
 
+    # Everything inside the requester is the human deciding. Charge it to the
+    # active tool call's approval-wait bucket so the tool's own duration can
+    # be reported net of it — otherwise a fast edit looks slow purely because
+    # someone took a while to click Allow (agent/turn_latency.py).
     try:
-        approved = bool(requester(proposal))
+        from agent.turn_latency import approval_wait_timer
+    except Exception:  # pragma: no cover — accounting must never gate approval
+        approval_wait_timer = None
+
+    try:
+        if approval_wait_timer is None:
+            approved = bool(requester(proposal))
+        else:
+            with approval_wait_timer():
+                approved = bool(requester(proposal))
     except Exception as exc:
         logger.warning("ACP edit approval requester failed: %s", exc)
         approved = False

@@ -23,6 +23,7 @@ keep the exact logger name (``"agent.conversation_loop"``).
 from __future__ import annotations
 
 import logging
+import time as _time
 import os
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
@@ -190,7 +191,26 @@ def finalize_turn(
                 f"\n⚠️  Iteration budget exhausted ({api_call_count}/{agent.max_iterations}) "
                 "— requesting summary..."
             )
-        final_response = agent._handle_max_iterations(messages, api_call_count)
+        # This path calls the provider directly (chat_completion_helpers),
+        # outside the main loop's per-attempt timer — so without this the
+        # summary round-trip would land in the turn's unattributed `other`
+        # bucket, on exactly the turns that ran long enough to exhaust the
+        # iteration budget.
+        _summary_started = _time.monotonic()
+        try:
+            final_response = agent._handle_max_iterations(messages, api_call_count)
+        finally:
+            try:
+                from agent.turn_latency import record_model_call
+                record_model_call(
+                    str(getattr(agent, "_current_turn_id", "") or ""),
+                    _time.monotonic() - _summary_started,
+                )
+            except Exception:
+                logger.debug(
+                    "turn latency: max-iterations summary not recorded",
+                    exc_info=True,
+                )
         iteration_limit_fallback = True
 
     if iteration_limit_fallback:

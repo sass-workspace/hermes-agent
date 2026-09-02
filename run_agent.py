@@ -8968,12 +8968,13 @@ class AIAgent:
                     # clock went. Runs on every exit — normal, interrupted,
                     # or raised — because a slow turn that crashed is exactly
                     # the one worth accounting for.
+                    _ended_turn_id = (
+                        str(getattr(self, "_current_turn_id", "") or "")
+                        or relay_turn_id
+                    )
                     try:
                         from agent.turn_latency import finish_turn
-                        finish_turn(
-                            str(getattr(self, "_current_turn_id", "") or "")
-                            or relay_turn_id
-                        )
+                        finish_turn(_ended_turn_id)
                     except Exception:
                         logger.debug("turn latency: finish failed", exc_info=True)
                     if acct_token is not None:

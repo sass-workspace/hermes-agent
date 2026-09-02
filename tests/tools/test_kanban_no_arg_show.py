@@ -167,35 +167,31 @@ def test_guidance_absent_when_the_tool_is_absent(monkeypatch, orchestrator_env):
 
 
 def _resolve_kanban_guidance(agent_init, agent) -> None:
-    """Run agent_init's guidance resolution against a stub agent.
-
-    Mirrors the block in ``agent_init`` rather than importing a helper that
-    does not exist, so the test exercises the real decision: tool present AND
-    dispatcher-spawned worker.
-    """
-    from agent.prompt_builder import KANBAN_GUIDANCE
-    from tools.kanban_tools import is_dispatcher_spawned_task_worker
-
-    agent._kanban_worker_guidance = (
-        KANBAN_GUIDANCE
-        if "kanban_show" in agent.valid_tool_names
-        and is_dispatcher_spawned_task_worker()
-        else ""
-    )
+    """Invoke the REAL resolver agent_init uses, against a stub agent."""
+    agent._kanban_worker_guidance = agent_init.resolve_kanban_worker_guidance(agent)
 
 
-def test_agent_init_source_gates_on_the_worker_predicate():
-    """Guard the wiring itself: the resolution in agent_init must consult
-    the worker predicate, not merely the tool's presence."""
+def test_agent_init_uses_the_shared_resolver():
+    """The init path must go through the function these tests exercise."""
     import inspect
 
     import agent.agent_init as agent_init
 
-    src = inspect.getsource(agent_init)
-    assert "is_dispatcher_spawned_task_worker" in src, (
-        "agent_init no longer gates KANBAN_GUIDANCE on the worker predicate — "
-        "an orchestrator would be handed the worker protocol again"
+    assert "resolve_kanban_worker_guidance(agent)" in inspect.getsource(
+        agent_init.initialize_tools
+        if hasattr(agent_init, "initialize_tools")
+        else agent_init
     )
+
+
+def test_the_resolver_tolerates_an_agent_without_tool_names():
+    """Never raise into agent init over a missing attribute."""
+    import agent.agent_init as agent_init
+
+    class _Bare:
+        pass
+
+    assert agent_init.resolve_kanban_worker_guidance(_Bare()) == ""
 
 
 # ---------------------------------------------------------------------------

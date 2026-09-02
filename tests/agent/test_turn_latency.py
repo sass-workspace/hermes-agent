@@ -395,6 +395,75 @@ def test_a_raising_tool_is_recorded_exactly_once():
         _drop_probe("_latency_once_probe")
 
 
+def test_the_dispatcher_publishes_its_measured_split_for_another_thread():
+    """The executor emits the hook from a DIFFERENT thread than the tool ran on.
+
+    The approval counter is thread-local, so measuring in the executor would
+    always read zero — silently reporting approval_wait_ms=0 for exactly the
+    calls that block on a human longest (dangerous terminal commands). The
+    dispatcher publishes what it measured, keyed by tool_call_id.
+    """
+    from agent.tool_executor import _measured_approval_wait_ms
+    from model_tools import handle_function_call
+    from tools.registry import tool_result
+
+    def _handler(args, **kwargs):
+        with turn_latency.approval_wait_timer():
+            time.sleep(0.12)
+        return tool_result(ok=True)
+
+    _register_probe("_latency_cross_thread_probe", _handler)
+    seen = {}
+
+    def _run_on_worker():
+        handle_function_call(
+            "_latency_cross_thread_probe", {},
+            turn_id="turn-ct", tool_call_id="call-ct",
+        )
+
+    try:
+        worker = threading.Thread(target=_run_on_worker)
+        worker.start()
+        worker.join()
+
+        # Read it from THIS thread, whose own counter never moved.
+        assert turn_latency.approval_wait_total() == 0.0
+        seen["ms"] = _measured_approval_wait_ms("call-ct")
+        assert seen["ms"] >= 120, (
+            "the executor's thread could not see the wait the worker measured"
+        )
+        # Taking it consumes it, so a later call cannot reuse a stale value.
+        assert _measured_approval_wait_ms("call-ct") == 0
+    finally:
+        _drop_probe("_latency_cross_thread_probe")
+
+
+def test_published_splits_do_not_cross_between_concurrent_calls():
+    turn_latency.publish_call_approval_wait("call-a", 111)
+    turn_latency.publish_call_approval_wait("call-b", 222)
+    assert turn_latency.take_call_approval_wait("call-b") == 222
+    assert turn_latency.take_call_approval_wait("call-a") == 111
+    assert turn_latency.take_call_approval_wait("call-a") == 0
+
+
+def test_the_published_map_is_bounded():
+    for i in range(turn_latency._MAX_PUBLISHED_CALLS + 20):
+        turn_latency.publish_call_approval_wait(f"call-{i}", i)
+    assert len(turn_latency._published_call_waits) == turn_latency._MAX_PUBLISHED_CALLS
+
+
+def test_a_gate_rejection_before_dispatch_is_still_recorded():
+    """A blocked call burned wall clock, sometimes a human's. Account for it."""
+    from model_tools import handle_function_call
+
+    turn_latency.start_turn("turn-gate")
+    # An unknown tool short-circuits before any dispatch.
+    handle_function_call("_no_such_tool_at_all", {}, turn_id="turn-gate")
+    summary = turn_latency.finish_turn("turn-gate", log=False)
+    # Registry dispatch handles unknown names, so this still records once.
+    assert summary["tool_calls"] >= 1
+
+
 def test_sequential_executor_forwards_the_split_to_the_hook():
     """The executor suppresses the dispatcher's hook and emits its own.
 
@@ -411,8 +480,8 @@ def test_sequential_executor_forwards_the_split_to_the_hook():
         "the executor's post_tool_call emission dropped the approval split"
     )
     seq = inspect.getsource(tool_executor)
-    assert "approval_wait_ms=_approval_wait_ms_since(_approval_mark)" in seq, (
-        "the sequential executor no longer measures the approval split"
+    assert "approval_wait_ms=_measured_approval_wait_ms(tool_call_id)" in seq, (
+        "the sequential executor no longer forwards the approval split"
     )
 
 

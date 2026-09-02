@@ -291,20 +291,24 @@ def _is_interpreter_shutdown_submit_error(exc: RuntimeError) -> bool:
     return interpreter_shutting_down(exc)
 
 
-def _approval_wait_mark():
-    """Snapshot this thread's approval-wait counter (see model_tools)."""
-    from model_tools import _approval_wait_mark as _mark
-    try:
-        return _mark()
-    except Exception:
-        return None
+def _measured_approval_wait_ms(tool_call_id: str) -> int:
+    """Read the approval-wait split the DISPATCHER measured for this call.
 
+    This executor suppresses ``handle_function_call``'s own post_tool_call
+    hook and emits its own — but it does so on a different thread than the
+    one the tool ran on (tools are handed to a worker), and the approval-wait
+    counter is thread-local. Measuring here would therefore always read zero,
+    silently reporting ``approval_wait_ms=0`` for exactly the calls that
+    block on a human the longest, such as dangerous terminal commands.
 
-def _approval_wait_ms_since(mark) -> int:
-    """Milliseconds spent blocked on a human since ``mark``."""
-    from model_tools import _approval_wait_ms_since as _since
+    So the dispatcher publishes what it measured, keyed by ``tool_call_id``
+    — unique per call, hence race-free between concurrent tools — and this
+    reads it back.
+    """
     try:
-        return _since(mark)
+        from agent.turn_latency import take_call_approval_wait
+
+        return take_call_approval_wait(tool_call_id or "")
     except Exception:
         return 0
 
@@ -2098,11 +2102,6 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         _execution_dispatched = False
 
         tool_start_time = time.time()
-        # Mark the thread's approval-wait counter alongside the clock: this
-        # executor suppresses handle_function_call's own post_tool_call hook
-        # and emits its own below, so the split has to be measured here too
-        # or every approval-heavy sequential call reports zero.
-        _approval_mark = _approval_wait_mark()
 
         if function_name == "todo":
             def _execute(next_args: dict) -> Any:
@@ -2720,7 +2719,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 effective_task_id=effective_task_id,
                 tool_call_id=tool_call_id,
                 duration_ms=int(tool_duration * 1000),
-                approval_wait_ms=_approval_wait_ms_since(_approval_mark),
+                approval_wait_ms=_measured_approval_wait_ms(tool_call_id),
                 middleware_trace=list(middleware_trace),
             )
         if not _execution_blocked:

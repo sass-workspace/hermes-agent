@@ -1274,6 +1274,12 @@ def handle_function_call(
     # inline. tool_call is unwrapped to the underlying tool so that every
     # downstream hook (pre/post, edit approval, guardrails) sees the real
     # tool name, not the bridge.
+    # ONE clock for the whole call. It deliberately starts before the gates,
+    # gates that can block on a human (ACP edit approval), and the middleware
+    # — a clock started just before `registry.dispatch` reported a tool as
+    # fast while the model waited on everything upstream of it. The
+    # `approval_wait_ms` split below is what keeps that honest: human
+    # think-time is measured inside this span and can be subtracted from it.
     _dispatch_start = time.monotonic()
     # Latency accounting state, bound here so the outer error handler can
     # always read it — including for a failure that happens before the
@@ -1281,7 +1287,32 @@ def handle_function_call(
     _approval_mark = _approval_wait_mark()
     _latency_recorded = False
 
+    def _record_pre_dispatch_exit() -> None:
+        """Charge a gate rejection to the turn ledger.
+
+        These returns happen before the tool runs, but they are not free: the
+        ACP edit-approval gate in particular can sit on a human for minutes.
+        Recording them keeps the turn summary's buckets adding up to its wall
+        clock instead of dumping gate time into the unattributed remainder.
+        """
+        nonlocal _latency_recorded
+        if _latency_recorded:
+            return
+        _latency_recorded = True
+        try:
+            from agent.turn_latency import record_tool_call
+            record_tool_call(
+                turn_id or "",
+                function_name,
+                int((time.monotonic() - _dispatch_start) * 1000),
+                _approval_wait_ms_since(_approval_mark),
+            )
+        except Exception:
+            logger.debug("turn latency: gate exit not recorded", exc_info=True)
+
     def _return_bridge_result(result: Any) -> Any:
+        nonlocal _latency_recorded
+        _record_pre_dispatch_exit()
         _emit_post_tool_call_hook(
             function_name=function_name,
             function_args=function_args,
@@ -1440,6 +1471,7 @@ def handle_function_call(
 
             if block_message is not None:
                 result = tool_error(block_message)
+                _record_pre_dispatch_exit()
                 _emit_post_tool_call_hook(
                     function_name=function_name,
                     function_args=function_args,
@@ -1464,6 +1496,7 @@ def handle_function_call(
 
             edit_block_message = maybe_require_edit_approval(function_name, function_args)
             if edit_block_message is not None:
+                _record_pre_dispatch_exit()
                 _emit_post_tool_call_hook(
                     function_name=function_name,
                     function_args=function_args,
@@ -1482,6 +1515,7 @@ def handle_function_call(
             logger.debug("ACP edit approval guard error: %s", _edit_approval_err)
             if function_name in {"write_file", "patch"}:
                 result = tool_error("Edit approval denied: approval guard failed")
+                _record_pre_dispatch_exit()
                 _emit_post_tool_call_hook(
                     function_name=function_name,
                     function_args=function_args,
@@ -1513,7 +1547,6 @@ def handle_function_call(
         # dashboards, budget alerts, and regression canaries without having
         # to wrap every tool manually.  We use monotonic() so the value is
         # unaffected by wall-clock adjustments during the call.
-        _dispatch_start = time.monotonic()
         _approval_tokens = None
         try:
             from tools.approval import (
@@ -1577,10 +1610,17 @@ def handle_function_call(
             approval_wait_ms = _approval_wait_ms_since(_approval_mark)
             _latency_recorded = True
             try:
-                from agent.turn_latency import record_tool_call
+                from agent.turn_latency import (
+                    publish_call_approval_wait,
+                    record_tool_call,
+                )
                 record_tool_call(
                     turn_id or "", function_name, duration_ms, approval_wait_ms,
                 )
+                # The sequential executor suppresses the hook below and emits
+                # its own from a DIFFERENT thread, where the thread-local
+                # counter reads zero. Hand it the number measured here.
+                publish_call_approval_wait(tool_call_id or "", approval_wait_ms)
             except Exception:
                 logger.debug("turn latency: tool call not recorded", exc_info=True)
 
