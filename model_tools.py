@@ -1133,6 +1133,33 @@ def _tool_result_observer_fields(
     return "ok", None, None
 
 
+def _approval_wait_mark() -> Optional[float]:
+    """Snapshot this thread's cumulative approval-wait counter.
+
+    Taken before the first surface in a tool call that can block on a human
+    (ACP edit approval, the dangerous-command gate, gateway consent), so the
+    delta at the end is however long the call actually waited on a person.
+    Returns None when the accounting module is unavailable, which reads as
+    "unknown" and yields a zero split rather than a wrong one.
+    """
+    try:
+        from agent.turn_latency import approval_wait_total
+        return approval_wait_total()
+    except Exception:
+        return None
+
+
+def _approval_wait_ms_since(mark: Optional[float]) -> int:
+    """Milliseconds spent blocked on a human since ``mark``."""
+    if mark is None:
+        return 0
+    try:
+        from agent.turn_latency import approval_wait_total
+        return max(0, int((approval_wait_total() - mark) * 1000))
+    except Exception:
+        return 0
+
+
 def _emit_post_tool_call_hook(
     *,
     function_name: str,
@@ -1144,6 +1171,7 @@ def _emit_post_tool_call_hook(
     turn_id: Optional[str] = None,
     api_request_id: Optional[str] = None,
     duration_ms: int = 0,
+    approval_wait_ms: int = 0,
     status: Optional[str] = None,
     error_type: Optional[str] = None,
     error_message: Optional[str] = None,
@@ -1180,6 +1208,11 @@ def _emit_post_tool_call_hook(
             turn_id=turn_id or "",
             api_request_id=api_request_id or "",
             duration_ms=duration_ms,
+            # Additive split of duration_ms: however much of it was spent
+            # blocked on a human approving the call. Zero for every
+            # unattended tool, so a latency dashboard can subtract it and
+            # stop charging human think-time to the agent.
+            approval_wait_ms=approval_wait_ms,
             status=status,
             error_type=error_type,
             error_message=error_message,
@@ -1242,6 +1275,11 @@ def handle_function_call(
     # downstream hook (pre/post, edit approval, guardrails) sees the real
     # tool name, not the bridge.
     _dispatch_start = time.monotonic()
+    # Latency accounting state, bound here so the outer error handler can
+    # always read it — including for a failure that happens before the
+    # dispatch block ever runs. See agent/turn_latency.py.
+    _approval_mark = _approval_wait_mark()
+    _latency_recorded = False
 
     def _return_bridge_result(result: Any) -> Any:
         _emit_post_tool_call_hook(
@@ -1531,7 +1569,20 @@ def handle_function_call(
                     reset_current_observability_context(_approval_tokens)
                 except Exception:
                     pass
-        duration_ms = int((time.monotonic() - _dispatch_start) * 1000)
+            # Record in the `finally`, not after it: a handler or execution
+            # middleware that raises is exactly the call whose latency (and
+            # approval wait) you want in the ledger. The outer handler
+            # re-reads these locals rather than measuring again.
+            duration_ms = int((time.monotonic() - _dispatch_start) * 1000)
+            approval_wait_ms = _approval_wait_ms_since(_approval_mark)
+            _latency_recorded = True
+            try:
+                from agent.turn_latency import record_tool_call
+                record_tool_call(
+                    turn_id or "", function_name, duration_ms, approval_wait_ms,
+                )
+            except Exception:
+                logger.debug("turn latency: tool call not recorded", exc_info=True)
 
         _emit_post_tool_call_hook(
             function_name=function_name,
@@ -1543,6 +1594,7 @@ def handle_function_call(
             turn_id=turn_id,
             api_request_id=api_request_id,
             duration_ms=duration_ms,
+            approval_wait_ms=approval_wait_ms,
             middleware_trace=list(_tool_middleware_trace),
         )
 
@@ -1594,6 +1646,18 @@ def handle_function_call(
             if _dispatch_start is not None
             else 0
         )
+        # A failure before the dispatch block still burned wall clock, and may
+        # have burned it on a human (a denied ACP edit approval). Record it,
+        # unless the dispatch `finally` already did.
+        approval_wait_ms = _approval_wait_ms_since(_approval_mark)
+        if not _latency_recorded:
+            try:
+                from agent.turn_latency import record_tool_call
+                record_tool_call(
+                    turn_id or "", function_name, duration_ms, approval_wait_ms,
+                )
+            except Exception:
+                logger.debug("turn latency: tool call not recorded", exc_info=True)
         _emit_post_tool_call_hook(
             function_name=function_name,
             function_args=function_args,
@@ -1604,6 +1668,7 @@ def handle_function_call(
             turn_id=turn_id,
             api_request_id=api_request_id,
             duration_ms=duration_ms,
+            approval_wait_ms=approval_wait_ms,
             status="error",
             error_type=type(e).__name__,
             error_message=str(e),

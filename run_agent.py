@@ -8964,6 +8964,18 @@ class AIAgent:
                         pass
                     if getattr(self, "_relay_pending_turn_id", None) == relay_turn_id:
                         self._relay_pending_turn_id = None
+                    # Close this turn's latency ledger and log where the wall
+                    # clock went. Runs on every exit — normal, interrupted,
+                    # or raised — because a slow turn that crashed is exactly
+                    # the one worth accounting for.
+                    try:
+                        from agent.turn_latency import finish_turn
+                        finish_turn(
+                            str(getattr(self, "_current_turn_id", "") or "")
+                            or relay_turn_id
+                        )
+                    except Exception:
+                        logger.debug("turn latency: finish failed", exc_info=True)
                     if acct_token is not None:
                         reset_accounting_context(acct_token)
                     if token is not None:

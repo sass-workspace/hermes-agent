@@ -3207,6 +3207,28 @@ def _prompt_dangerous_approval_inner(command: str, description: str,
                                      approval_callback=None,
                                      *, allow_session: bool = True,
                                      smart_denied: bool = False) -> str:
+    """Ask the human. Everything below this line is human think-time.
+
+    The wrapper charges the whole call to the active tool dispatch's
+    approval-wait bucket, so the tool's own ``duration_ms`` can be reported
+    net of it (see ``agent/turn_latency.py``).
+    """
+    from agent.turn_latency import approval_wait_timer
+
+    with approval_wait_timer():
+        return _prompt_dangerous_approval_blocking(
+            command, description, timeout_seconds, allow_permanent,
+            approval_callback, allow_session=allow_session,
+            smart_denied=smart_denied,
+        )
+
+
+def _prompt_dangerous_approval_blocking(command: str, description: str,
+                                        timeout_seconds: int,
+                                        allow_permanent: bool = True,
+                                        approval_callback=None,
+                                        *, allow_session: bool = True,
+                                        smart_denied: bool = False) -> str:
     # Redact secrets before any user-visible rendering. The original
     # `command` is still what executes after approval; only the displayed
     # copy is scrubbed. Reuses the same redaction module used for memory
@@ -4387,6 +4409,23 @@ def _await_coalesced_leader(session_key: str, leader, approval_data: dict,
 
 def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
                             *, surface: str = "gateway") -> dict:
+    """Block on a gateway user's approval decision.
+
+    Thin timing wrapper: the whole wait is human think-time, charged to the
+    active tool dispatch's approval-wait bucket so the tool's own
+    ``duration_ms`` can be reported net of it (``agent/turn_latency.py``).
+    """
+    from agent.turn_latency import approval_wait_timer
+
+    with approval_wait_timer():
+        return _await_gateway_decision_blocking(
+            session_key, notify_cb, approval_data, surface=surface,
+        )
+
+
+def _await_gateway_decision_blocking(session_key: str, notify_cb,
+                                     approval_data: dict,
+                                     *, surface: str = "gateway") -> dict:
     """Enqueue *approval_data*, notify the user, and block the calling agent
     thread until the request is resolved or the gateway approval timeout
     elapses — firing pre/post approval hooks and cleaning up the queue entry.

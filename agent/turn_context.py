@@ -593,6 +593,16 @@ def build_turn_context(
     from agent.agent_runtime_helpers import note_turn_start
     note_turn_start(agent, turn_id)
 
+    # Open this turn's latency ledger. Closed (and logged) by the
+    # run_conversation forwarder's finally, so an interrupted or crashed
+    # turn still reports where its wall clock went.
+    from agent.turn_latency import start_turn as _start_latency_turn
+    _start_latency_turn(
+        turn_id,
+        session_id=str(getattr(agent, "session_id", "") or ""),
+        platform=str(getattr(agent, "platform", "") or ""),
+    )
+
     # Reset retry counters and iteration budget at the start of each turn.
     agent._invalid_tool_retries = 0
     agent._invalid_json_retries = 0

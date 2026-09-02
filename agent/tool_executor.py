@@ -291,6 +291,24 @@ def _is_interpreter_shutdown_submit_error(exc: RuntimeError) -> bool:
     return interpreter_shutting_down(exc)
 
 
+def _approval_wait_mark():
+    """Snapshot this thread's approval-wait counter (see model_tools)."""
+    from model_tools import _approval_wait_mark as _mark
+    try:
+        return _mark()
+    except Exception:
+        return None
+
+
+def _approval_wait_ms_since(mark) -> int:
+    """Milliseconds spent blocked on a human since ``mark``."""
+    from model_tools import _approval_wait_ms_since as _since
+    try:
+        return _since(mark)
+    except Exception:
+        return 0
+
+
 def _emit_terminal_post_tool_call(
     agent,
     *,
@@ -300,6 +318,7 @@ def _emit_terminal_post_tool_call(
     effective_task_id: str,
     tool_call_id: str,
     duration_ms: int = 0,
+    approval_wait_ms: int = 0,
     status: str | None = None,
     error_type: str | None = None,
     error_message: str | None = None,
@@ -317,6 +336,11 @@ def _emit_terminal_post_tool_call(
             turn_id=getattr(agent, "_current_turn_id", "") or "",
             api_request_id=getattr(agent, "_current_api_request_id", "") or "",
             duration_ms=duration_ms,
+            # This executor suppresses handle_function_call's own hook and
+            # emits here instead, so without forwarding the split every
+            # approval-heavy call (dangerous terminal commands, above all)
+            # would report approval_wait_ms=0 to plugins.
+            approval_wait_ms=approval_wait_ms,
             status=status,
             error_type=error_type,
             error_message=error_message,
@@ -2074,6 +2098,11 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         _execution_dispatched = False
 
         tool_start_time = time.time()
+        # Mark the thread's approval-wait counter alongside the clock: this
+        # executor suppresses handle_function_call's own post_tool_call hook
+        # and emits its own below, so the split has to be measured here too
+        # or every approval-heavy sequential call reports zero.
+        _approval_mark = _approval_wait_mark()
 
         if function_name == "todo":
             def _execute(next_args: dict) -> Any:
@@ -2691,6 +2720,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 effective_task_id=effective_task_id,
                 tool_call_id=tool_call_id,
                 duration_ms=int(tool_duration * 1000),
+                approval_wait_ms=_approval_wait_ms_since(_approval_mark),
                 middleware_trace=list(middleware_trace),
             )
         if not _execution_blocked:

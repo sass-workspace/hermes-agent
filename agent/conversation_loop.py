@@ -3219,6 +3219,13 @@ def run_conversation(
                 elif _model_request_active is not None:
                     _model_request_active.set()
                 _redirect_crossed_response = False
+                # Charge the turn's model bucket per ATTEMPT, right here.
+                # Deriving it from `api_start_time` instead would fold every
+                # earlier failed attempt AND the backoff sleeps between them
+                # into one number, and would record nothing at all when the
+                # provider raises — which is exactly the slow turn worth
+                # accounting for. The `finally` covers both outcomes.
+                _model_attempt_start = time.monotonic()
                 try:
                     response = run_llm_execution_middleware(
                         api_kwargs,
@@ -3237,6 +3244,15 @@ def run_conversation(
                         middleware_trace=list(_llm_middleware_trace),
                     )
                 finally:
+                    try:
+                        from agent.turn_latency import record_model_call
+                        record_model_call(
+                            turn_id, time.monotonic() - _model_attempt_start,
+                        )
+                    except Exception:
+                        logger.debug(
+                            "turn latency: model call not recorded", exc_info=True
+                        )
                     if _redirect_lock is not None:
                         with _redirect_lock:
                             if _model_request_active is not None:
@@ -3265,7 +3281,7 @@ def run_conversation(
                     break
                 
                 api_duration = time.time() - api_start_time
-                
+
                 # Stop thinking spinner silently -- the response box or tool
                 # execution messages that follow are more informative.
                 if thinking_spinner:
