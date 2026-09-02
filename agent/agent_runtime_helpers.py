@@ -3275,6 +3275,26 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
             pass
         return result
 
+    # Same rule as the sequential executor: this ladder runs several tools
+    # directly, never reaching handle_function_call, so the per-turn
+    # read-suppression cache's invalidate-on-write rule has to be applied
+    # here too. `delegate_task` below is the sharpest case — a delegated
+    # subagent can mutate exactly the state a cached read describes.
+    # Anything not provably a read-only MCP tool invalidates; read-only MCP
+    # tools fall through to the `else` branch, where handle_function_call
+    # does the check-and-record itself.
+    try:
+        from tools import turn_read_cache
+
+        if not turn_read_cache.is_read_only_tool(function_name):
+            turn_read_cache.invalidate(
+                str(getattr(agent, "_current_turn_id", "") or "")
+            )
+    except Exception:
+        logger.debug(
+            "turn read cache: pre-dispatch invalidate failed", exc_info=True
+        )
+
     if function_name == "todo":
         def _execute(next_args: dict) -> Any:
             from tools.todo_tool import todo_tool as _todo_tool

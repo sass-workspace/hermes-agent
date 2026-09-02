@@ -421,3 +421,140 @@ def test_write_capable_tools_are_never_suppressed():
         assert calls["n"] == 2
     finally:
         _drop("_write_probe")
+
+
+# ---------------------------------------------------------------------------
+# "Immediately preceding" must hold even when the intervening call FAILS
+# ---------------------------------------------------------------------------
+
+
+def test_a_failed_intervening_read_breaks_the_chain():
+    """A -> failed B -> A must run, not be answered from A's old result.
+
+    Failed reads are deliberately never recorded, so the chain cannot be
+    maintained by recording alone: `check` has to forget on a mismatch.
+    """
+    _run("t1", "get_task", {"gid": "1"})
+
+    # B is attempted and fails, so nothing is recorded for it.
+    out, _gen = turn_read_cache.check("t1", "get_task", {"gid": "2"})
+    assert out is None
+
+    assert _suppressed("t1", "get_task", {"gid": "1"}) is None, (
+        "answered a read from a result that was no longer the previous call"
+    )
+
+
+def test_a_failed_intervening_read_also_resets_the_hit_count():
+    """B's hits must not be carried into A and trip A's hard block early."""
+    _run("t1", "get_task", {"gid": "1"})
+    _suppressed("t1", "get_task", {"gid": "1"})  # 1 hit on A
+
+    turn_read_cache.check("t1", "get_task", {"gid": "2"})  # B, fails
+
+    _run("t1", "get_task", {"gid": "1"})
+    first_repeat = json.loads(_suppressed("t1", "get_task", {"gid": "1"}))
+    assert "error" not in first_repeat, "hard block fired on the first repeat"
+
+
+def test_the_dispatcher_does_not_suppress_after_a_failed_read(monkeypatch):
+    """The same property end to end."""
+    from model_tools import handle_function_call
+    from tools.registry import tool_error, tool_result
+
+    calls = {"n": 0}
+
+    def _handler(args, **kw):
+        calls["n"] += 1
+        if args.get("boom"):
+            return tool_error("upstream hiccup")
+        return tool_result(n=calls["n"])
+
+    _register("_chain_probe", _handler)
+    monkeypatch.setattr(
+        turn_read_cache, "is_read_only_tool", lambda name: name == "_chain_probe"
+    )
+    try:
+        handle_function_call("_chain_probe", {"q": 1}, turn_id="T")
+        handle_function_call("_chain_probe", {"boom": True}, turn_id="T")
+        out = json.loads(handle_function_call("_chain_probe", {"q": 1}, turn_id="T"))
+        assert "suppressed" not in out
+        assert calls["n"] == 3
+    finally:
+        _drop("_chain_probe")
+
+
+# ---------------------------------------------------------------------------
+# The concurrent execution path has its own direct-dispatch ladder
+# ---------------------------------------------------------------------------
+
+
+def test_the_concurrent_path_invalidates_for_a_direct_mutator(monkeypatch):
+    """`invoke_tool` runs delegate_task and friends without ever reaching
+    handle_function_call, so it must apply the invalidate-on-write rule too.
+
+    Driven through the real `invoke_tool`, because the sequential executor's
+    fix did nothing for this path.
+    """
+    from agent.agent_runtime_helpers import invoke_tool
+
+    class _Agent:
+        _current_turn_id = "T"
+        _todo_store = None
+
+        def _should_emit_quiet_tool_messages(self):
+            return False
+
+    turn_read_cache.record("T", "get_task", {"gid": "1"}, 0)
+    assert _suppressed("T", "get_task", {"gid": "1"}) is not None
+
+    # `tour` is one of the ladder's direct branches; any of them proves the
+    # rule is applied before the ladder rather than per-tool.
+    monkeypatch.setattr(
+        turn_read_cache, "is_read_only_tool", lambda name: False
+    )
+    try:
+        invoke_tool(_Agent(), "tour", {}, "task-1")
+    except Exception:
+        # The tool itself may fail in this bare harness; the invalidation
+        # happens before the ladder, which is what is under test.
+        pass
+
+    assert _suppressed("T", "get_task", {"gid": "1"}) is None, (
+        "the concurrent path ran a direct mutator without invalidating"
+    )
+
+
+def test_the_concurrent_path_does_not_invalidate_for_read_only_tools(monkeypatch):
+    """Invalidating unconditionally there would disable the feature."""
+    from agent.agent_runtime_helpers import invoke_tool
+    from tools.registry import tool_result
+
+    class _Agent:
+        _current_turn_id = "T"
+        valid_tool_names = {"_ro_conc_probe"}
+        session_id = ""
+        enabled_toolsets = None
+        disabled_toolsets = None
+        _current_api_request_id = ""
+
+    _register("_ro_conc_probe", lambda args, **kw: tool_result(ok=True))
+    monkeypatch.setattr(
+        turn_read_cache,
+        "is_read_only_tool",
+        lambda name: name == "_ro_conc_probe",
+    )
+    try:
+        turn_read_cache.record("T", "get_task", {"gid": "1"}, 0)
+        try:
+            invoke_tool(_Agent(), "_ro_conc_probe", {}, "task-1")
+        except Exception:
+            # This bare harness cannot satisfy everything the full dispatch
+            # path wants. The invalidate decision is made before the ladder,
+            # which is the whole of what this test asserts.
+            pass
+        assert _suppressed("T", "get_task", {"gid": "1"}) is not None, (
+            "a read-only tool wiped the cache — suppression would never work"
+        )
+    finally:
+        _drop("_ro_conc_probe")

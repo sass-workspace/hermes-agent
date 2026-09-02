@@ -462,6 +462,3 @@ def test_a_gate_rejection_before_dispatch_is_still_recorded():
     summary = turn_latency.finish_turn("turn-gate", log=False)
     # Registry dispatch handles unknown names, so this still records once.
     assert summary["tool_calls"] >= 1
-
-
-

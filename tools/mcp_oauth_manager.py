@@ -45,11 +45,18 @@ from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
-# An OAuth handshake that has been in flight this long is not slow, it is
-# parked on a lock whose owner task is gone. Well above any real flow —
-# including one waiting on a human to finish a browser login, which the SDK
-# performs inside the flow.
-_STALLED_AUTH_FLOW_SEC = 600.0
+# An OAuth handshake in flight this long is not slow, it is parked on a lock
+# whose owner task is gone. Deliberately far above any legitimate flow: the
+# browser-login wait happens INSIDE the flow, and its callback timeout is
+# operator-configurable above the 300s default, so a tighter bound here could
+# evict a provider that was merely waiting on a slow human.
+#
+# Erring long costs nothing. This is only a backstop — the latched signal
+# (watching the SDK fail to release the lock) catches the case we actually
+# observed, immediately. This one exists for the variant where the wrapper's
+# finalizer never ran at all, and poisoning is permanent, so a late detection
+# is still a recovery that would otherwise never happen.
+_STALLED_AUTH_FLOW_SEC = 1800.0
 
 
 def _same_endpoint(a: str, b: str) -> bool:
@@ -641,8 +648,9 @@ def _make_hermes_provider_class() -> Optional[type]:
                 # error at loop shutdown, long after the provider has been
                 # reused and deadlocked. See _hermes_lock_is_poisoned.
                 try:
+                  try:
                     await inner.aclose()
-                except RuntimeError as exc:
+                  except RuntimeError as exc:
                     if "not holding this lock" in str(exc).lower():
                         self._hermes_lock_poisoned = True
                         logger.warning(
@@ -658,19 +666,26 @@ def _make_hermes_provider_class() -> Optional[type]:
                             "MCP OAuth '%s': closing the inner auth flow "
                             "raised: %s", self._hermes_server_name, exc,
                         )
-                except Exception as exc:  # pragma: no cover — defensive
+                  except Exception as exc:  # pragma: no cover — defensive
                     logger.debug(
                         "MCP OAuth '%s': closing the inner auth flow "
                         "failed: %s", self._hermes_server_name, exc,
                     )
-                # Decrement AFTER the close, not before: the lock is released
-                # inside aclose(), so releasing the depth slot first opens a
-                # window where a reconnect on another thread sees a held lock
-                # with no flow running and rebuilds a perfectly healthy
-                # provider.
-                self._hermes_flow_depth -= 1
-                if self._hermes_flow_depth <= 0:
-                    self._hermes_flow_started_mono = None
+                finally:
+                    # Decrement AFTER the close, not before: the lock is
+                    # released inside aclose(), so releasing the depth slot
+                    # first opens a window where a reconnect on another
+                    # thread sees a held lock with no flow running and
+                    # rebuilds a perfectly healthy provider.
+                    #
+                    # In its own `finally` because aclose() can be
+                    # interrupted by CancelledError — a BaseException, caught
+                    # by neither handler above — and a leaked depth slot
+                    # would blind the poison check for the life of the
+                    # provider.
+                    self._hermes_flow_depth -= 1
+                    if self._hermes_flow_depth <= 0:
+                        self._hermes_flow_started_mono = None
 
     return HermesMCPOAuthProvider
 

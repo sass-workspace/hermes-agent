@@ -138,6 +138,14 @@ def check(turn_id: str, tool_name: str, args: Any) -> Tuple[Optional[str], int]:
     with state.lock:
         generation = state.generation
         if key is None or state.last_key != key:
+            # This call is NOT a repeat, so whatever was remembered is no
+            # longer the immediately preceding one. Forget it here rather
+            # than relying on the caller to record a replacement: a read
+            # that ERRORS is deliberately never recorded, so leaving the old
+            # key in place would let A -> failed B -> A be answered from A's
+            # stale result, and would carry B's hit count into it.
+            state.last_key = None
+            state.hits = 0
             return None, generation
         state.hits += 1
         hits = state.hits

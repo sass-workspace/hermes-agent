@@ -7446,16 +7446,6 @@ def _describe_unknown_mcp_tool(tool_name: str) -> Optional[str]:
             f"assuming the capability does not exist."
         )
 
-    if _connect_cooldown_active(server_name):
-        with _lock:
-            deadline = _server_connect_retry_after.get(server_name, 0.0)
-        remaining = max(1, int(deadline - time.monotonic()))
-        return (
-            f"{prefix} It is in connect backoff after repeated failures and "
-            f"will retry in ~{remaining}s. {dont_conclude} Wait for that "
-            f"window before retrying, or continue with other work."
-        )
-
     # A CONNECTED server that simply does not offer this tool is a different
     # answer entirely: the name is genuinely gone (removed or renamed
     # server-side, or filtered out by config), and telling the model to wait
@@ -7476,6 +7466,16 @@ def _describe_unknown_mcp_tool(tool_name: str) -> Optional[str]:
                 f"retry it. Use the tools currently available, or ask the "
                 f"user to check the server's configuration."
             )
+
+    if _connect_cooldown_active(server_name):
+        with _lock:
+            deadline = _server_connect_retry_after.get(server_name, 0.0)
+        remaining = max(1, int(deadline - time.monotonic()))
+        return (
+            f"{prefix} It is in connect backoff after repeated failures and "
+            f"will retry in ~{remaining}s. {dont_conclude} Wait for that "
+            f"window before retrying, or continue with other work."
+        )
 
     if getattr(server, "_was_parked", False):
         return (
