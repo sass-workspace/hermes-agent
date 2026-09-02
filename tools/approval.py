@@ -224,6 +224,20 @@ def reset_current_observability_context(
     _approval_turn_id.reset(turn_token)
 
 
+def get_current_turn_id(default: str = "") -> str:
+    """Return the turn id bound around the active tool dispatch.
+
+    Set by ``model_tools.handle_function_call`` for the duration of a tool's
+    execution, so anything running inside a tool call can scope per-turn
+    state without threading the id through every signature. Empty outside a
+    dispatch.
+    """
+    try:
+        return _approval_turn_id.get() or default
+    except Exception:  # pragma: no cover — defensive
+        return default
+
+
 def get_current_session_key(default: str = "default") -> str:
     """Return the active session key, preferring context-local state.
 

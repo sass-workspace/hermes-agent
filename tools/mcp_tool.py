@@ -110,7 +110,8 @@ import shutil
 import sys
 import threading
 import time
-from contextlib import asynccontextmanager
+from collections import OrderedDict
+from contextlib import asynccontextmanager, contextmanager
 from types import SimpleNamespace
 from typing import Callable
 from datetime import datetime
@@ -4903,6 +4904,108 @@ def reconnect_mcp_server(server_name: str) -> bool:
     return _signal_reconnect(server)
 
 
+# ---------------------------------------------------------------------------
+# Per-turn auth/reconnect budget.
+#
+# Recovery waits were each individually reasonable and collectively awful.
+# One failing tool call could burn, in sequence: up to 5s waiting for a
+# session to reappear, 10s in the OAuth manager's handle_401, 15s waiting on
+# the reconnect it triggers, and — if that path declined — another 15s
+# waiting on the session-expired reconnect. 45 seconds of pure waiting before
+# the retry RPC even starts, per call, with nothing capping the total across
+# several failing tools in one turn.
+#
+# From the model's side that is indistinguishable from a hang, and the user
+# is watching a turn that has produced nothing.
+#
+# So the waits share one budget, scoped to the turn. Each wait is clamped to
+# what is left; when the budget is spent, recovery waits are skipped outright
+# and the handler returns its "reconnecting, back off" error immediately. The
+# recovery itself is NOT cancelled — the server task keeps rebuilding its
+# transport in the background, and the next turn (or the next call once the
+# budget refreshes) finds it healthy. We stop *blocking the turn* on it, which
+# is the part the user pays for.
+#
+# Deliberately not charged here: the retry RPC itself. That is the tool's own
+# ``tool_timeout``, already configurable per server, and it is work rather
+# than waiting.
+_TURN_RECOVERY_BUDGET_SEC = 15.0
+_turn_recovery_spent: "OrderedDict[str, float]" = OrderedDict()
+_MAX_TRACKED_RECOVERY_TURNS = 64
+# Calls outside any tool dispatch (startup discovery, the dashboard probe,
+# CLI paths) have no turn to protect; they share this key and are given a
+# fresh budget each time rather than being starved by an unrelated turn.
+_NO_TURN_KEY = ""
+
+
+def _current_recovery_turn_key() -> str:
+    """Turn id bound around the active tool dispatch, or "" outside one."""
+    try:
+        from tools.approval import get_current_turn_id
+
+        return get_current_turn_id()
+    except Exception:  # pragma: no cover — defensive
+        return _NO_TURN_KEY
+
+
+def _recovery_budget_remaining() -> float:
+    """Seconds of auth/reconnect waiting this turn may still spend."""
+    key = _current_recovery_turn_key()
+    if not key:
+        # No turn scope — nothing to protect, so no cap.
+        return _TURN_RECOVERY_BUDGET_SEC
+    with _lock:
+        spent = _turn_recovery_spent.get(key, 0.0)
+    return max(0.0, _TURN_RECOVERY_BUDGET_SEC - spent)
+
+
+def _charge_recovery_budget(seconds: float) -> None:
+    """Charge ``seconds`` of waiting to the active turn's budget."""
+    key = _current_recovery_turn_key()
+    if not key:
+        return
+    try:
+        amount = max(0.0, float(seconds))
+    except (TypeError, ValueError):  # pragma: no cover — defensive
+        return
+    with _lock:
+        _turn_recovery_spent[key] = _turn_recovery_spent.get(key, 0.0) + amount
+        _turn_recovery_spent.move_to_end(key)
+        while len(_turn_recovery_spent) > _MAX_TRACKED_RECOVERY_TURNS:
+            _turn_recovery_spent.popitem(last=False)
+
+
+@contextmanager
+def _recovery_wait(op: str, requested: float):
+    """Clamp one recovery wait to the turn's remaining budget.
+
+    Yields the number of seconds the caller may actually wait — possibly
+    0.0, which every call site treats as "skip the wait". Whatever is spent
+    inside the block is charged on exit, including on an exception, so a
+    raising wait cannot leak budget.
+    """
+    remaining = _recovery_budget_remaining()
+    allowed = min(max(0.0, float(requested or 0.0)), remaining)
+    if allowed <= 0.0:
+        logger.info(
+            "MCP recovery budget for this turn is spent (%.0fs); skipping the "
+            "%s wait and returning to the model immediately. The reconnect "
+            "continues in the background.",
+            _TURN_RECOVERY_BUDGET_SEC, op,
+        )
+    started = time.monotonic()
+    try:
+        yield allowed
+    finally:
+        _charge_recovery_budget(time.monotonic() - started)
+
+
+def _reset_recovery_budget_for_tests() -> None:
+    """Test-only helper: forget every turn's recovery spend."""
+    with _lock:
+        _turn_recovery_spent.clear()
+
+
 def _wait_for_server_session_ready(
     srv: "MCPServerTask",
     *,
@@ -5075,6 +5178,24 @@ def _is_auth_error(exc: BaseException) -> bool:
     return True
 
 
+def _needs_reauth_error(server_name: str) -> str:
+    """Structured re-auth verdict. Bumps the breaker so the model stops.
+
+    Shared by the two exits of the auth-recovery path: no recovery was
+    available (or the retry failed again), and the turn's recovery budget was
+    already spent so there was no time left to attempt one.
+    """
+    _bump_server_error(server_name)
+    return tool_error(
+        f"MCP server '{server_name}' requires re-authentication. "
+        f"Run `hermes mcp login {server_name}` (or delete the tokens "
+        f"file under ~/.hermes/mcp-tokens/ and restart). Do NOT retry "
+        f"this tool — ask the user to re-authenticate.",
+        needs_reauth=True,
+        server=server_name,
+    )
+
+
 def _handle_auth_error_and_retry(
     server_name: str,
     exc: BaseException,
@@ -5123,7 +5244,12 @@ def _handle_auth_error_and_retry(
         return await manager.handle_401(server_name, None)
 
     try:
-        recovered = _run_on_mcp_loop(_recover, timeout=10)
+        with _recovery_wait("oauth-recovery", 10.0) as _budget:
+            if _budget <= 0.0:
+                # No budget left to sit on the OAuth manager. Fall through to
+                # the needs_reauth verdict rather than stalling the turn.
+                return _needs_reauth_error(server_name)
+            recovered = _run_on_mcp_loop(_recover, timeout=_budget)
     except Exception as rec_exc:
         logger.warning(
             "MCP OAuth '%s': recovery attempt failed: %s",
@@ -5136,12 +5262,15 @@ def _handle_auth_error_and_retry(
             srv = _servers.get(server_name)
         reconnected = False
         if srv is not None and hasattr(srv, "_reconnect_event"):
-            reconnected = _signal_reconnect_and_wait(
-                server_name,
-                srv,
-                op_description=f"{op_description} after OAuth recovery",
-                timeout=15,
-            )
+            with _recovery_wait("oauth-reconnect", 15.0) as _budget:
+                # A zero budget still SIGNALS the reconnect — the server task
+                # rebuilds in the background — we just stop waiting for it.
+                reconnected = _signal_reconnect_and_wait(
+                    server_name,
+                    srv,
+                    op_description=f"{op_description} after OAuth recovery",
+                    timeout=_budget,
+                )
 
         # A successful OAuth recovery + transport reconnect is independent
         # evidence that the server is viable again, so close the circuit
@@ -5173,17 +5302,8 @@ def _handle_auth_error_and_retry(
             )
 
     # No recovery available, or retry also failed: surface a structured
-    # needs_reauth error. Bumps the circuit breaker so the model stops
-    # retrying the tool.
-    _bump_server_error(server_name)
-    return tool_error(
-        f"MCP server '{server_name}' requires re-authentication. "
-        f"Run `hermes mcp login {server_name}` (or delete the tokens "
-        f"file under ~/.hermes/mcp-tokens/ and restart). Do NOT retry "
-        f"this tool — ask the user to re-authenticate.",
-        needs_reauth=True,
-        server=server_name,
-    )
+    # needs_reauth error.
+    return _needs_reauth_error(server_name)
 
 
 # Substrings (lower-cased match) that indicate the MCP server rejected
@@ -5337,16 +5457,19 @@ def _handle_session_expired_and_retry(
 
     # Trigger the same reconnect mechanism the OAuth recovery path
     # uses, then wait briefly for the new session to come back ready.
-    if not _signal_reconnect_and_wait(
-        server_name,
-        srv,
-        op_description=op_description,
-        timeout=15,
-    ):
-        logger.warning(
-            "MCP server '%s': reconnect did not ready within 15s after "
-            "session-expired error; falling through to error response.",
+    with _recovery_wait("session-expired-reconnect", 15.0) as _budget:
+        _readied = _signal_reconnect_and_wait(
             server_name,
+            srv,
+            op_description=op_description,
+            timeout=_budget,
+        )
+    if not _readied:
+        logger.warning(
+            "MCP server '%s': reconnect did not ready within %.0fs after "
+            "session-expired error; falling through to error response. The "
+            "transport rebuild continues in the background.",
+            server_name, _budget,
         )
         return None
 
@@ -6280,9 +6403,13 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
             # wait briefly before treating this as a failure, so a
             # transient reconnect window doesn't burn a circuit-breaker
             # strike (#26892).
-            if _wait_for_server_session_ready(
-                server, timeout=min(5.0, float(tool_timeout or 5.0)),
-            ):
+            with _recovery_wait(
+                "session-ready", min(5.0, float(tool_timeout or 5.0)),
+            ) as _budget:
+                _session_arrived = _budget > 0.0 and _wait_for_server_session_ready(
+                    server, timeout=_budget,
+                )
+            if _session_arrived:
                 pass  # Fresh session arrived; proceed below.
             else:
                 # Still down — the server task is reconnecting, or it has

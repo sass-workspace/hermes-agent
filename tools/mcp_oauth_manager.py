@@ -129,6 +129,15 @@ def _make_hermes_provider_class() -> Optional[type]:
         (``src/utils/auth.ts:1320``, CC-1096 / GH#24317).
         """
 
+        # CLASS-level defaults, not just __init__ assignments: providers are
+        # also built by paths that bypass __init__ (restore/rehydrate, and
+        # test construction via object.__new__). ``async_auth_flow`` touches
+        # the depth counter on every single request, so an instance missing
+        # the attribute would not degrade the poison check — it would break
+        # authentication outright with an AttributeError.
+        _hermes_flow_depth = 0
+        _hermes_lock_poisoned = False
+
         def __init__(
             self,
             *args: Any,
