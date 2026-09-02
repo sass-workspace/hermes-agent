@@ -5501,6 +5501,11 @@ _parallel_safe_servers: set = set()
 # name captured at registration time so policy and capability checks never rely
 # on parsing or re-sanitizing the generated name.
 _mcp_tool_server_names: Dict[str, str] = {}
+# Tool name -> owning server, kept even after the tool is deregistered, so a
+# call to a parked server's tool gets a precise verdict instead of
+# "Unknown tool". See _describe_unknown_mcp_tool.
+_known_mcp_tool_owners: "OrderedDict[str, str]" = OrderedDict()
+_MAX_REMEMBERED_TOOL_OWNERS = 2000
 
 # Dedicated event loop running in a background daemon thread.
 _mcp_loop: Optional[asyncio.AbstractEventLoop] = None
@@ -7331,12 +7336,106 @@ def _track_mcp_tool_server(tool_name: str, server_name: str) -> None:
     """Remember the exact raw MCP server that registered *tool_name*."""
     with _lock:
         _mcp_tool_server_names[tool_name] = server_name
+        # Provenance that OUTLIVES deregistration — see
+        # _describe_unknown_mcp_tool. Bounded because a server whose tool
+        # list churns (dynamic discovery) would otherwise accumulate names
+        # for the life of the process.
+        _known_mcp_tool_owners[tool_name] = server_name
+        _known_mcp_tool_owners.move_to_end(tool_name)
+        while len(_known_mcp_tool_owners) > _MAX_REMEMBERED_TOOL_OWNERS:
+            _known_mcp_tool_owners.popitem(last=False)
 
 
 def _forget_mcp_tool_server(tool_name: str) -> None:
-    """Forget MCP server provenance for a deregistered tool."""
+    """Forget MCP server provenance for a deregistered tool.
+
+    Only the LIVE map is cleared. ``_known_mcp_tool_owners`` deliberately
+    keeps the association: a deregistered tool is exactly the case where the
+    model still has the name in its byte-stable schema and needs to be told
+    what actually happened to it.
+    """
     with _lock:
         _mcp_tool_server_names.pop(tool_name, None)
+
+
+def _describe_unknown_mcp_tool(tool_name: str) -> Optional[str]:
+    """Explain a vanished MCP tool precisely, or return None if we can't.
+
+    Registered with the tool registry as an unknown-tool resolver.
+
+    The problem this solves: when an MCP server parks (reconnect budget
+    exhausted) or fails to connect, ``_deregister_tools()`` pulls its tools
+    out of the registry. The model's schema, however, is byte-stable for the
+    life of the conversation — that is a prompt-cache invariant, not an
+    oversight — so it goes right on calling them. It used to get back
+    "Unknown tool: mcp__asana__create_task", read that as proof the
+    capability does not exist, tell the user Hermes cannot do that thing,
+    and never try again. A transport outage lasting seconds became a
+    permanent-looking loss of capability.
+
+    The verdict has to answer a different question than "is this name in the
+    registry". It has to say WHICH of these is true:
+
+      * this server is configured and reconnecting — wait and retry;
+      * it is parked and self-probing on a known interval — retry after it;
+      * it is in connect backoff — retry after the cooldown;
+      * we have never heard of this name — then, and only then, the
+        capability really is absent.
+    """
+    with _lock:
+        server_name = _known_mcp_tool_owners.get(tool_name)
+    if not server_name:
+        return None
+
+    with _lock:
+        server = _servers.get(server_name)
+
+    retry_hint = (
+        f"Retry the SAME call in a few seconds; if it still fails, tell the "
+        f"user that the '{server_name}' MCP server is down and let them "
+        f"check it."
+    )
+    prefix = (
+        f"MCP tool '{tool_name}' is temporarily unavailable: its server "
+        f"'{server_name}' is configured and known, but is not connected "
+        f"right now."
+    )
+    dont_conclude = (
+        f"This is a transport outage, NOT a missing capability — do NOT tell "
+        f"the user that Hermes cannot do this, and do NOT look for another "
+        f"way to do it on the assumption the tool does not exist."
+    )
+
+    if server is None:
+        # Known name, no live server task: the server was removed from the
+        # config, or never came up in this process.
+        return (
+            f"MCP tool '{tool_name}' is not currently available. Its server "
+            f"'{server_name}' has no running connection in this process — it "
+            f"may have been removed from the MCP configuration, or failed to "
+            f"start. Ask the user to check `hermes mcp list` rather than "
+            f"assuming the capability does not exist."
+        )
+
+    if _connect_cooldown_active(server_name):
+        with _lock:
+            deadline = _server_connect_retry_after.get(server_name, 0.0)
+        remaining = max(1, int(deadline - time.monotonic()))
+        return (
+            f"{prefix} It is in connect backoff after repeated failures and "
+            f"will retry in ~{remaining}s. {dont_conclude} Wait for that "
+            f"window before retrying, or continue with other work."
+        )
+
+    if getattr(server, "_was_parked", False):
+        return (
+            f"{prefix} It exhausted its reconnect budget and parked; it "
+            f"self-probes every {_PARKED_RETRY_INTERVAL}s and re-registers "
+            f"its tools as soon as it is back. {dont_conclude} Retry after "
+            f"that interval, or continue with other work meanwhile."
+        )
+
+    return f"{prefix} A reconnect is in progress. {dont_conclude} {retry_hint}"
 
 
 def _select_utility_schemas(server_name: str, server: MCPServerTask, config: dict) -> List[dict]:
@@ -8912,3 +9011,19 @@ def _stop_mcp_loop(*, only_if_idle: bool = False) -> bool:
         # since the loop is gone and no session can still be in flight.
         _kill_orphaned_mcp_children(include_active=True)
     return True
+
+
+# ---------------------------------------------------------------------------
+# Registry wiring
+# ---------------------------------------------------------------------------
+#
+# Teach the tool registry to explain a vanished MCP tool instead of calling it
+# unknown. Registered at import time — mcp_tool is imported by the tool
+# discovery pass, and the resolver is a pure read of this module's state, so
+# there is no ordering requirement beyond "before the first dispatch".
+try:
+    from tools.registry import registry as _tool_registry
+
+    _tool_registry.register_unknown_tool_resolver(_describe_unknown_mcp_tool)
+except Exception:  # pragma: no cover — never block import on the hook
+    logger.debug("Could not register the MCP unknown-tool resolver", exc_info=True)

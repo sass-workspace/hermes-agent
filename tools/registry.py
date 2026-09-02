@@ -23,7 +23,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Set
+from typing import Any, Callable, Dict, List, Optional, Set
 
 from hermes_constants import hermes_home_key
 
@@ -455,6 +455,9 @@ class ToolRegistry:
     def __init__(self):
         # Built-in and other process-global registrations.
         self._tools: Dict[str, ToolEntry] = {}
+        # Consulted before answering "Unknown tool" — see
+        # register_unknown_tool_resolver.
+        self._unknown_tool_resolvers: List[Any] = []
         # Plugin registrations are overlays keyed by resolved HERMES_HOME. A
         # profile sees its own overlay first and then the global built-ins.
         self._scoped_tools: Dict[str, Dict[str, ToolEntry]] = {}
@@ -1125,6 +1128,44 @@ class ToolRegistry:
             result_type=result_type,
         )
 
+    def register_unknown_tool_resolver(self, resolver) -> None:
+        """Add a source of precise verdicts for names this registry lacks.
+
+        ``resolver(name) -> str | None`` returns a replacement message when
+        it recognises the name, or None to defer. The first non-empty answer
+        wins; resolvers are consulted in registration order.
+
+        This exists because "Unknown tool: X" is a claim about CAPABILITY,
+        and the registry cannot always support that claim. A tool can leave
+        the registry while remaining perfectly real — an MCP server that
+        parked deregisters its tools, but the model's schema is byte-stable
+        for the life of the conversation (prompt caching), so it still calls
+        them. It then reads "Unknown tool" as proof the capability does not
+        exist and tells the user so, when the truth was "that server is
+        reconnecting, try again shortly".
+
+        Kept as a registration hook rather than an import so this module
+        keeps its no-dependencies invariant (see the file-dependency chain in
+        AGENTS.md); ``tools/mcp_tool.py`` registers its own at import time.
+        """
+        if callable(resolver) and resolver not in self._unknown_tool_resolvers:
+            self._unknown_tool_resolvers.append(resolver)
+
+    def _describe_unknown_tool(self, name: str) -> str:
+        """Best available explanation for a name this registry does not have."""
+        for resolver in list(self._unknown_tool_resolvers):
+            try:
+                described = resolver(name)
+            except Exception:
+                logger.debug(
+                    "unknown-tool resolver %r failed for %s",
+                    resolver, name, exc_info=True,
+                )
+                continue
+            if isinstance(described, str) and described.strip():
+                return described
+        return f"Unknown tool: {name}"
+
     def dispatch(
         self,
         name: str,
@@ -1143,7 +1184,7 @@ class ToolRegistry:
         """
         entry = self.get_entry(name, scope=scope)
         if not entry:
-            return tool_error(f"Unknown tool: {name}")
+            return tool_error(self._describe_unknown_tool(name))
         try:
             if entry.is_async:
                 from model_tools import _run_async
