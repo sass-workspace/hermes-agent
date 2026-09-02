@@ -1626,15 +1626,28 @@ def init_agent(
     elif not agent.quiet_mode:
         print("🛠️  No tools loaded (all tools filtered out or unavailable)")
 
-    # Kanban worker/orchestrator lifecycle guidance is session-static:
-    # the dispatcher decides at spawn time whether this process is a kanban
-    # worker (kanban_show tool is present iff HERMES_KANBAN_TASK is set).
-    # Resolving the ~835-token block once here avoids re-running the
-    # membership test + reference on every system-prompt rebuild
-    # (init + each context compression).
+    # Kanban WORKER lifecycle guidance is session-static: the dispatcher
+    # decides at spawn time whether this process was spawned to work one task.
+    # Resolving the ~835-token block once here avoids re-running the check on
+    # every system-prompt rebuild (init + each context compression).
+    #
+    # The gate is the worker condition itself, NOT the presence of
+    # ``kanban_show``. Those are not the same set: ``_check_kanban_mode()``
+    # also grants the kanban tools to any ORCHESTRATOR profile that enabled
+    # the toolset, with no HERMES_KANBAN_TASK and no assigned task. Gating on
+    # tool presence handed those profiles a protocol whose first instruction
+    # is "Call kanban_show() first (no args — it defaults to your task)" —
+    # and with no task to default to, `_default_task_id()` returns None and
+    # every such call comes back "task_id is required". The model, following
+    # its own system prompt, calls it again. Ask the question the guidance
+    # actually answers: was I spawned to work a task?
     from agent.prompt_builder import KANBAN_GUIDANCE
+    from tools.kanban_tools import is_dispatcher_spawned_task_worker
     agent._kanban_worker_guidance = (
-        KANBAN_GUIDANCE if "kanban_show" in agent.valid_tool_names else ""
+        KANBAN_GUIDANCE
+        if "kanban_show" in agent.valid_tool_names
+        and is_dispatcher_spawned_task_worker()
+        else ""
     )
 
     # Check tool requirements

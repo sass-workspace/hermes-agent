@@ -119,6 +119,27 @@ def _check_kanban_mode() -> bool:
     return _profile_has_kanban_toolset()
 
 
+def is_dispatcher_spawned_task_worker() -> bool:
+    """True only for a process the Kanban dispatcher spawned to work ONE task.
+
+    This is the condition under which ``kanban_show()`` resolves a task id
+    with no arguments, and therefore the condition under which the worker
+    lifecycle protocol (which opens by telling the agent to do exactly that)
+    is true. It is deliberately narrower than :func:`_check_kanban_mode`,
+    which is also True for orchestrator profiles that merely enabled the
+    kanban toolset and were never assigned a task.
+
+    Public because ``agent/agent_init.py`` needs it to gate the worker
+    guidance block; keeping the definition here means the prompt gate and
+    the tool's own default resolution can never drift apart.
+    """
+    if _is_delegated_child_context():
+        return False
+    return bool(
+        os.environ.get("HERMES_KANBAN_TASK") and _is_dispatcher_owned_worker()
+    )
+
+
 def _check_kanban_orchestrator_mode() -> bool:
     """Board-routing tools (kanban_list, kanban_unblock) are intentionally
     hidden from task workers.
@@ -151,6 +172,31 @@ def _default_task_id(arg: Optional[str]) -> Optional[str]:
         return None
     env_tid = os.environ.get("HERMES_KANBAN_TASK")
     return env_tid or None
+
+
+def _no_default_task_error(tool_name: str) -> str:
+    """Verdict for a lifecycle call made with no task_id and no default.
+
+    A bare ``kanban_*()`` call only resolves a task id in a process the
+    dispatcher spawned to work one task (see
+    :func:`is_dispatcher_spawned_task_worker`). Everywhere else there is
+    nothing to default to.
+
+    The old message — "task_id is required (or set HERMES_KANBAN_TASK in the
+    env)" — read as a retryable hint, and models retried the identical no-arg
+    call: setting an env var is not something the agent can do mid-turn, and
+    nothing in the text said the same call could never succeed. Name why this
+    session has no default, say that repeating the call cannot work, and
+    point at the one route that does.
+    """
+    return tool_error(
+        f"{tool_name} needs an explicit task_id in this session: it was not "
+        "spawned by the Kanban dispatcher to work a specific task, so there "
+        "is no default task. Calling it again with no task_id will fail the "
+        "same way. Find the task first (kanban_list, or ask the user), then "
+        f'call {tool_name}(task_id="<id>").',
+        needs_task_id=True,
+    )
 
 
 def _worker_run_id(task_id: str) -> Optional[int]:
@@ -519,9 +565,7 @@ def _handle_show(args: dict, **kw) -> str:
     runs (attempt history), and the last N events."""
     tid = _default_task_id(args.get("task_id"))
     if not tid:
-        return tool_error(
-            "task_id is required (or set HERMES_KANBAN_TASK in the env)"
-        )
+        return _no_default_task_error("kanban_show")
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)
@@ -659,9 +703,7 @@ def _handle_complete(args: dict, **kw) -> str:
         return delegated_err
     tid = _default_task_id(args.get("task_id"))
     if not tid:
-        return tool_error(
-            "task_id is required (or set HERMES_KANBAN_TASK in the env)"
-        )
+        return _no_default_task_error("kanban_complete")
     ownership_err = _enforce_worker_task_ownership(tid)
     if ownership_err:
         return ownership_err
@@ -821,9 +863,7 @@ def _handle_block(args: dict, **kw) -> str:
         return delegated_err
     tid = _default_task_id(args.get("task_id"))
     if not tid:
-        return tool_error(
-            "task_id is required (or set HERMES_KANBAN_TASK in the env)"
-        )
+        return _no_default_task_error("kanban_block")
     ownership_err = _enforce_worker_task_ownership(tid)
     if ownership_err:
         return ownership_err
@@ -902,9 +942,7 @@ def _handle_request_review(args: dict, **kw) -> str:
         return delegated_err
     tid = _default_task_id(args.get("task_id"))
     if not tid:
-        return tool_error(
-            "task_id is required (or set HERMES_KANBAN_TASK in the env)"
-        )
+        return _no_default_task_error("kanban_request_review")
     ownership_err = _enforce_worker_task_ownership(tid)
     if ownership_err:
         return ownership_err
@@ -980,9 +1018,7 @@ def _handle_request_changes(args: dict, **kw) -> str:
         return delegated_err
     tid = _default_task_id(args.get("task_id"))
     if not tid:
-        return tool_error(
-            "task_id is required (or set HERMES_KANBAN_TASK in the env)"
-        )
+        return _no_default_task_error("kanban_request_changes")
     ownership_err = _enforce_worker_task_ownership(tid)
     if ownership_err:
         return ownership_err
@@ -1036,9 +1072,7 @@ def _handle_heartbeat(args: dict, **kw) -> str:
         return delegated_err
     tid = _default_task_id(args.get("task_id"))
     if not tid:
-        return tool_error(
-            "task_id is required (or set HERMES_KANBAN_TASK in the env)"
-        )
+        return _no_default_task_error("kanban_heartbeat")
     ownership_err = _enforce_worker_task_ownership(tid)
     if ownership_err:
         return ownership_err
@@ -1130,9 +1164,7 @@ def _handle_attach(args: dict, **kw) -> str:
         return delegated_err
     tid = _default_task_id(args.get("task_id"))
     if not tid:
-        return tool_error(
-            "task_id is required (or set HERMES_KANBAN_TASK in the env)"
-        )
+        return _no_default_task_error("kanban_attach")
     ownership_err = _enforce_worker_task_ownership(tid)
     if ownership_err:
         return ownership_err
@@ -1252,9 +1284,7 @@ def _handle_attach_url(args: dict, **kw) -> str:
         return delegated_err
     tid = _default_task_id(args.get("task_id"))
     if not tid:
-        return tool_error(
-            "task_id is required (or set HERMES_KANBAN_TASK in the env)"
-        )
+        return _no_default_task_error("kanban_attach_url")
     ownership_err = _enforce_worker_task_ownership(tid)
     if ownership_err:
         return ownership_err
@@ -1305,9 +1335,7 @@ def _handle_attachments(args: dict, **kw) -> str:
     """List a task's attachments (read-only; no ownership restriction)."""
     tid = _default_task_id(args.get("task_id"))
     if not tid:
-        return tool_error(
-            "task_id is required (or set HERMES_KANBAN_TASK in the env)"
-        )
+        return _no_default_task_error("kanban_attachments")
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)
