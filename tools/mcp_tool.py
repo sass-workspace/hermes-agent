@@ -4713,6 +4713,154 @@ def _reset_server_error(server_name: str) -> None:
     _server_breaker_opened_at.pop(server_name, None)
 
 
+# ---------------------------------------------------------------------------
+# Tool-result error classification (application vs transport).
+#
+# The circuit breaker above is a *reachability* breaker: its message tells
+# the model "this server is unreachable, stop retrying". An MCP tool result
+# carrying ``isError: true`` is NOT evidence of unreachability — the JSON-RPC
+# round-trip completed, which is exactly why ``_mark_session_proven()`` fires
+# on that same path. Per the MCP spec, ``isError`` reports a *tool execution*
+# failure (bad arguments, validation rejection, upstream 404, business-rule
+# denial); protocol/transport failures arrive as exceptions instead.
+#
+# Counting those toward the breaker manufactured fake outages: three
+# consecutive schema-validation rejections from one hosted server were enough
+# to trip the breaker and black out every one of that server's tools for the
+# cooldown, even though the transport never faltered once.
+#
+# So we classify before touching the breaker. The default is "application"
+# (breaker untouched-as-failure, and closed because the round-trip proved the
+# transport). Only an error whose text carries an unambiguous transport- or
+# auth-layer marker still counts as a strike — some servers do tunnel a real
+# 401/502 out through ``isError`` rather than raising, and those must keep
+# their existing breaker + re-auth behavior.
+#
+# A BARE status number is deliberately NOT a marker. Validation errors quote
+# line/column positions ("EntityRef: expecting ';' (line 1, column 503)"), so
+# matching a loose ``\b503\b`` would re-manufacture the exact fake outage this
+# fix removes. A status code only counts when it is either labelled as one
+# (``HTTP 503``, ``status: 502``) or immediately followed by its standard
+# reason phrase. For the same reason a bare "Forbidden" is not a marker —
+# applications say it about their own permission rules — but "403 Forbidden"
+# is.
+_HTTP_TRANSPORT_STATUS = r"401|403|407|502|503|504"
+# Reason phrases an APPLICATION plausibly uses about its own rules, so they
+# only count when paired with the status code that makes them HTTP's.
+_HTTP_AMBIGUOUS_REASON = (
+    r"unauthoriz(?:ed|ation)"
+    r"|forbidden"
+    r"|proxy\s+authentication\s+required"
+)
+# Reason phrases that are infrastructure wording in any context — no
+# application says "Bad Gateway" about its own business rules.
+_HTTP_INFRA_REASON = (
+    r"bad\s+gateway"
+    r"|service\s+unavailable"
+    r"|gateway\s+time-?out"
+)
+_TRANSPORT_ERROR_MARKERS = re.compile(
+    r"""(?xi)
+    # -- HTTP status paired with an otherwise-ambiguous reason phrase --
+    \b(?:""" + _HTTP_TRANSPORT_STATUS + r""")\b[\s:,;—–-]*(?:""" + _HTTP_AMBIGUOUS_REASON + r""")\b
+    # -- ...or a status code explicitly labelled as one --
+  | \b(?:http(?:/\d(?:\.\d)?)?|status(?:\s+code)?)\b[\s:=]*\b(?:""" + _HTTP_TRANSPORT_STATUS + r""")\b
+    # -- ...or infrastructure wording, which stands on its own --
+  | \b(?:""" + _HTTP_INFRA_REASON + r""")\b
+    # -- Credential-layer markers (unambiguous on their own) --
+  | \bauthentication\s+(?:required|failed)\b
+  | \binvalid[_\s-]token\b
+  | \btoken\s+(?:has\s+)?expired\b
+  | \bre-?authenticat
+    # -- Socket / connection --
+  | \bconnection\s+(?:refused|reset|aborted|closed|error|timed\s+out)\b
+  | \b(?:read|connect)\s+timeout\b
+  | \becon(?:nrefused|nreset|naborted)\b
+  | \be(?:notfound|timedout|hostunreach|netunreach|pipe)\b
+  | \beai_[a-z]+\b
+  | \bbroken\s+pipe\b
+  | \bsocket\s+hang\s+up\b
+  | \bserver\s+disconnected\b
+  | \bremote\s+end\s+closed\s+connection\b
+  | \bupstream\s+connect\s+error\b
+  | \bno\s+route\s+to\s+host\b
+  | \bnetwork\s+is\s+unreachable\b
+    # -- DNS --
+  | \bgetaddrinfo\b
+  | \bname\s+or\s+service\s+not\s+known\b
+  | \btemporary\s+failure\s+in\s+name\s+resolution\b
+    # -- TLS --
+  | \bcertificate\s+verify\s+failed\b
+  | \b(?:ssl|tls)\s+(?:error|handshake)\b
+  | \bhandshake\s+fail
+    """
+)
+
+
+def _classify_tool_result_error(error_text: Any) -> str:
+    """Classify a completed call's error payload.
+
+    Returns ``"transport"`` when the text carries an unambiguous
+    transport/auth-layer marker, else ``"application"``. Non-string and
+    empty payloads classify as ``"application"`` — an unreadable error is
+    not evidence that the server is unreachable.
+    """
+    if not isinstance(error_text, str) or not error_text.strip():
+        return "application"
+    return (
+        "transport"
+        if _TRANSPORT_ERROR_MARKERS.search(error_text)
+        else "application"
+    )
+
+
+def _record_tool_result_outcome(
+    server_name: str, result: Any, *, count_transport_failure: bool = True,
+) -> str:
+    """Fold a *completed* RPC's payload into the circuit breaker.
+
+    This is the single policy point for every handler that gets a payload
+    back from the MCP loop (the tool handler and both retry helpers). The
+    round-trip completing at all is the evidence being recorded:
+
+    - ``"success"``   — no error key. Breaker closed.
+    - ``"application"`` — tool-level error. Breaker closed: the transport
+      demonstrably works, so a reachability breaker must not count it.
+    - ``"transport"`` — error text names a transport/auth failure the
+      server tunnelled through ``isError``. Breaker bumped, as before.
+
+    ``count_transport_failure=False`` classifies without recording the
+    strike. The retry helpers pass it: a transport verdict there makes them
+    fall through to a caller that bumps the breaker itself, and one failed
+    call must cost exactly one strike — "consecutive failures" is the
+    quantity the threshold is calibrated against.
+
+    Returns the classification so callers can branch on it.
+    """
+    try:
+        parsed = json.loads(result)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        _reset_server_error(server_name)
+        return "success"
+    if not isinstance(parsed, dict) or "error" not in parsed:
+        _reset_server_error(server_name)
+        return "success"
+
+    verdict = _classify_tool_result_error(parsed.get("error"))
+    if verdict == "transport":
+        if count_transport_failure:
+            _bump_server_error(server_name)
+        logger.debug(
+            "MCP server '%s': tool result error classified transport "
+            "(strike recorded: %s)", server_name, count_transport_failure,
+        )
+    else:
+        # Round-trip completed: the server is reachable. Close the breaker
+        # exactly as a successful call would.
+        _reset_server_error(server_name)
+    return verdict
+
+
 def _signal_reconnect(server: Any) -> bool:
     """Ask a server task to rebuild its transport, thread-safely.
 
@@ -4938,9 +5086,13 @@ def _handle_auth_error_and_retry(
       2. If yes, set the server's ``_reconnect_event`` so the server task
          tears down the current MCP session and rebuilds it with fresh
          credentials. Wait briefly for ``_ready`` to re-fire.
-      3. Retry the operation once. Return the retry result if it produced
-         a non-error JSON payload. Otherwise return the ``needs_reauth``
-         error dict so the model stops hallucinating manual refresh.
+      3. Retry the operation once and return its result — unless the retry
+         failed at the transport/auth layer again, in which case return the
+         ``needs_reauth`` error dict so the model stops hallucinating manual
+         refresh. An *application*-level error on the retry is returned as
+         it stands: the credentials demonstrably worked, so the tool's own
+         message is the honest answer (see
+         :func:`_record_tool_result_outcome`).
       4. Return None if ``exc`` is not an auth error, signalling the
          caller to use the generic error path.
 
@@ -4997,13 +5149,16 @@ def _handle_auth_error_and_retry(
 
         try:
             result = retry_call()
-            try:
-                parsed = json.loads(result)
-                if "error" not in parsed:
-                    _reset_server_error(server_name)
-                    return result
-            except (json.JSONDecodeError, TypeError):
-                _reset_server_error(server_name)
+            # An application-level error on the retry means the credentials
+            # worked — the tool itself rejected the call. Surfacing the real
+            # message beats masking it behind a bogus needs_reauth.
+            #
+            # A transport verdict falls through to the needs_reauth return
+            # below, which bumps the breaker itself — so this call must not
+            # bump too, or one failed call would cost two strikes.
+            if _record_tool_result_outcome(
+                server_name, result, count_transport_failure=False,
+            ) != "transport":
                 return result
         except Exception as retry_exc:
             logger.warning(
@@ -5191,13 +5346,13 @@ def _handle_session_expired_and_retry(
 
     try:
         result = retry_call()
-        try:
-            parsed = json.loads(result)
-            if "error" not in parsed:
-                _reset_server_error(server_name)
-                return result
-        except (json.JSONDecodeError, TypeError):
-            _reset_server_error(server_name)
+        # Same rule as the auth path: the rebuilt session carried the call
+        # through, so a tool-level error is the answer, not a fall-through.
+        # A transport verdict returns None, and the caller's generic error
+        # path owns the strike — don't record it twice.
+        if _record_tool_result_outcome(
+            server_name, result, count_transport_failure=False,
+        ) != "transport":
             return result
     except Exception as retry_exc:
         logger.warning(
@@ -6353,15 +6508,10 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
 
         try:
             result = _call_once()
-            # Check if the MCP tool itself returned an error
-            try:
-                parsed = json.loads(result)
-                if "error" in parsed:
-                    _bump_server_error(server_name)
-                else:
-                    _reset_server_error(server_name)  # success — reset
-            except (json.JSONDecodeError, TypeError):
-                _reset_server_error(server_name)  # non-JSON = success
+            # The RPC round-trip completed. Classify before touching the
+            # breaker: a tool-level ``isError`` is not a reachability
+            # failure, and must not black out the server's other tools.
+            _record_tool_result_outcome(server_name, result)
             return result
         except InterruptedError:
             return _interrupted_call_result()

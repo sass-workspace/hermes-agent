@@ -1,0 +1,167 @@
+{
+  "_readme": [
+    "Fixtures for tools/mcp_tool.py::_classify_tool_result_error.",
+    "",
+    "Every payload here is the TEXT that a completed MCP `tools/call`",
+    "round-trip returned with `isError: true`. The round-trip itself",
+    "succeeded in all cases — these are what the *server* said, not what",
+    "the transport did.",
+    "",
+    "The `application` entries are synthetic reproductions of the shapes",
+    "that manufactured fake hosted-server outages: three consecutive",
+    "schema-validation rejections were enough to trip a *reachability*",
+    "breaker and black out every tool on that server. No payload here was",
+    "captured by sending an invalid request to a live production server;",
+    "they are hand-written to the documented error shapes.",
+    "",
+    "The `transport` entries are the narrow set that must KEEP counting",
+    "as breaker strikes: real transport/auth failures that some servers",
+    "tunnel out through `isError` instead of raising."
+  ],
+
+  "application": [
+    {
+      "id": "asana-xml-validation-unclosed-tag",
+      "why": "Renderer emitted malformed markup; the tool rejected it. Server is fine.",
+      "text": "Validation failed: `html_notes` is not valid XML. Unexpected end of input: expected closing tag </body> (line 1, column 214)."
+    },
+    {
+      "id": "asana-xml-validation-unsupported-element",
+      "why": "Unsupported element in a rich-text field — a payload bug, not an outage.",
+      "text": "Invalid request: html_notes contains unsupported element <table>. Allowed elements: <body> <h1> <h2> <ul> <ol> <li> <strong> <em> <code> <a>."
+    },
+    {
+      "id": "asana-xml-validation-unescaped-entity",
+      "why": "Third consecutive validation rejection — the exact count that used to trip the breaker.",
+      "text": "Validation failed: `html_notes` is not valid XML. EntityRef: expecting ';' (line 1, column 88). Raw '&' must be escaped as '&amp;'."
+    },
+    {
+      "id": "not-found",
+      "why": "Upstream 404 for a bad gid. The server answered; the object does not exist.",
+      "text": "Not Found: task with gid '1209999999999999' does not exist."
+    },
+    {
+      "id": "business-rule-denial",
+      "why": "Permission decided by the application, not by the transport's auth layer.",
+      "text": "You do not have write access to this project. Ask a project admin to grant you edit permission."
+    },
+    {
+      "id": "bad-arguments",
+      "why": "Schema mismatch on the call arguments.",
+      "text": "Invalid arguments for tool 'create_task': required property 'workspace' is missing."
+    },
+    {
+      "id": "rate-limited-by-app",
+      "why": "Application-level throttle. Retryable later, but the server is plainly reachable.",
+      "text": "Rate limit exceeded for this workspace. Retry after 30 seconds."
+    },
+    {
+      "id": "empty-error-text",
+      "why": "Unreadable error is not evidence of unreachability — must not strike the breaker.",
+      "text": ""
+    },
+    {
+      "id": "app-timeout-wording",
+      "why": "The tool's own operation timed out server-side; bare 'timed out' must not read as transport.",
+      "text": "The report generation timed out after 60 seconds. Narrow the date range and try again."
+    },
+    {
+      "id": "validation-column-503",
+      "why": "Adversarial: a parser position that happens to be a gateway status number. A bare \\b503\\b marker would re-manufacture the very outage this fix removes.",
+      "text": "Validation failed: `html_notes` is not valid XML. EntityRef: expecting ';' (line 1, column 503)."
+    },
+    {
+      "id": "validation-line-401",
+      "why": "Adversarial: line 401 must not read as HTTP 401.",
+      "text": "Invalid request: unexpected token at line 401, column 12 of the submitted document."
+    },
+    {
+      "id": "validation-offset-502",
+      "why": "Adversarial: a byte offset colliding with a gateway status number.",
+      "text": "Parse error at offset 502: expected '>' to close the opening tag."
+    },
+    {
+      "id": "app-forbidden-wording",
+      "why": "Adversarial: applications say 'forbidden' about their OWN permission rules. Only '403 Forbidden' is a transport marker.",
+      "text": "Forbidden by workspace policy: guests may not create tasks in private projects."
+    },
+    {
+      "id": "app-count-404-403",
+      "why": "Adversarial: status-like numbers appearing as plain data.",
+      "text": "Bulk import rejected: 403 of 504 rows failed validation. Fix the rows and resubmit."
+    }
+  ],
+
+  "transport": [
+    {
+      "id": "tunnelled-401",
+      "why": "Server reports an auth failure through isError rather than raising.",
+      "text": "Upstream returned 401 Unauthorized: the access token is invalid or has expired."
+    },
+    {
+      "id": "tunnelled-403",
+      "why": "Forbidden at the auth layer.",
+      "text": "403 Forbidden — token lacks the required scope."
+    },
+    {
+      "id": "tunnelled-502",
+      "why": "Gateway failure in front of the MCP server.",
+      "text": "502 Bad Gateway: upstream service did not respond."
+    },
+    {
+      "id": "tunnelled-503",
+      "why": "Backend is genuinely down.",
+      "text": "Service Unavailable: the backend is temporarily offline."
+    },
+    {
+      "id": "connection-refused",
+      "why": "Socket-level failure surfaced as a tool error.",
+      "text": "Connection refused while contacting the upstream API (ECONNREFUSED)."
+    },
+    {
+      "id": "connection-timed-out",
+      "why": "Transport-level timeout, distinct from an application timeout.",
+      "text": "Connection timed out after 30s while reaching api.example.internal."
+    },
+    {
+      "id": "dns-failure",
+      "why": "Name resolution failure is a transport failure.",
+      "text": "Temporary failure in name resolution for host api.example.internal."
+    },
+    {
+      "id": "tls-failure",
+      "why": "TLS handshake failure.",
+      "text": "SSL error: certificate verify failed (unable to get local issuer certificate)."
+    },
+    {
+      "id": "token-expired",
+      "why": "Credential expiry must keep its re-auth handling.",
+      "text": "The token has expired. Please re-authenticate and try again."
+    },
+    {
+      "id": "labelled-http-status",
+      "why": "A status code labelled as one counts even without its reason phrase.",
+      "text": "Upstream request failed with HTTP 503 while proxying the call."
+    },
+    {
+      "id": "status-code-field",
+      "why": "'status code: 502' is an unambiguous transport report.",
+      "text": "Proxy failure — status code: 502 returned by the origin."
+    },
+    {
+      "id": "eai-again",
+      "why": "Node/libc DNS retry failure. Codex review flagged this as a miss.",
+      "text": "request to https://api.example.internal failed, reason: getaddrinfo EAI_AGAIN api.example.internal"
+    },
+    {
+      "id": "socket-hang-up",
+      "why": "Node's wording for a dropped connection. Codex review flagged this as a miss.",
+      "text": "Request to the upstream API failed: socket hang up"
+    },
+    {
+      "id": "upstream-connect-error",
+      "why": "Envoy/Istio sidecar wording for an unreachable upstream.",
+      "text": "upstream connect error or disconnect/reset before headers"
+    }
+  ]
+}
