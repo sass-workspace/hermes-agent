@@ -291,6 +291,29 @@ def _is_interpreter_shutdown_submit_error(exc: RuntimeError) -> bool:
     return interpreter_shutting_down(exc)
 
 
+# Tools the sequential executor dispatches DIRECTLY, without going through
+# model_tools.handle_function_call. Kept beside the ladder that uses it so the
+# two cannot drift: adding a branch there means adding the name here.
+_EXECUTOR_DIRECT_DISPATCH_TOOLS = frozenset({
+    "todo",
+    "message_agent",
+    "session_search",
+    "memory",
+    "clarify",
+    "read_terminal",
+    "read_preview",
+    "drive_preview",
+    "annotate_preview",
+    # delegate_task is the sharpest one: a delegated subagent can mutate
+    # exactly the state a cached read describes, and it never touches this
+    # process's handle_function_call to say so.
+    "delegate_task",
+    "read_window_below",
+    "setup_mcp",
+    "tour",
+})
+
+
 def _measured_approval_wait_ms(tool_call_id: str) -> int:
     """Read the approval-wait split the DISPATCHER measured for this call.
 
@@ -2102,6 +2125,26 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         _execution_dispatched = False
 
         tool_start_time = time.time()
+
+        # The ladder below runs a handful of tools directly, bypassing
+        # handle_function_call — and with it the per-turn read-suppression
+        # cache's invalidate-on-write rule. None of them is a read-only MCP
+        # tool, so by that cache's own policy every one of them invalidates.
+        # Without this, `message_agent` (which can drive another agent into
+        # mutating the very state a cached read describes) would leave a
+        # stale answer in place for the rest of the turn.
+        if function_name in _EXECUTOR_DIRECT_DISPATCH_TOOLS:
+            try:
+                from tools import turn_read_cache
+
+                turn_read_cache.invalidate(
+                    str(getattr(agent, "_current_turn_id", "") or "")
+                )
+            except Exception:
+                logger.debug(
+                    "turn read cache: direct-dispatch invalidate failed",
+                    exc_info=True,
+                )
 
         if function_name == "todo":
             def _execute(next_args: dict) -> Any:

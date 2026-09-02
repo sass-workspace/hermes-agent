@@ -354,3 +354,63 @@ def test_write_capable_tools_are_never_suppressed(monkeypatch):
         assert calls["n"] == 2
     finally:
         _drop("_write_probe")
+
+
+# ---------------------------------------------------------------------------
+# The executor's direct-dispatch bypass
+# ---------------------------------------------------------------------------
+
+
+def test_every_direct_dispatch_tool_is_listed():
+    """The bypass list must cover every branch of the executor's ladder.
+
+    Those tools never reach handle_function_call, so they never hit the
+    invalidate-on-write rule there. If a new branch is added to the ladder
+    without adding its name here, a write would silently stop invalidating
+    and a cached read could go stale for the rest of the turn.
+    """
+    import inspect
+    import re
+
+    from agent import tool_executor
+
+    src = inspect.getsource(tool_executor)
+    ladder = src[src.index('if function_name == "todo":'):]
+    ladder = ladder[:ladder.index("\n        else:")]
+    branched = set(re.findall(r'function_name == "([a-z_]+)"', ladder))
+    assert branched, "could not find the executor's direct-dispatch ladder"
+
+    missing = branched - set(tool_executor._EXECUTOR_DIRECT_DISPATCH_TOOLS)
+    assert not missing, (
+        f"executor branches on {sorted(missing)} without listing them in "
+        "_EXECUTOR_DIRECT_DISPATCH_TOOLS — those writes would not invalidate "
+        "the per-turn read cache"
+    )
+
+
+def test_the_bypass_list_names_only_real_tools():
+    """A stale name here would silently invalidate nothing."""
+    import inspect
+
+    from agent import tool_executor
+
+    src = inspect.getsource(tool_executor)
+    for name in tool_executor._EXECUTOR_DIRECT_DISPATCH_TOOLS:
+        assert f'function_name == "{name}"' in src, (
+            f"{name} is listed as direct-dispatch but the executor has no "
+            "branch for it"
+        )
+
+
+def test_a_direct_dispatch_tool_invalidates_the_turn_cache():
+    """message_agent can drive another agent into mutating the read's subject."""
+    from agent import tool_executor
+
+    turn_read_cache.record("T", "get_task", {"gid": "1"})
+    assert turn_read_cache.check("T", "get_task", {"gid": "1"}) is not None
+
+    assert "message_agent" in tool_executor._EXECUTOR_DIRECT_DISPATCH_TOOLS
+    # Mirror what the executor does for a direct-dispatch tool.
+    turn_read_cache.invalidate("T")
+
+    assert turn_read_cache.check("T", "get_task", {"gid": "1"}) is None
