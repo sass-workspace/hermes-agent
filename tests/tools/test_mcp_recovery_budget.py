@@ -326,3 +326,58 @@ def test_worst_case_turn_impact_stays_within_the_budget(mcp, in_turn, monkeypatc
         f"a turn spent {elapsed:.1f}s waiting on MCP recovery; the budget is "
         f"{mcp._TURN_RECOVERY_BUDGET_SEC:.0f}s"
     )
+
+
+# ---------------------------------------------------------------------------
+# The wiring that makes the budget real
+# ---------------------------------------------------------------------------
+
+
+def test_the_turn_key_reaches_a_tool_handler_for_real(mcp, tmp_path, monkeypatch):
+    """Without this, the entire budget is a silent no-op.
+
+    The turn key comes from a contextvar the tool dispatcher binds around
+    dispatch. MCP tool handlers run inside that dispatch — but if the
+    contextvar were not visible there (a different thread, a lost context),
+    every budget lookup would fall into the "no turn to protect" branch, the
+    cap would never apply, and nothing would fail: waits would simply go back
+    to being unbounded. So exercise the REAL dispatcher, with no
+    monkeypatching of the turn id.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    from model_tools import handle_function_call
+    from tools.registry import registry, tool_result
+
+    seen = {}
+
+    def _handler(args, **kw):
+        seen["key"] = mcp._current_recovery_turn_key()
+        seen["before"] = mcp._recovery_budget_remaining()
+        mcp._charge_recovery_budget(5.0)
+        seen["after"] = mcp._recovery_budget_remaining()
+        return tool_result(ok=True)
+
+    registry.register(
+        name="_budget_wiring_probe",
+        toolset="testing",
+        schema={
+            "name": "_budget_wiring_probe",
+            "description": "test only",
+            "parameters": {"type": "object", "properties": {}},
+        },
+        handler=_handler,
+    )
+    try:
+        handle_function_call("_budget_wiring_probe", {}, turn_id="TURN-XYZ")
+
+        assert seen["key"] == "TURN-XYZ", (
+            "the turn key is not visible inside a tool handler — the recovery "
+            "budget would never apply to any MCP wait"
+        )
+        assert seen["before"] == mcp._TURN_RECOVERY_BUDGET_SEC
+        # And the charge is scoped to that turn, not discarded.
+        assert seen["after"] == pytest.approx(
+            mcp._TURN_RECOVERY_BUDGET_SEC - 5.0
+        )
+    finally:
+        registry._tools.pop("_budget_wiring_probe", None)
