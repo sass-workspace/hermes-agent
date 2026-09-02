@@ -132,8 +132,13 @@ def check(turn_id: str, tool_name: str, args: Any) -> Tuple[Optional[str], int]:
     if not turn_id:
         return None, 0
     key = _call_key(tool_name, args)
-    state = _state(turn_id, create=False)
-    if state is None:
+    # create=True: the turn must be TRACKED from its first read, not from its
+    # first recording. An untracked turn is invisible to invalidate_all(), so
+    # a read that started before a plugin's write would record afterwards with
+    # a generation nobody had bumped — the exact stale result the generation
+    # guard exists to prevent.
+    state = _state(turn_id, create=True)
+    if state is None:  # pragma: no cover — create=True always returns one
         return None, 0
     with state.lock:
         generation = state.generation
@@ -222,6 +227,54 @@ def invalidate(turn_id: str) -> None:
         state.generation += 1
         state.last_key = None
         state.hits = 0
+
+
+def invalidate_all() -> None:
+    """Forget every turn's last call.
+
+    For dispatch paths that can mutate state but cannot identify the turn
+    they belong to — notably ``PluginAPI.dispatch_tool``, which plugins may
+    call from a hook that runs before the turn id is bound, or from
+    background code with no turn at all.
+
+    Blunt on purpose. The cache holds one key per turn and only ever
+    suppresses a back-to-back repeat, so the entire cost of being wrong here
+    is one extra read; the cost of being wrong the other way is a stale
+    answer.
+    """
+    with _registry_lock:
+        states = list(_turns.values())
+    for state in states:
+        with state.lock:
+            state.generation += 1
+            state.last_key = None
+            state.hits = 0
+
+
+def note_tool_dispatch(tool_name: str, turn_id: str) -> None:
+    """Apply the invalidate-on-write rule for one about-to-run tool.
+
+    THE single expression of that rule, for every dispatch path that does
+    not go through ``model_tools.handle_function_call``. Anything not
+    provably a read-only MCP tool invalidates; read-only MCP tools are left
+    alone so the dispatcher can do its own check-and-record.
+
+    It exists as a named function because the rule kept being missed: it was
+    added at one call site at a time, and each miss was a silently reachable
+    stale read rather than a visible failure. A grep for this name now finds
+    every path that has considered the question.
+    """
+    try:
+        if not is_read_only_tool(tool_name):
+            if turn_id:
+                invalidate(turn_id)
+            else:
+                invalidate_all()
+    except Exception:
+        logger.debug(
+            "turn read cache: dispatch note failed for %s", tool_name,
+            exc_info=True,
+        )
 
 
 def finish_turn(turn_id: str) -> None:

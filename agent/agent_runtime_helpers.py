@@ -3286,10 +3286,9 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
     try:
         from tools import turn_read_cache
 
-        if not turn_read_cache.is_read_only_tool(function_name):
-            turn_read_cache.invalidate(
-                str(getattr(agent, "_current_turn_id", "") or "")
-            )
+        turn_read_cache.note_tool_dispatch(
+            function_name, str(getattr(agent, "_current_turn_id", "") or "")
+        )
     except Exception:
         logger.debug(
             "turn read cache: pre-dispatch invalidate failed", exc_info=True

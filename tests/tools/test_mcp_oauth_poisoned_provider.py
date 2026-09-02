@@ -567,3 +567,39 @@ def test_flow_depth_is_released_only_after_the_lock_is(monkeypatch, tmp_path):
         "here would rebuild a healthy provider"
     )
     assert provider._hermes_flow_depth == 0
+
+
+def test_the_stall_threshold_never_undercuts_the_configured_browser_wait():
+    """The browser login is awaited INSIDE the flow.
+
+    `oauth.timeout` is operator-configurable above its 300s default, so a
+    fixed bound could judge a provider poisoned while a human was still
+    legitimately logging in.
+    """
+    from tools.mcp_oauth_manager import _STALLED_AUTH_FLOW_SEC
+
+    provider = _provider_stub(locked=True, depth=1)
+
+    provider._hermes_callback_timeout = 0.0
+    assert provider._hermes_stall_threshold() == _STALLED_AUTH_FLOW_SEC
+
+    provider._hermes_callback_timeout = 300.0
+    assert provider._hermes_stall_threshold() == _STALLED_AUTH_FLOW_SEC
+
+    # A long configured wait raises the bar above it, with headroom.
+    provider._hermes_callback_timeout = 3600.0
+    assert provider._hermes_stall_threshold() == 7200.0
+
+    provider._hermes_callback_timeout = "not-a-number"
+    assert provider._hermes_stall_threshold() == _STALLED_AUTH_FLOW_SEC
+
+
+def test_a_flow_inside_a_long_configured_wait_is_not_poison():
+    import time as _time
+
+    provider = _provider_stub(locked=True, depth=1)
+    provider._hermes_callback_timeout = 3600.0
+    provider._hermes_flow_started_mono = _time.monotonic() - 2000.0
+    assert provider._hermes_lock_is_poisoned() is False, (
+        "evicted a provider that was still within its configured browser wait"
+    )

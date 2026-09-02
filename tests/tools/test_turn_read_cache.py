@@ -558,3 +558,79 @@ def test_the_concurrent_path_does_not_invalidate_for_read_only_tools(monkeypatch
         )
     finally:
         _drop("_ro_conc_probe")
+
+
+# ---------------------------------------------------------------------------
+# The shared policy helper, and the paths that reach the registry directly
+# ---------------------------------------------------------------------------
+
+
+def test_note_tool_dispatch_invalidates_for_a_write(monkeypatch):
+    monkeypatch.setattr(turn_read_cache, "is_read_only_tool", lambda name: False)
+    _run("T", "get_task", {"gid": "1"})
+    turn_read_cache.note_tool_dispatch("update_task", "T")
+    assert _suppressed("T", "get_task", {"gid": "1"}) is None
+
+
+def test_note_tool_dispatch_leaves_read_only_tools_alone(monkeypatch):
+    """Invalidating for reads too would disable suppression everywhere."""
+    monkeypatch.setattr(turn_read_cache, "is_read_only_tool", lambda name: True)
+    _run("T", "get_task", {"gid": "1"})
+    turn_read_cache.note_tool_dispatch("mcp__asana__get_task", "T")
+    assert _suppressed("T", "get_task", {"gid": "1"}) is not None
+
+
+def test_note_tool_dispatch_without_a_turn_id_clears_every_turn(monkeypatch):
+    """A caller that cannot identify its turn must still be safe.
+
+    PluginContext.dispatch_tool is the real case: a plugin may dispatch from a
+    hook that runs before the turn id is bound, or from background code with
+    no turn at all.
+    """
+    monkeypatch.setattr(turn_read_cache, "is_read_only_tool", lambda name: False)
+    _run("T1", "get_task", {"gid": "1"})
+    _run("T2", "get_task", {"gid": "1"})
+
+    turn_read_cache.note_tool_dispatch("delegate_task", "")
+
+    assert _suppressed("T1", "get_task", {"gid": "1"}) is None
+    assert _suppressed("T2", "get_task", {"gid": "1"}) is None
+
+
+def test_invalidate_all_bumps_generations_so_in_flight_reads_are_voided(
+    monkeypatch,
+):
+    _out, gen = turn_read_cache.check("T1", "get_task", {"gid": "1"})
+    turn_read_cache.invalidate_all()
+    assert turn_read_cache.record("T1", "get_task", {"gid": "1"}, gen) is False
+
+
+def test_plugin_dispatch_invalidates_the_read_cache(monkeypatch):
+    """The entry point round 6 found: PluginContext reaches the registry directly.
+
+    Driven through the real `PluginContext.dispatch_tool`, because none of the
+    other dispatch paths' fixes touch it.
+    """
+    from hermes_cli.plugins import PluginContext
+    from tools.registry import registry, tool_result
+
+    _register("_plugin_write_probe", lambda args, **kw: tool_result(ok=True))
+    monkeypatch.setattr(turn_read_cache, "is_read_only_tool", lambda name: False)
+
+    class _Manager:
+        scope_key = None
+        _cli_ref = None
+
+    api = PluginContext.__new__(PluginContext)
+    api._manager = _Manager()
+    try:
+        _run("T", "get_task", {"gid": "1"})
+        assert _suppressed("T", "get_task", {"gid": "1"}) is not None
+
+        api.dispatch_tool("_plugin_write_probe", {})
+
+        assert _suppressed("T", "get_task", {"gid": "1"}) is None, (
+            "a plugin mutated through the registry without invalidating"
+        )
+    finally:
+        _drop("_plugin_write_probe")

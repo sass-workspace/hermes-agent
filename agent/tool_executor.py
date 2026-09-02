@@ -1737,6 +1737,21 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             suffix = f"{timeout_s:.1f}s" if timeout_s is not None else "the configured timeout"
             function_result = f"Error executing tool '{name}': timed out after {suffix}"
             effect_disposition = "unknown"
+            # The worker may have finished — and recorded a read in the
+            # per-turn cache — in the window between the deadline snapshot
+            # and here. The model is about to receive this timeout instead of
+            # that result, so a later "the result directly above" stub would
+            # point at text it never saw. Forget the turn's last call.
+            try:
+                from tools import turn_read_cache
+
+                turn_read_cache.invalidate(
+                    str(getattr(agent, "_current_turn_id", "") or "")
+                )
+            except Exception:
+                logger.debug(
+                    "turn read cache: timeout invalidate failed", exc_info=True
+                )
             _emit_terminal_post_tool_call(
                 agent,
                 function_name=name,
@@ -2120,10 +2135,9 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         try:
             from tools import turn_read_cache
 
-            if not turn_read_cache.is_read_only_tool(function_name):
-                turn_read_cache.invalidate(
-                    str(getattr(agent, "_current_turn_id", "") or "")
-                )
+            turn_read_cache.note_tool_dispatch(
+                function_name, str(getattr(agent, "_current_turn_id", "") or "")
+            )
         except Exception:
             logger.debug(
                 "turn read cache: pre-dispatch invalidate failed", exc_info=True

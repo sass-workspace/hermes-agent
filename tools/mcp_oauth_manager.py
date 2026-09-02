@@ -152,6 +152,7 @@ def _make_hermes_provider_class() -> Optional[type]:
         _hermes_flow_depth = 0
         _hermes_lock_poisoned = False
         _hermes_flow_started_mono = None
+        _hermes_callback_timeout = 0.0
 
         def __init__(
             self,
@@ -236,7 +237,22 @@ def _make_hermes_provider_class() -> Optional[type]:
             started = getattr(self, "_hermes_flow_started_mono", None)
             if started is None:
                 return False
-            return (time.monotonic() - started) > _STALLED_AUTH_FLOW_SEC
+            return (time.monotonic() - started) > self._hermes_stall_threshold()
+
+        def _hermes_stall_threshold(self) -> float:
+            """Seconds in flight before a flow counts as parked, not slow.
+
+            Never below the configured OAuth callback wait: the browser login
+            is awaited INSIDE the flow, so a provider legitimately waiting on
+            a slow human must never be judged poisoned. Doubled to leave room
+            for the discovery and token round-trips either side of it.
+            """
+            configured = getattr(self, "_hermes_callback_timeout", 0.0) or 0.0
+            try:
+                configured = float(configured)
+            except (TypeError, ValueError):  # pragma: no cover — defensive
+                configured = 0.0
+            return max(_STALLED_AUTH_FLOW_SEC, configured * 2.0)
 
         def _stamp_token_user_agent(self, request):
             ua = getattr(self, "_hermes_token_user_agent", None)
@@ -846,11 +862,12 @@ class MCPOAuthManager:
         # mcp 2.0 removed OAuthClientProvider's `timeout` argument, so the
         # configured `oauth.timeout` now bounds the callback waiter's own poll
         # loop instead — that is where the browser round-trip is awaited.
+        _callback_timeout = float(cfg.get("timeout", 300))
         callback_handler = _make_callback_waiter(
-            resolved_port, cfg.get("_cimd_url"), timeout=float(cfg.get("timeout", 300))
+            resolved_port, cfg.get("_cimd_url"), timeout=_callback_timeout
         )
 
-        return _HERMES_PROVIDER_CLS(
+        provider = _HERMES_PROVIDER_CLS(
             server_name=server_name,
             preregistered=bool(cfg.get("client_id")),
             server_url=entry.server_url,
@@ -861,6 +878,10 @@ class MCPOAuthManager:
             token_user_agent=token_request_user_agent(cfg),
             **cimd_provider_kwargs(cfg),
         )
+        # The stall backstop must never fire while a legitimate flow is still
+        # inside the browser wait — see _hermes_stall_threshold.
+        provider._hermes_callback_timeout = _callback_timeout
+        return provider
 
     def remove(
         self,

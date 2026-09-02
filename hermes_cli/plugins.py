@@ -2215,6 +2215,24 @@ class PluginContext:
             if agent is not None:
                 kwargs["parent_agent"] = agent
 
+        # This reaches the registry directly, so none of the dispatch paths
+        # that enforce the per-turn read cache's invalidate-on-write rule
+        # apply. A plugin calling e.g. delegate_task here can mutate exactly
+        # the state a cached read describes.
+        #
+        # The turn id is not reliably knowable here — a plugin may dispatch
+        # from a hook that runs before it is bound, or from background code
+        # with no turn at all — so the helper falls back to clearing every
+        # tracked turn.
+        try:
+            from tools import turn_read_cache
+
+            turn_read_cache.note_tool_dispatch(tool_name, "")
+        except Exception:
+            logger.debug(
+                "turn read cache: plugin dispatch note failed", exc_info=True
+            )
+
         return registry.dispatch(
             tool_name, args, scope=self._manager.scope_key, **kwargs
         )
