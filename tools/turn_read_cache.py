@@ -197,8 +197,17 @@ def record(turn_id: str, tool_name: str, args: Any, generation: int) -> bool:
     key = _call_key(tool_name, args)
     if key is None:
         return False
-    state = _state(turn_id, create=True)
-    if state is None:  # pragma: no cover — create=True always returns one
+    # create=False: if this turn was evicted from the capped registry while
+    # the read was in flight, recreating it here would resurrect it at
+    # generation 0 — losing any invalidate_all() that happened in between and
+    # caching a pre-write result. `check()` already created the turn, so a
+    # missing one means it was evicted, and dropping the record is correct.
+    state = _state(turn_id, create=False)
+    if state is None:
+        logger.debug(
+            "turn read cache: turn %s was evicted mid-call; not recording",
+            turn_id,
+        )
         return False
     with state.lock:
         if state.generation != generation:
@@ -291,6 +300,12 @@ def reset_for_tests() -> None:
         _turns.clear()
 
 
+# Every MCP tool is registered as ``mcp__<server>__<tool>``. Checked here as a
+# literal so this module never imports tools.mcp_tool just to learn the
+# prefix — see is_read_only_tool.
+_MCP_REGISTRY_PREFIX = "mcp__"
+
+
 def is_read_only_tool(tool_name: str) -> bool:
     """True only for a tool we can positively prove is a read.
 
@@ -303,7 +318,16 @@ def is_read_only_tool(tool_name: str) -> bool:
     they are reads: they have their own mtime-aware dedup in
     ``tools/file_tools.py``, which can tell "unchanged" from "not re-read"
     and is strictly better than this one. Two layers would fight.
+
+    The name-shape check comes FIRST and matters for cold start: this runs on
+    every tool dispatch, and ``tools/mcp_tool.py`` is deliberately excluded
+    from built-in tool discovery (``tools/registry.py``) because importing it
+    is expensive. Asking the question through an import would have dragged
+    that module into every process that ever calls any tool, MCP configured
+    or not. A name that cannot be an MCP tool is answered without it.
     """
+    if not tool_name or not tool_name.startswith(_MCP_REGISTRY_PREFIX):
+        return False
     try:
         from tools.mcp_tool import is_read_only_mcp_tool
 

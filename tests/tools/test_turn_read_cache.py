@@ -505,7 +505,7 @@ def test_the_concurrent_path_invalidates_for_a_direct_mutator(monkeypatch):
         def _should_emit_quiet_tool_messages(self):
             return False
 
-    turn_read_cache.record("T", "get_task", {"gid": "1"}, 0)
+    _run("T", "get_task", {"gid": "1"})
     assert _suppressed("T", "get_task", {"gid": "1"}) is not None
 
     # `tour` is one of the ladder's direct branches; any of them proves the
@@ -545,7 +545,7 @@ def test_the_concurrent_path_does_not_invalidate_for_read_only_tools(monkeypatch
         lambda name: name == "_ro_conc_probe",
     )
     try:
-        turn_read_cache.record("T", "get_task", {"gid": "1"}, 0)
+        _run("T", "get_task", {"gid": "1"})
         try:
             invoke_tool(_Agent(), "_ro_conc_probe", {}, "task-1")
         except Exception:
@@ -634,3 +634,123 @@ def test_plugin_dispatch_invalidates_the_read_cache(monkeypatch):
         )
     finally:
         _drop("_plugin_write_probe")
+
+
+# ---------------------------------------------------------------------------
+# Cold start: the classifier runs on EVERY tool dispatch
+# ---------------------------------------------------------------------------
+
+
+def test_a_non_mcp_tool_name_is_answered_without_importing_mcp_tool():
+    """tools/mcp_tool is deliberately excluded from built-in discovery.
+
+    Asking the read-only question through an import would drag that module
+    into every process that ever calls any tool, MCP configured or not. A
+    name that cannot be an MCP tool must be answered from its shape alone.
+
+    Checked in a CLEAN interpreter, because by the time this file's other
+    tests have run, mcp_tool is already in sys.modules.
+    """
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    repo = Path(__file__).resolve().parents[2]
+    script = (
+        "import sys; sys.path.insert(0, %r)\n"
+        "from tools import turn_read_cache\n"
+        "for n in ('read_file', 'terminal', 'todo', 'delegate_task', ''):\n"
+        "    assert turn_read_cache.is_read_only_tool(n) is False, n\n"
+        "assert 'tools.mcp_tool' not in sys.modules, 'imported tools.mcp_tool'\n"
+        "print('OK')\n" % str(repo)
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True, text=True, timeout=120, cwd=str(repo),
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "OK" in proc.stdout
+
+
+def test_an_mcp_prefixed_name_still_consults_the_annotations(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    from tools import mcp_tool
+
+    mcp_tool._mcp_tool_server_names["mcp__asana__get_task"] = "asana"
+    mcp_tool._tool_read_only_hints["asana"] = {"get_task": True}
+    try:
+        assert turn_read_cache.is_read_only_tool("mcp__asana__get_task") is True
+    finally:
+        mcp_tool._mcp_tool_server_names.pop("mcp__asana__get_task", None)
+        mcp_tool._tool_read_only_hints.pop("asana", None)
+
+
+# ---------------------------------------------------------------------------
+# A turn evicted mid-call must not be resurrected by record()
+# ---------------------------------------------------------------------------
+
+
+def test_a_turn_evicted_while_a_read_was_in_flight_is_not_recorded():
+    """Recreating it would lose an invalidate_all() that happened meanwhile.
+
+    The registry is capped, so a long-running read's turn can be evicted by
+    other turns before it finishes. Resurrecting it at generation 0 would
+    cache a result the intervening write should have voided.
+    """
+    _out, gen = turn_read_cache.check("victim", "get_task", {"gid": "1"})
+    assert _out is None
+    assert "victim" in turn_read_cache._turns
+
+    # Push it out of the capped registry.
+    for i in range(turn_read_cache._MAX_TRACKED_TURNS + 2):
+        turn_read_cache.check(f"other-{i}", "x", {})
+    assert "victim" not in turn_read_cache._turns
+
+    assert turn_read_cache.record("victim", "get_task", {"gid": "1"}, gen) is False
+    assert "victim" not in turn_read_cache._turns, "record() resurrected the turn"
+    assert _suppressed("victim", "get_task", {"gid": "1"}) is None
+
+
+# ---------------------------------------------------------------------------
+# The fourth entry point: PluginContext.call_mcp
+# ---------------------------------------------------------------------------
+
+
+def test_plugin_call_mcp_invalidates_the_read_cache(monkeypatch):
+    """It invokes the MCP handler directly, bypassing every dispatch path.
+
+    Driven through the real `PluginContext.call_mcp`.
+    """
+    from hermes_cli.plugins import PluginContext
+
+    _run("T", "mcp__asana__get_task", {"gid": "1"})
+    assert _suppressed("T", "mcp__asana__get_task", {"gid": "1"}) is not None
+
+    # Stub the handler factory so no transport is needed.
+    monkeypatch.setattr(
+        "tools.mcp_tool._make_tool_handler",
+        lambda server, tool, timeout: (lambda args: '{"ok": true}'),
+    )
+
+    class _Manifest:
+        key = "test-plugin"
+        name = "test-plugin"
+
+    class _Manager:
+        scope_key = None
+        _cli_ref = None
+
+    ctx = PluginContext.__new__(PluginContext)
+    ctx._manager = _Manager()
+    ctx.manifest = _Manifest()
+    # The per-server allowlist gate runs first and must be satisfied, or the
+    # call is refused before it could mutate anything.
+    monkeypatch.setattr(
+        PluginContext, "_mcp_allowlist", lambda self, plugin_id: {"asana"}
+    )
+
+    ctx.call_mcp("asana", "update_task", {"gid": "1"})
+
+    assert _suppressed("T", "mcp__asana__get_task", {"gid": "1"}) is None, (
+        "a plugin MCP write left a cached read in place"
+    )

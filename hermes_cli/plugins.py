@@ -1893,6 +1893,25 @@ class PluginContext:
         # same trust gate, circuit breaker, reconnect and rendering paths.
         from tools.mcp_tool import _make_tool_handler
 
+        # ...but that handler is invoked directly, so none of the dispatch
+        # paths that enforce the per-turn read cache's invalidate-on-write
+        # rule apply. A plugin calling an MCP write here can mutate exactly
+        # the state a cached read describes.
+        #
+        # `tool` is the server's own unprefixed name, and this helper has no
+        # turn context, so neither the read-only lookup nor a turn-scoped
+        # invalidation is available. Clear every tracked turn: the cache
+        # holds one key per turn and only suppresses a back-to-back repeat,
+        # so the cost of being conservative is one extra read.
+        try:
+            from tools import turn_read_cache
+
+            turn_read_cache.invalidate_all()
+        except Exception:
+            logger.debug(
+                "turn read cache: plugin MCP call note failed", exc_info=True
+            )
+
         handler = _make_tool_handler(server, tool, timeout)
         raw = handler(dict(arguments or {}))
 
