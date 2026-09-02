@@ -149,6 +149,57 @@ def _make_hermes_provider_class() -> Optional[type]:
             # oauth.user_agent — stamped onto token-endpoint requests only;
             # some authorization servers/WAFs reject httpx's default (#75576).
             self._hermes_token_user_agent = token_user_agent
+            # Auth-flow liveness bookkeeping — see _hermes_lock_is_poisoned.
+            # ``_hermes_flow_depth`` counts flows currently inside
+            # ``async_auth_flow`` on this provider; ``_hermes_lock_poisoned``
+            # latches when we directly observe the SDK failing to release
+            # ``context.lock``.
+            self._hermes_flow_depth = 0
+            self._hermes_lock_poisoned = False
+
+        def _hermes_lock_is_poisoned(self) -> bool:
+            """True when this provider's OAuth lock can never be acquired again.
+
+            The SDK's ``async_auth_flow`` is an async GENERATOR that holds
+            ``self.context.lock`` — an ``anyio.Lock`` — across every yield,
+            for the whole flow. ``anyio.Lock.release()`` is owner-checked: it
+            raises ``RuntimeError("The current task is not holding this
+            lock")`` unless the releasing task is the one that acquired it.
+
+            So when a connect attempt is cancelled mid-flow (connect timeout,
+            transport TaskGroup drop, park), the generator is finalized from a
+            different task than the one that acquired the lock — or is dropped
+            and never finalized at all — and the lock stays held forever. The
+            provider is then permanently unusable: every later auth flow
+            blocks on a lock whose owner task no longer exists. Verified
+            against the installed SDK; a reused provider deadlocks on every
+            subsequent attempt, while a rebuilt one acquires immediately.
+
+            Two independent signals, either sufficient:
+
+            * ``_hermes_lock_poisoned`` — we watched the release fail while
+              finalizing the inner generator in ``async_auth_flow``.
+            * the lock is held while no flow is in progress on this provider
+              — nobody is going to release it.
+            """
+            if getattr(self, "_hermes_lock_poisoned", False):
+                return True
+            lock = getattr(getattr(self, "context", None), "lock", None)
+            locked_fn = getattr(lock, "locked", None)
+            if not callable(locked_fn):
+                return False
+            try:
+                held = locked_fn()
+            except Exception:  # pragma: no cover — defensive
+                return False
+            # Require a real ``True``, not merely something truthy. An
+            # unrecognised lock object (or a mock, whose every attribute is a
+            # truthy Mock) is not evidence of poisoning, and inferring it
+            # would rebuild healthy providers on every reconnect. The latched
+            # flag above still catches the case we actually observed.
+            if held is not True:
+                return False
+            return getattr(self, "_hermes_flow_depth", 0) <= 0
 
         def _stamp_token_user_agent(self, request):
             ua = getattr(self, "_hermes_token_user_agent", None)
@@ -531,6 +582,7 @@ def _make_hermes_provider_class() -> Optional[type]:
             # contract. Regression from PR #11383 caught by
             # tests/tools/test_mcp_oauth_bidirectional.py.
             inner = super().async_auth_flow(request)
+            self._hermes_flow_depth += 1
             try:
                 outgoing = await inner.__anext__()
                 while True:
@@ -544,6 +596,42 @@ def _make_hermes_provider_class() -> Optional[type]:
                 # 401 branch so a subsequent cold-load skips discovery.
                 self._persist_oauth_metadata_if_changed()
                 return
+            finally:
+                self._hermes_flow_depth -= 1
+                # Finalize the SDK's generator HERE, while we are still in a
+                # position to observe the outcome. It holds ``context.lock``
+                # across its yields; closing it runs the ``async with``
+                # exit, and ``anyio.Lock.release()`` raises when the closing
+                # task is not the one that acquired it — which is exactly
+                # what happens when a connect attempt is cancelled mid-flow.
+                # Catching that here is a direct, unambiguous poisoning
+                # signal, and the only place it is observable at all: left to
+                # the async-generator finalizer it surfaces as an unhandled
+                # error at loop shutdown, long after the provider has been
+                # reused and deadlocked. See _hermes_lock_is_poisoned.
+                try:
+                    await inner.aclose()
+                except RuntimeError as exc:
+                    if "not holding this lock" in str(exc).lower():
+                        self._hermes_lock_poisoned = True
+                        logger.warning(
+                            "MCP OAuth '%s': auth flow was abandoned by "
+                            "another task and its OAuth lock could not be "
+                            "released (%s). Marking this provider poisoned "
+                            "so the next reconnect rebuilds it instead of "
+                            "deadlocking on a lock nobody owns.",
+                            self._hermes_server_name, exc,
+                        )
+                    else:  # pragma: no cover — defensive
+                        logger.debug(
+                            "MCP OAuth '%s': closing the inner auth flow "
+                            "raised: %s", self._hermes_server_name, exc,
+                        )
+                except Exception as exc:  # pragma: no cover — defensive
+                    logger.debug(
+                        "MCP OAuth '%s': closing the inner auth flow "
+                        "failed: %s", self._hermes_server_name, exc,
+                    )
 
     return HermesMCPOAuthProvider
 
@@ -587,9 +675,20 @@ class MCPOAuthManager:
         If ``server_url`` changes for a given name, the cached entry is
         discarded and a fresh provider is built.
 
+        Reuse across reconnects is deliberate — it keeps the in-memory token
+        state and the pre-flow disk-watch warm. The one exception is a
+        provider whose OAuth lock has been poisoned by an abandoned auth
+        flow: reusing THAT is not reuse, it is a guaranteed deadlock on every
+        future reconnect, which is why hosted OAuth servers effectively never
+        recovered on their own after parking. Such a provider is evicted and
+        rebuilt. Persisted OAuth state on disk is untouched by the eviction,
+        so tokens survive and the rebuilt provider picks them straight back
+        up. See ``HermesMCPOAuthProvider._hermes_lock_is_poisoned``.
+
         Returns None if the MCP SDK's OAuth support is unavailable.
         """
         key = self._key(server_name)
+        self._evict_if_poisoned(server_name)
         with self._entries_lock:
             entry = self._entries.get(key)
             if entry is not None and entry.server_url != server_url:
@@ -743,6 +842,47 @@ class MCPOAuthManager:
             return
         with self._entries_lock:
             self._entries.setdefault(self._key(server_name, hermes_home), entry)
+
+    def _evict_if_poisoned(
+        self,
+        server_name: str,
+        *,
+        hermes_home: str | Path | None = None,
+    ) -> bool:
+        """Drop a cached provider whose OAuth lock can never be acquired again.
+
+        Called on the reconnect path before handing a cached provider back.
+        Returns True when a provider was evicted.
+
+        The poison check runs outside ``_entries_lock`` (it only reads the
+        provider), and ``evict()`` takes that lock itself — holding it across
+        the check would deadlock on the non-reentrant lock.
+        """
+        with self._entries_lock:
+            entry = self._entries.get(self._key(server_name, hermes_home))
+            provider = entry.provider if entry is not None else None
+        if provider is None:
+            return False
+        check = getattr(provider, "_hermes_lock_is_poisoned", None)
+        try:
+            poisoned = bool(check()) if callable(check) else False
+        except Exception:  # pragma: no cover — defensive
+            logger.debug(
+                "MCP OAuth '%s': poison check failed (non-fatal)",
+                server_name, exc_info=True,
+            )
+            return False
+        if not poisoned:
+            return False
+        logger.warning(
+            "MCP OAuth '%s': cached provider's OAuth lock is held with no "
+            "auth flow running — an earlier flow was abandoned mid-handshake "
+            "and the lock can never be released. Evicting it so this "
+            "reconnect builds a fresh provider; persisted tokens are kept.",
+            server_name,
+        )
+        self.evict(server_name, hermes_home=hermes_home)
+        return True
 
     def evict(
         self,

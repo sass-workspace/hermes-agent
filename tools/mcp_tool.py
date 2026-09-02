@@ -3601,6 +3601,12 @@ class MCPServerTask:
         # OAuth 2.1 PKCE: route through the central MCPOAuthManager so the
         # same provider instance is reused across reconnects, pre-flow
         # disk-watch is active, and config-time CLI code paths share state.
+        #
+        # The manager makes one exception to that reuse, and this call site
+        # is why it exists: a provider whose OAuth lock was poisoned by an
+        # auth flow abandoned mid-handshake is evicted and rebuilt here.
+        # Reusing it would block forever on a lock whose owner task is gone —
+        # every reconnect, for the life of the process.
         # If OAuth setup fails (e.g. non-interactive env without cached
         # tokens), re-raise so this server is reported as failed without
         # blocking other MCP servers from connecting.
