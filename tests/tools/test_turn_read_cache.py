@@ -247,6 +247,18 @@ class TestReadOnlyClassification:
         mcp_tool._mcp_tool_server_names.pop("mcp__asana__get_task", None)
         mcp_tool._tool_read_only_hints.pop("asana", None)
 
+    @pytest.fixture(autouse=True)
+    def _owned_by_mcp(self, monkeypatch):
+        """The registry must still resolve the name to the MCP toolset.
+
+        Classification fails closed otherwise — see the plugin-override test.
+        """
+        from tools.registry import registry
+
+        monkeypatch.setattr(
+            registry, "get_toolset_for_tool", lambda name: "mcp-asana"
+        )
+
     def _install(self, mcp, read_only):
         mcp._mcp_tool_server_names["mcp__asana__get_task"] = "asana"
         mcp._tool_read_only_hints["asana"] = {"get_task": read_only}
@@ -676,8 +688,11 @@ def test_an_mcp_prefixed_name_still_consults_the_annotations(monkeypatch, tmp_pa
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     from tools import mcp_tool
 
+    from tools.registry import registry
+
     mcp_tool._mcp_tool_server_names["mcp__asana__get_task"] = "asana"
     mcp_tool._tool_read_only_hints["asana"] = {"get_task": True}
+    monkeypatch.setattr(registry, "get_toolset_for_tool", lambda n: "mcp-asana")
     try:
         assert turn_read_cache.is_read_only_tool("mcp__asana__get_task") is True
     finally:
@@ -754,3 +769,47 @@ def test_plugin_call_mcp_invalidates_the_read_cache(monkeypatch):
     assert _suppressed("T", "mcp__asana__get_task", {"gid": "1"}) is None, (
         "a plugin MCP write left a cached read in place"
     )
+
+
+def test_a_plugin_override_of_an_mcp_tool_is_never_suppressed(monkeypatch, tmp_path):
+    """An operator-approved plugin override changes WHICH handler runs.
+
+    `PluginContext.register_tool(..., override=True)` overlays a scoped entry
+    on an MCP tool's name. Our readOnlyHint metadata says nothing about the
+    plugin's handler, so reading the annotation off a name we no longer own
+    would let a plugin's write be classified as a read.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    from tools import mcp_tool
+    from tools.registry import registry
+
+    name = "mcp__asana__get_task"
+    mcp_tool._mcp_tool_server_names[name] = "asana"
+    mcp_tool._tool_read_only_hints["asana"] = {"get_task": True}
+    try:
+        # While the registry still resolves the name to the MCP toolset...
+        monkeypatch.setattr(
+            registry, "get_toolset_for_tool", lambda n: "mcp-asana"
+        )
+        assert turn_read_cache.is_read_only_tool(name) is True
+
+        # ...but once a plugin owns the name, fail closed.
+        monkeypatch.setattr(
+            registry, "get_toolset_for_tool", lambda n: "plugin-my-plugin"
+        )
+        assert turn_read_cache.is_read_only_tool(name) is False
+
+        # An unresolvable name is also not read-only.
+        monkeypatch.setattr(registry, "get_toolset_for_tool", lambda n: None)
+        assert turn_read_cache.is_read_only_tool(name) is False
+    finally:
+        mcp_tool._mcp_tool_server_names.pop(name, None)
+        mcp_tool._tool_read_only_hints.pop("asana", None)
+
+
+def test_the_ownership_check_matches_the_registration_toolset(monkeypatch, tmp_path):
+    """The check must use the same toolset name registration uses."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    from tools import mcp_tool
+
+    assert mcp_tool._mcp_toolset_name("asana") == "mcp-asana"
