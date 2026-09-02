@@ -8977,14 +8977,6 @@ class AIAgent:
                         finish_turn(_ended_turn_id)
                     except Exception:
                         logger.debug("turn latency: finish failed", exc_info=True)
-                    # Read suppression is per-turn by design: the world moves
-                    # between turns, and context may have been compacted in
-                    # ways the cache has no view of.
-                    try:
-                        from tools import turn_read_cache
-                        turn_read_cache.finish_turn(_ended_turn_id)
-                    except Exception:
-                        logger.debug("turn read cache: finish failed", exc_info=True)
                     if acct_token is not None:
                         reset_accounting_context(acct_token)
                     if token is not None:

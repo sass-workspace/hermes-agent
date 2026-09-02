@@ -1133,20 +1133,6 @@ def _tool_result_observer_fields(
     return "ok", None, None
 
 
-def _tool_result_is_error(result: Any) -> bool:
-    """True when a tool result carries an error payload.
-
-    Used to keep failed reads out of the per-turn suppression cache: a call
-    that failed has to stay retryable, and answering the retry from the
-    failure would strand the turn.
-    """
-    try:
-        parsed = json.loads(result) if isinstance(result, str) else result
-    except Exception:
-        return False
-    return isinstance(parsed, dict) and bool(parsed.get("error"))
-
-
 def _approval_wait_mark() -> Optional[float]:
     """Snapshot this thread's cumulative approval-wait counter.
 
@@ -1554,47 +1540,6 @@ def handle_function_call(
             except Exception:
                 pass  # file_tools may not be loaded yet
 
-        # Identical read-only calls inside one turn return the same payload
-        # every time, and every copy stays in the conversation for the rest
-        # of the session — inflating context and, with it, the latency of
-        # every later request. Answer the repeat from the earlier result.
-        #
-        # A write invalidates the whole turn's cache: get → update → get must
-        # not answer the third call with the pre-update state.
-        _suppressible = False
-        _read_generation = 0
-        try:
-            from tools import turn_read_cache
-
-            _suppressible = turn_read_cache.is_read_only_tool(function_name)
-            if _suppressible:
-                _suppressed, _read_generation = turn_read_cache.check(
-                    turn_id or "", function_name, function_args,
-                )
-                if _suppressed is not None:
-                    logger.debug(
-                        "suppressed duplicate read %s in turn %s",
-                        function_name, turn_id,
-                    )
-                    _emit_post_tool_call_hook(
-                        function_name=function_name,
-                        function_args=function_args,
-                        result=_suppressed,
-                        task_id=task_id,
-                        session_id=session_id,
-                        tool_call_id=tool_call_id,
-                        turn_id=turn_id,
-                        api_request_id=api_request_id,
-                        duration_ms=0,
-                        status="suppressed",
-                        middleware_trace=list(_tool_middleware_trace),
-                    )
-                    return _suppressed
-            else:
-                turn_read_cache.invalidate(turn_id or "")
-        except Exception:
-            logger.debug("turn read cache check failed", exc_info=True)
-
         # Measure tool dispatch latency so post_tool_call and
         # transform_tool_result hooks can observe per-tool duration.
         # Inspired by Claude Code 2.1.119, which added ``duration_ms`` to
@@ -1729,24 +1674,6 @@ def handle_function_call(
                         break
         except Exception as _hook_err:
             logger.debug("transform_tool_result hook error: %s", _hook_err)
-
-        # Remember this read as the turn's most recent call, so an
-        # immediately-following identical repeat can be answered from it.
-        # Recorded HERE, after transform_tool_result, so the cache's notion
-        # of "the result directly above" is the text the model actually got.
-        # Errors are deliberately not recorded — a failed call stays
-        # retryable — and the generation check drops this if a write landed
-        # while the call was in flight.
-        if _suppressible and not _tool_result_is_error(result):
-            try:
-                from tools import turn_read_cache
-
-                turn_read_cache.record(
-                    turn_id or "", function_name, function_args,
-                    _read_generation,
-                )
-            except Exception:
-                logger.debug("turn read cache record failed", exc_info=True)
 
         return result
 

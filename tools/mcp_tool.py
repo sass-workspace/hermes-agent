@@ -4639,56 +4639,6 @@ def _record_tool_trust_metadata(
                 hints[name] = _annotation_read_only_hint(tool)
 
 
-def is_read_only_mcp_tool(registry_tool_name: str) -> bool:
-    """True when this registered MCP tool is annotated ``readOnlyHint: true``.
-
-    Reuses the per-tool hints captured at discovery for the trust gate — the
-    same fail-closed rule applies, so a missing or malformed annotation reads
-    as write-capable. Consumed by ``tools/turn_read_cache.py`` to decide
-    whether an identical repeat call inside one turn can be answered from the
-    earlier result instead of re-fetching the payload.
-
-    ``registry_tool_name`` is the name as registered with the tool registry
-    (``mcp__<server>__<tool>``); the hints are keyed by the server's own tool
-    name, so resolve through the provenance map rather than parsing.
-
-    Fails closed when the name no longer resolves to THIS module's
-    registration. An operator-approved plugin override
-    (``PluginContext.register_tool(..., override=True)``) overlays a scoped
-    entry on top of an MCP tool's name, and the handler that then runs is the
-    plugin's — about which our ``readOnlyHint`` metadata says nothing. Reading
-    the annotation off a name whose handler we no longer own would let a
-    plugin's write be classified as a read.
-    """
-    with _lock:
-        server_name = _mcp_tool_server_names.get(registry_tool_name)
-        if not server_name:
-            return False
-        hints = _tool_read_only_hints.get(server_name) or {}
-    # Ownership check, outside our lock: the registry takes its own.
-    try:
-        from tools.registry import registry
-
-        if registry.get_toolset_for_tool(registry_tool_name) != _mcp_toolset_name(
-            server_name
-        ):
-            return False
-    except Exception:
-        logger.debug(
-            "MCP: could not confirm registry ownership of %s",
-            registry_tool_name, exc_info=True,
-        )
-        return False
-    # Registry names are prefixed AND sanitized, so the transform is not
-    # reversible by string surgery. Compare forwards instead: derive each
-    # candidate's registry name the same way registration did.
-    for bare_name, read_only in hints.items():
-        if read_only is not True:
-            continue
-        if mcp_prefixed_tool_name(server_name, bare_name) == registry_tool_name:
-            return True
-    return False
-
 
 def _trust_gate_check(server_name: str, tool_name: str) -> Optional[str]:
     """Consult the approval path for write-capable tools on untrusted servers.
@@ -7189,14 +7139,6 @@ def mcp_prefixed_tool_name(server_name: str, tool_name: str) -> str:
     safe_tool = sanitize_mcp_name_component(tool_name)
     return f"{MCP_TOOL_NAME_PREFIX}{safe_server}{_MCP_NAME_DELIM}{safe_tool}"
 
-
-def _mcp_toolset_name(server_name: str) -> str:
-    """The toolset MCP tools for ``server_name`` are registered under.
-
-    Single source for the value ``_register_server_tools`` uses, so an
-    ownership check cannot drift from the registration.
-    """
-    return f"mcp-{server_name}"
 
 
 def _convert_mcp_schema(server_name: str, mcp_tool) -> dict:

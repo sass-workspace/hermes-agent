@@ -1737,21 +1737,6 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             suffix = f"{timeout_s:.1f}s" if timeout_s is not None else "the configured timeout"
             function_result = f"Error executing tool '{name}': timed out after {suffix}"
             effect_disposition = "unknown"
-            # The worker may have finished — and recorded a read in the
-            # per-turn cache — in the window between the deadline snapshot
-            # and here. The model is about to receive this timeout instead of
-            # that result, so a later "the result directly above" stub would
-            # point at text it never saw. Forget the turn's last call.
-            try:
-                from tools import turn_read_cache
-
-                turn_read_cache.invalidate(
-                    str(getattr(agent, "_current_turn_id", "") or "")
-                )
-            except Exception:
-                logger.debug(
-                    "turn read cache: timeout invalidate failed", exc_info=True
-                )
             _emit_terminal_post_tool_call(
                 agent,
                 function_name=name,
@@ -2117,31 +2102,6 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         _execution_dispatched = False
 
         tool_start_time = time.time()
-
-        # The ladder below runs several tools directly, bypassing
-        # handle_function_call — and with it the per-turn read-suppression
-        # cache's invalidate-on-write rule. `delegate_task` is the sharpest
-        # case: a delegated subagent can mutate exactly the state a cached
-        # read describes, and never touches this process's dispatcher to say
-        # so.
-        #
-        # Apply the cache's own rule here rather than listing the bypassing
-        # tools: anything not provably a read-only MCP tool invalidates. A
-        # hand-maintained list would silently rot the first time a branch was
-        # added to the ladder without updating it, and the failure mode of
-        # that rot is a stale read — not an error anyone would notice.
-        # Read-only MCP tools fall through to the `else` branch, where
-        # handle_function_call does the check-and-record itself.
-        try:
-            from tools import turn_read_cache
-
-            turn_read_cache.note_tool_dispatch(
-                function_name, str(getattr(agent, "_current_turn_id", "") or "")
-            )
-        except Exception:
-            logger.debug(
-                "turn read cache: pre-dispatch invalidate failed", exc_info=True
-            )
 
         if function_name == "todo":
             def _execute(next_args: dict) -> Any:
