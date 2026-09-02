@@ -38,11 +38,18 @@ import asyncio
 import logging
 import re
 import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
+
+# An OAuth handshake that has been in flight this long is not slow, it is
+# parked on a lock whose owner task is gone. Well above any real flow —
+# including one waiting on a human to finish a browser login, which the SDK
+# performs inside the flow.
+_STALLED_AUTH_FLOW_SEC = 600.0
 
 
 def _same_endpoint(a: str, b: str) -> bool:
@@ -137,6 +144,7 @@ def _make_hermes_provider_class() -> Optional[type]:
         # authentication outright with an AttributeError.
         _hermes_flow_depth = 0
         _hermes_lock_poisoned = False
+        _hermes_flow_started_mono = None
 
         def __init__(
             self,
@@ -165,6 +173,7 @@ def _make_hermes_provider_class() -> Optional[type]:
             # ``context.lock``.
             self._hermes_flow_depth = 0
             self._hermes_lock_poisoned = False
+            self._hermes_flow_started_mono = None
 
         def _hermes_lock_is_poisoned(self) -> bool:
             """True when this provider's OAuth lock can never be acquired again.
@@ -208,7 +217,19 @@ def _make_hermes_provider_class() -> Optional[type]:
             # flag above still catches the case we actually observed.
             if held is not True:
                 return False
-            return getattr(self, "_hermes_flow_depth", 0) <= 0
+            if getattr(self, "_hermes_flow_depth", 0) <= 0:
+                return True
+            # Depth is positive — but that is NOT proof of health, and this is
+            # the subtle case. Once the lock is poisoned, the very next flow
+            # blocks inside the SDK while holding a depth slot, so depth stays
+            # pinned above zero and a depth-only check goes permanently blind
+            # exactly when it matters most. A flow that has been in flight far
+            # longer than any real OAuth handshake is parked on a lock nobody
+            # owns, not making progress.
+            started = getattr(self, "_hermes_flow_started_mono", None)
+            if started is None:
+                return False
+            return (time.monotonic() - started) > _STALLED_AUTH_FLOW_SEC
 
         def _stamp_token_user_agent(self, request):
             ua = getattr(self, "_hermes_token_user_agent", None)
@@ -591,6 +612,8 @@ def _make_hermes_provider_class() -> Optional[type]:
             # contract. Regression from PR #11383 caught by
             # tests/tools/test_mcp_oauth_bidirectional.py.
             inner = super().async_auth_flow(request)
+            if self._hermes_flow_depth <= 0:
+                self._hermes_flow_started_mono = time.monotonic()
             self._hermes_flow_depth += 1
             try:
                 outgoing = await inner.__anext__()
@@ -606,7 +629,6 @@ def _make_hermes_provider_class() -> Optional[type]:
                 self._persist_oauth_metadata_if_changed()
                 return
             finally:
-                self._hermes_flow_depth -= 1
                 # Finalize the SDK's generator HERE, while we are still in a
                 # position to observe the outcome. It holds ``context.lock``
                 # across its yields; closing it runs the ``async with``
@@ -641,6 +663,14 @@ def _make_hermes_provider_class() -> Optional[type]:
                         "MCP OAuth '%s': closing the inner auth flow "
                         "failed: %s", self._hermes_server_name, exc,
                     )
+                # Decrement AFTER the close, not before: the lock is released
+                # inside aclose(), so releasing the depth slot first opens a
+                # window where a reconnect on another thread sees a held lock
+                # with no flow running and rebuilds a perfectly healthy
+                # provider.
+                self._hermes_flow_depth -= 1
+                if self._hermes_flow_depth <= 0:
+                    self._hermes_flow_started_mono = None
 
     return HermesMCPOAuthProvider
 
@@ -867,8 +897,9 @@ class MCPOAuthManager:
         provider), and ``evict()`` takes that lock itself — holding it across
         the check would deadlock on the non-reentrant lock.
         """
+        key = self._key(server_name, hermes_home)
         with self._entries_lock:
-            entry = self._entries.get(self._key(server_name, hermes_home))
+            entry = self._entries.get(key)
             provider = entry.provider if entry is not None else None
         if provider is None:
             return False
@@ -890,7 +921,18 @@ class MCPOAuthManager:
             "reconnect builds a fresh provider; persisted tokens are kept.",
             server_name,
         )
-        self.evict(server_name, hermes_home=hermes_home)
+        # Identity-guarded: between the read above and here, another thread
+        # may already have rebuilt this entry. Popping blindly would throw
+        # away a fresh, healthy provider and make both callers redo the work.
+        with self._entries_lock:
+            current = self._entries.get(key)
+            if current is None or current.provider is not provider:
+                logger.debug(
+                    "MCP OAuth '%s': provider was rebuilt concurrently; "
+                    "leaving the new one in place", server_name,
+                )
+                return False
+            self._entries.pop(key, None)
         return True
 
     def evict(

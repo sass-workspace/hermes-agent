@@ -7420,9 +7420,9 @@ def _describe_unknown_mcp_tool(tool_name: str) -> Optional[str]:
         server = _servers.get(server_name)
 
     retry_hint = (
-        f"Retry the SAME call in a few seconds; if it still fails, tell the "
-        f"user that the '{server_name}' MCP server is down and let them "
-        f"check it."
+        f"Wait a few seconds and retry this call ONCE. If it fails again, "
+        f"stop retrying and tell the user the '{server_name}' MCP server is "
+        f"not responding so they can check it."
     )
     prefix = (
         f"MCP tool '{tool_name}' is temporarily unavailable: its server "
@@ -7455,6 +7455,27 @@ def _describe_unknown_mcp_tool(tool_name: str) -> Optional[str]:
             f"will retry in ~{remaining}s. {dont_conclude} Wait for that "
             f"window before retrying, or continue with other work."
         )
+
+    # A CONNECTED server that simply does not offer this tool is a different
+    # answer entirely: the name is genuinely gone (removed or renamed
+    # server-side, or filtered out by config), and telling the model to wait
+    # for a reconnect would send it into a retry loop against a server that
+    # is already up. Only claim "temporarily unavailable" when the server is
+    # actually not serving right now.
+    if getattr(server, "session", None) is not None and not getattr(
+        server, "_was_parked", False
+    ):
+        _registered = list(getattr(server, "_registered_tool_names", []) or [])
+        if _registered:
+            return (
+                f"MCP tool '{tool_name}' no longer exists on server "
+                f"'{server_name}'. The server is connected and serving "
+                f"{len(_registered)} other tools, so this is not an outage — "
+                f"the tool was removed, renamed, or filtered out of the "
+                f"configuration since this conversation started. Do NOT "
+                f"retry it. Use the tools currently available, or ask the "
+                f"user to check the server's configuration."
+            )
 
     if getattr(server, "_was_parked", False):
         return (

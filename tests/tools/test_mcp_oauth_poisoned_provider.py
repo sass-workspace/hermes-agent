@@ -26,7 +26,6 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
@@ -42,15 +41,25 @@ pytest.importorskip("mcp.client.auth.oauth2")
 
 
 class TestSdkPremise:
-    def test_auth_flow_is_an_async_generator_holding_the_context_lock(self):
+    def test_auth_flow_is_an_async_generator_over_an_anyio_lock(self):
+        """Runtime shape, not source text: a generator, and an anyio lock.
+
+        Both properties are what make poisoning possible at all. The lock
+        being HELD across yields is proven behaviourally by
+        ``test_abandoned_flow_latches_the_poison_flag`` below.
+        """
+        import dataclasses
+
         import mcp.client.auth.oauth2 as sdk
 
         assert inspect.isasyncgenfunction(sdk.OAuthClientProvider.async_auth_flow)
-        src = inspect.getsource(sdk.OAuthClientProvider.async_auth_flow)
-        assert "async with self.context.lock" in src, (
-            "the SDK no longer holds context.lock across the auth flow — "
-            "re-verify whether provider poisoning is still possible before "
-            "trusting the eviction path"
+
+        lock_field = next(
+            f for f in dataclasses.fields(sdk.OAuthContext) if f.name == "lock"
+        )
+        assert lock_field.default_factory is anyio.Lock, (
+            "OAuthContext.lock is no longer an anyio.Lock — re-verify whether "
+            "provider poisoning is still possible before trusting eviction"
         )
 
     def test_anyio_lock_release_is_owner_checked(self):
@@ -267,27 +276,6 @@ class TestEvictionOnReconnect:
 # ---------------------------------------------------------------------------
 
 
-def test_the_connect_path_goes_through_the_eviction_check():
-    """mcp_tool's reconnect must route through get_or_build_provider."""
-    src = Path("tools/mcp_tool.py").read_text()
-    assert "get_manager().get_or_build_provider(" in src
-
-    manager_src = Path("tools/mcp_oauth_manager.py").read_text()
-    assert "self._evict_if_poisoned(server_name)" in manager_src, (
-        "get_or_build_provider no longer checks for a poisoned provider — "
-        "a parked OAuth server can never self-recover again"
-    )
-
-
-def test_the_auth_flow_finalizes_its_inner_generator():
-    """The direct poisoning signal depends on closing the SDK's generator."""
-    from tools.mcp_oauth_manager import _HERMES_PROVIDER_CLS
-
-    src = inspect.getsource(_HERMES_PROVIDER_CLS.async_auth_flow)
-    assert "await inner.aclose()" in src
-    assert "not holding this lock" in src
-    assert "self._hermes_flow_depth += 1" in src
-    assert "self._hermes_flow_depth -= 1" in src
 
 
 # ---------------------------------------------------------------------------
@@ -461,3 +449,121 @@ def test_a_truthy_non_bool_locked_is_not_treated_as_poisoned():
     # ...but a latched observation still wins.
     provider._hermes_lock_poisoned = True
     assert provider._hermes_lock_is_poisoned() is True
+
+
+# ---------------------------------------------------------------------------
+# A stalled in-flight flow is poison too
+# ---------------------------------------------------------------------------
+
+
+class TestStalledFlowDetection:
+    """Depth alone goes blind exactly when it matters.
+
+    Once the lock is poisoned, the NEXT flow blocks inside the SDK while
+    holding a depth slot. Depth stays pinned above zero, so a depth-only
+    check reports "healthy" forever — on a provider that can never connect.
+    """
+
+    def _stalled(self, mcp_mod, *, age):
+        provider = _provider_stub(locked=True, depth=1)
+        provider._hermes_flow_started_mono = (
+            __import__("time").monotonic() - age
+        )
+        return provider
+
+    def test_a_long_stalled_flow_is_poison(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        from tools import mcp_oauth_manager as mod
+
+        provider = self._stalled(mod, age=mod._STALLED_AUTH_FLOW_SEC + 60)
+        assert provider._hermes_lock_is_poisoned() is True
+
+    def test_a_flow_still_within_the_window_is_not(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        from tools import mcp_oauth_manager as mod
+
+        provider = self._stalled(mod, age=5.0)
+        assert provider._hermes_lock_is_poisoned() is False
+
+    def test_an_in_flight_flow_with_no_start_stamp_is_not_poison(self):
+        """Never invent a verdict from missing evidence."""
+        provider = _provider_stub(locked=True, depth=1)
+        provider._hermes_flow_started_mono = None
+        assert provider._hermes_lock_is_poisoned() is False
+
+
+# ---------------------------------------------------------------------------
+# Eviction must not discard a concurrently-rebuilt provider
+# ---------------------------------------------------------------------------
+
+
+def test_eviction_is_identity_guarded(manager, monkeypatch):
+    """Another thread may rebuild between the check and the pop.
+
+    Popping blindly would throw away a fresh, healthy provider and make both
+    callers redo the work.
+    """
+    poisoned = _provider_stub(locked=True, depth=0)
+    _install_entry(manager, "srv", poisoned)
+
+    replacement = _provider_stub(locked=False, depth=0)
+    real_evict_if_poisoned = manager._evict_if_poisoned
+
+    # Simulate the race: a rebuild lands while _evict_if_poisoned is deciding.
+    original_lock_check = type(poisoned)._hermes_lock_is_poisoned
+
+    def _swap_then_answer(self):
+        manager._entries[manager._key("srv")].provider = replacement
+        return original_lock_check(self)
+
+    # A scoped context, not undo(): undo() would also revert the fixture's
+    # HERMES_HOME, and _key() resolves the home at call time.
+    with monkeypatch.context() as m:
+        m.setattr(type(poisoned), "_hermes_lock_is_poisoned", _swap_then_answer)
+        evicted = real_evict_if_poisoned("srv")
+
+    assert evicted is False, "evicted a provider that had already been replaced"
+    assert manager._entries[manager._key("srv")].provider is replacement
+
+
+def test_flow_depth_is_released_only_after_the_lock_is(monkeypatch, tmp_path):
+    """Decrementing before aclose() would let a racing reconnect see
+    "lock held, no flow running" during a perfectly normal teardown."""
+    provider = _bare_provider(monkeypatch, tmp_path)
+    observed = {}
+
+    class _WatchedLock:
+        """Delegates to a real anyio.Lock, noting the depth at release."""
+
+        def __init__(self, on_release):
+            self._lock = anyio.Lock()
+            self._on_release = on_release
+
+        async def __aenter__(self):
+            return await self._lock.__aenter__()
+
+        async def __aexit__(self, *exc):
+            self._on_release()
+            return await self._lock.__aexit__(*exc)
+
+        def locked(self):
+            return self._lock.locked()
+
+    async def _main():
+        lock = _WatchedLock(
+            lambda: observed.setdefault(
+                "depth_at_release", provider._hermes_flow_depth
+            )
+        )
+        _patch_base_flow_holding(monkeypatch, provider, lock)
+        gen = provider.async_auth_flow(object())
+        await gen.__anext__()
+        await gen.aclose()
+
+    asyncio.run(_main())
+
+    assert observed.get("depth_at_release") == 1, (
+        "the depth slot was released before the lock — a reconnect racing "
+        "here would rebuild a healthy provider"
+    )
+    assert provider._hermes_flow_depth == 0

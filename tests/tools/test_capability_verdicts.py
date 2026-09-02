@@ -39,8 +39,10 @@ def mcp(monkeypatch, tmp_path):
 
 
 class _Server:
-    def __init__(self, parked=False):
+    def __init__(self, parked=False, session=None, registered=()):
         self._was_parked = parked
+        self.session = session
+        self._registered_tool_names = list(registered)
 
 
 # ---------------------------------------------------------------------------
@@ -179,7 +181,9 @@ class TestReconnectingServer:
         v = _verdict(mcp)
         assert "reconnect" in v.lower()
         assert "NOT a missing capability" in v
-        assert "Retry the SAME call" in v
+        # Bounded: retry ONCE, then tell the user — not an open-ended loop.
+        assert "retry this call ONCE" in v
+        assert "stop retrying" in v
 
 
 class TestConnectBackoff:
@@ -245,3 +249,46 @@ def test_a_registered_tool_is_unaffected(mcp):
         assert out.get("ok") is True
     finally:
         registry._tools.pop("mcp__asana__create_task", None)
+
+
+class TestConnectedServerNoLongerOffersTheTool:
+    """The opposite failure: telling the model to wait for a live server.
+
+    A tool removed, renamed, or filtered out of the config leaves its name in
+    the conversation's byte-stable schema while the server itself is up and
+    serving. Calling it "temporarily unavailable, retry" would send the model
+    into a loop against a server that is already healthy and never coming
+    back with that tool.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _setup(self, mcp):
+        mcp._track_mcp_tool_server("mcp__asana__create_task", "asana")
+        mcp._forget_mcp_tool_server("mcp__asana__create_task")
+        mcp._servers["asana"] = _Server(
+            parked=False,
+            session=object(),
+            registered=["mcp__asana__get_task", "mcp__asana__list_tasks"],
+        )
+
+    def test_it_says_the_tool_is_gone_not_that_the_server_is_down(self, mcp):
+        v = _verdict(mcp)
+        assert "no longer exists" in v
+        assert "not an outage" in v
+
+    def test_it_tells_the_model_to_stop_retrying(self, mcp):
+        v = _verdict(mcp)
+        assert "Do NOT retry it" in v
+        assert "temporarily unavailable" not in v
+
+    def test_it_reports_that_the_server_is_serving(self, mcp):
+        assert "2 other tools" in _verdict(mcp)
+
+    def test_a_connected_server_with_no_tools_still_reads_as_reconnecting(self, mcp):
+        """Mid-reconnect the list is briefly empty — that IS an outage."""
+        mcp._servers["asana"] = _Server(
+            parked=False, session=object(), registered=[]
+        )
+        v = _verdict(mcp)
+        assert "reconnect" in v.lower()
+        assert "no longer exists" not in v
