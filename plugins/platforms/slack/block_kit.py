@@ -164,6 +164,11 @@ def _token_element(s: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+# Placeholder for a masked token inside ``_inline_elements``: private-use
+# characters no author types, so emphasis regexes step over a token whole.
+_PLACEHOLDER_RE = re.compile("(\\d+)")
+
+
 def _inline_elements(text: str) -> List[Dict[str, Any]]:
     """Parse a run of inline markdown into rich_text section child elements.
 
@@ -173,18 +178,40 @@ def _inline_elements(text: str) -> List[Dict[str, Any]]:
     plain text, so this never loses characters.
     """
     elements: List[Dict[str, Any]] = []
+    # Slack tokens are masked with private-use placeholders BEFORE emphasis
+    # runs, so ``**A :iris-x: B**`` keeps its bold on both sides of the token
+    # and an underscore inside a shortcode (``:white_check_mark:``) is never
+    # read as italic. ``emit_text`` expands a placeholder back into its native
+    # element; the token itself carries no style (a ``date`` element has none).
+    tokens: List[Dict[str, Any]] = []
+
+    def _mask(s: str) -> str:
+        def _sub(m: "re.Match[str]") -> str:
+            el = _token_element(m.group(0))
+            if el is None:
+                return m.group(0)
+            tokens.append(el)
+            return f"{len(tokens) - 1}"
+        return _TOKEN_RE.sub(_sub, s)
 
     def emit_text(s: str, style: Optional[Dict[str, bool]] = None) -> None:
         if not s:
             return
-        el: Dict[str, Any] = {"type": "text", "text": s}
-        if style:
-            el["style"] = style
-        elements.append(el)
+        parts = _PLACEHOLDER_RE.split(s)
+        for i, part in enumerate(parts):
+            if i % 2 == 1:
+                elements.append(dict(tokens[int(part)]))
+                continue
+            if not part:
+                continue
+            el: Dict[str, Any] = {"type": "text", "text": part}
+            if style:
+                el["style"] = style
+            elements.append(el)
 
     # Tokenize by the highest-priority markers first using a single scan.
-    # We recursively split on code, then links, then emphasis to keep spans
-    # from overlapping incorrectly.
+    # We recursively split on code, then links, then emphasis (over masked
+    # tokens) to keep spans from overlapping incorrectly.
     def walk(s: str, style: Dict[str, bool]) -> None:
         pos = 0
         # inline code is opaque — no nested styling
@@ -199,27 +226,13 @@ def _inline_elements(text: str) -> List[Dict[str, Any]]:
     def _walk_links(s: str, style: Dict[str, bool]) -> None:
         pos = 0
         for m in _LINK_RE.finditer(s):
-            _walk_tokens(s[pos:m.start()], style)
+            _walk_emphasis(_mask(s[pos:m.start()]), style)
             link_el: Dict[str, Any] = {"type": "link", "url": m.group(2), "text": m.group(1)}
             if style:
                 link_el["style"] = dict(style)
             elements.append(link_el)
             pos = m.end()
-        _walk_tokens(s[pos:], style)
-
-    def _walk_tokens(s: str, style: Dict[str, bool]) -> None:
-        # Slack tokens are atomic: no emphasis is applied to them (a ``date``
-        # element carries no style field), and the text around them keeps
-        # whatever style the enclosing span has.
-        pos = 0
-        for m in _TOKEN_RE.finditer(s):
-            el = _token_element(m.group(0))
-            if el is None:
-                continue
-            _walk_emphasis(s[pos:m.start()], style)
-            elements.append(el)
-            pos = m.end()
-        _walk_emphasis(s[pos:], style)
+        _walk_emphasis(_mask(s[pos:]), style)
 
     def _walk_emphasis(s: str, style: Dict[str, bool]) -> None:
         if not s:

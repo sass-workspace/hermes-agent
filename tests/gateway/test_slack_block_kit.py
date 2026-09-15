@@ -117,8 +117,25 @@ class TestInlineFormatting:
     def test_mrkdwn_flattening_round_trips_the_tokens(self):
         from plugins.platforms.slack.block_kit import group_mrkdwn_text
         blocks = render_blocks("- :iris-overdue: <@U0123ABC> seit <!date^1789106400^{ago}|3 T>")
+        els = self._bullet_elements("- :iris-overdue: <@U0123ABC> seit <!date^1789106400^{ago}|3 T>")
+        # native elements first — otherwise a reverted tokenizer would pass on raw text
+        assert [e["type"] for e in els if e["type"] != "text"] == ["emoji", "user", "date"]
         flat = group_mrkdwn_text(blocks)
         assert ":iris-overdue:" in flat and "<@U0123ABC>" in flat and "3 T" in flat
+
+    def test_bold_spanning_a_token_keeps_its_bold(self):
+        """``**A :x: B**`` — the token is masked before emphasis runs, so the
+        bold pairs across it instead of leaving literal asterisks."""
+        els = self._bullet_elements("- **Freigabe :iris-followup: erteilen** — Kunde")
+        assert els[0] == {"type": "text", "text": "Freigabe ", "style": {"bold": True}}
+        assert els[1] == {"type": "emoji", "name": "iris-followup"}
+        assert els[2] == {"type": "text", "text": " erteilen", "style": {"bold": True}}
+        assert not any("**" in e.get("text", "") for e in els if e["type"] == "text")
+
+    def test_underscores_inside_a_shortcode_are_not_italic(self):
+        els = self._bullet_elements("- done :white_check_mark: today")
+        assert {"type": "emoji", "name": "white_check_mark"} in els
+        assert not any(e.get("style", {}).get("italic") for e in els if e["type"] == "text")
 
 
     def test_blank_line_separated_ordered_items_stay_in_one_list(self):
