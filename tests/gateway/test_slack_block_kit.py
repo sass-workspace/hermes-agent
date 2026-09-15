@@ -47,6 +47,80 @@ class TestInlineFormatting:
         assert "https://example.com/x" in blob
 
 
+    @staticmethod
+    def _bullet_elements(md):
+        blocks = render_blocks(md)
+        rich = [b for b in blocks if b["type"] == "rich_text"][0]
+        lst = [e for e in rich["elements"] if e["type"] == "rich_text_list"][0]
+        return lst["elements"][0]["elements"]
+
+    def test_date_token_in_list_item_becomes_date_element(self):
+        """A <!date…> token inside a bullet must be a native ``date`` element —
+        as a ``text`` element it reaches the reader as literal characters."""
+        els = self._bullet_elements(
+            "- [TUR-1](https://x/1) **Freigabe** — wartet seit <!date^1789106400^{ago}|3 Tagen>")
+        dates = [e for e in els if e["type"] == "date"]
+        assert len(dates) == 1
+        assert dates[0]["timestamp"] == 1789106400
+        assert dates[0]["format"] == "{ago}"
+        assert dates[0]["fallback"] == "3 Tagen"
+        assert "url" not in dates[0]
+        # no raw token survives as text, and the bold before it is intact
+        assert not any("<!date" in e.get("text", "") for e in els if e["type"] == "text")
+        assert any(e["type"] == "text" and e.get("style", {}).get("bold") for e in els)
+        assert any(e["type"] == "link" for e in els)
+
+    def test_date_token_with_url_carries_the_url(self):
+        els = self._bullet_elements("- seit <!date^1789106400^{date_short}^https://x/1|01.09.>")
+        d = [e for e in els if e["type"] == "date"][0]
+        assert d["url"] == "https://x/1" and d["fallback"] == "01.09."
+
+    def test_emoji_shortcode_in_list_item_becomes_emoji_element(self):
+        els = self._bullet_elements("- :iris-followup: [TUR-1](https://x/1) **Aktion** — Kunde")
+        assert els[0] == {"type": "emoji", "name": "iris-followup"}
+        assert not any(":iris-followup:" in e.get("text", "") for e in els if e["type"] == "text")
+
+    def test_time_and_ratio_are_not_emoji(self):
+        els = self._bullet_elements("- Termin 10:30:45 und a:b:c bleiben Text")
+        assert not any(e["type"] == "emoji" for e in els)
+        assert "".join(e.get("text", "") for e in els) == "Termin 10:30:45 und a:b:c bleiben Text"
+
+    def test_token_inside_code_span_stays_text(self):
+        els = self._bullet_elements("- der Token `<!date^1^{ago}|x>` und `:iris-overdue:` als Code")
+        assert not any(e["type"] in ("date", "emoji") for e in els)
+        assert any(e.get("style", {}).get("code") and "<!date^1^{ago}|x>" == e["text"] for e in els)
+
+    def test_user_mention_in_list_item_becomes_user_element(self):
+        els = self._bullet_elements("- Rückfrage an <@U0123ABC> offen")
+        assert {"type": "user", "user_id": "U0123ABC"} in els
+
+    def test_table_cell_carries_a_date_element(self):
+        # The token's own pipe would split the cell like any other pipe; inside
+        # a table it is written escaped (``\|``), which the cell splitter
+        # restores before the tokenizer sees it.
+        md = "| Kunde | Alter |\n|---|---|\n| Turbogrün | <!date^1789106400^{ago}\\|3 T> |"
+        blocks = render_blocks(md)
+        table = [b for b in blocks if b["type"] == "table"][0]
+        cell = table["rows"][1][1]
+        els = cell["elements"][0]["elements"]
+        assert any(e["type"] == "date" and e["fallback"] == "3 T" for e in els)
+
+    def test_group_notification_text_uses_the_date_fallback_and_drops_emoji(self):
+        from plugins.platforms.slack.block_kit import group_notification_text
+        blocks = render_blocks(
+            "- :iris-followup: [TUR-1](https://x/1) **Aktion** — seit <!date^1789106400^{ago}|3 Tagen>")
+        text = group_notification_text(blocks, 0, 1)
+        assert "3 Tagen" in text
+        assert "{ago}" not in text and "1789106400" not in text
+        assert "iris-followup" not in text
+
+    def test_mrkdwn_flattening_round_trips_the_tokens(self):
+        from plugins.platforms.slack.block_kit import group_mrkdwn_text
+        blocks = render_blocks("- :iris-overdue: <@U0123ABC> seit <!date^1789106400^{ago}|3 T>")
+        flat = group_mrkdwn_text(blocks)
+        assert ":iris-overdue:" in flat and "<@U0123ABC>" in flat and "3 T" in flat
+
+
     def test_blank_line_separated_ordered_items_stay_in_one_list(self):
         """Regression: blank lines between ordered items must not reset numbering.
 

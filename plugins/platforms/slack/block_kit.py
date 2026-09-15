@@ -118,20 +118,59 @@ def _indent_level(spaces: str) -> int:
 # Inline markdown → rich_text elements
 # ----------------------------------------------------------------------------
 
-# Order matters: code first (opaque), then links, then emphasis.
+# Order matters: code first (opaque), then links, then Slack tokens, then
+# emphasis.
 _INLINE_CODE_RE = re.compile(r"`([^`]+)`")
 _LINK_RE = re.compile(r"(?<!!)\[([^\]]+)\]\(([^()\s]+(?:\([^()]*\)[^()\s]*)*)\)")
 _BOLD_RE = re.compile(r"(?:\*\*|__)(.+?)(?:\*\*|__)")
 _ITALIC_RE = re.compile(r"(?<![\*_])(?:\*|_)(?![\*_\s])(.+?)(?<![\*_\s])(?:\*|_)(?![\*_])")
 _STRIKE_RE = re.compile(r"~~(.+?)~~")
 
+# Slack's own inline tokens. mrkdwn text objects resolve these by themselves,
+# but a rich_text list item or table cell carries typed ELEMENTS: a
+# ``<!date^…>`` token or ``:shortcode:`` left inside a ``text`` element reaches
+# the reader as literal characters. So the tokenizer emits the native
+# ``date`` / ``emoji`` / ``user`` element types instead — which is what lets
+# a live age or a workspace icon sit inside a bullet at all.
+_DATE_TOKEN_RE = re.compile(r"<!date\^(\d+)\^([^|>^]+?)(?:\^(https?://[^|>]+))?\|([^>]*)>")
+# An emoji shortcode: lowercase name, not glued to a word or another colon on
+# either side, so ``10:30:45`` and ``a:b:c`` stay text.
+_EMOJI_TOKEN_RE = re.compile(r"(?<![\w:/]):([a-z0-9_+\-]{2,}):(?![\w:])")
+_USER_TOKEN_RE = re.compile(r"<@([UW][A-Z0-9]{2,})>")
+_TOKEN_RE = re.compile(
+    "|".join(f"(?:{rx.pattern})" for rx in (_DATE_TOKEN_RE, _EMOJI_TOKEN_RE, _USER_TOKEN_RE))
+)
+
+
+def _token_element(s: str) -> Optional[Dict[str, Any]]:
+    """The rich_text element for one matched Slack token, or None."""
+    d = _DATE_TOKEN_RE.fullmatch(s)
+    if d:
+        el: Dict[str, Any] = {
+            "type": "date",
+            "timestamp": int(d.group(1)),
+            "format": d.group(2),
+            "fallback": d.group(4) or d.group(2),
+        }
+        if d.group(3):
+            el["url"] = d.group(3)
+        return el
+    u = _USER_TOKEN_RE.fullmatch(s)
+    if u:
+        return {"type": "user", "user_id": u.group(1)}
+    e = _EMOJI_TOKEN_RE.fullmatch(s)
+    if e:
+        return {"type": "emoji", "name": e.group(1)}
+    return None
+
 
 def _inline_elements(text: str) -> List[Dict[str, Any]]:
     """Parse a run of inline markdown into rich_text section child elements.
 
-    Produces ``text`` elements (optionally styled bold/italic/strike/code) and
-    ``link`` elements.  Unmatched markup is emitted verbatim as plain text, so
-    this never loses characters.
+    Produces ``text`` elements (optionally styled bold/italic/strike/code),
+    ``link`` elements, and the native ``date`` / ``emoji`` / ``user`` elements
+    for Slack's own inline tokens.  Unmatched markup is emitted verbatim as
+    plain text, so this never loses characters.
     """
     elements: List[Dict[str, Any]] = []
 
@@ -160,11 +199,25 @@ def _inline_elements(text: str) -> List[Dict[str, Any]]:
     def _walk_links(s: str, style: Dict[str, bool]) -> None:
         pos = 0
         for m in _LINK_RE.finditer(s):
-            _walk_emphasis(s[pos:m.start()], style)
+            _walk_tokens(s[pos:m.start()], style)
             link_el: Dict[str, Any] = {"type": "link", "url": m.group(2), "text": m.group(1)}
             if style:
                 link_el["style"] = dict(style)
             elements.append(link_el)
+            pos = m.end()
+        _walk_tokens(s[pos:], style)
+
+    def _walk_tokens(s: str, style: Dict[str, bool]) -> None:
+        # Slack tokens are atomic: no emphasis is applied to them (a ``date``
+        # element carries no style field), and the text around them keeps
+        # whatever style the enclosing span has.
+        pos = 0
+        for m in _TOKEN_RE.finditer(s):
+            el = _token_element(m.group(0))
+            if el is None:
+                continue
+            _walk_emphasis(s[pos:m.start()], style)
+            elements.append(el)
             pos = m.end()
         _walk_emphasis(s[pos:], style)
 
@@ -1470,6 +1523,14 @@ def group_notification_text(group: List[Block], index: int, total: int) -> str:
                 return
             if t == "markdown" and isinstance(el.get("text"), str):
                 words.append(el["text"])
+                return
+            # Native Slack tokens: a date shows its readable fallback, an
+            # emoji or a user mention is not a word — without these branches
+            # the generic descent below would leak the raw format string.
+            if t == "date":
+                words.append(str(el.get("fallback") or ""))
+                return
+            if t in ("emoji", "user"):
                 return
             for v in el.values():
                 _walk(v)

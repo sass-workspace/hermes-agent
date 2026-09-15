@@ -2447,6 +2447,19 @@ class SlackAdapter(BasePlatformAdapter):
             # Overflow-menu selections share the click-means-instruction
             # contract and the same handler (value in selected_option.value).
             self._app.action("hermes_agent_menu")(self._handle_agent_reply_action)
+            # Link buttons — on agent-authored cards (``hermes_card_url_N``,
+            # block_kit) and on the BusinessOS ops notices
+            # (``businessos_ops_link_N``) — open their URL client-side, but
+            # Slack still delivers the click as a block_actions interaction
+            # that must be acknowledged within 3 s; an unacknowledged one marks
+            # the message with a warning. Acknowledge and do NOTHING else: no
+            # dispatch, no session, nothing to audit.
+            self._app.action(
+                _re.compile(r"^hermes_card_url_\d+$")
+            )(self._handle_link_button_ack)
+            self._app.action(
+                _re.compile(r"^businessos_ops_link_\d+$")
+            )(self._handle_link_button_ack)
 
             # Register Block Kit action handlers for clarify buttons
             # (interactive multiple-choice prompts; see tools/clarify_gateway.py).
@@ -8047,6 +8060,16 @@ class SlackAdapter(BasePlatformAdapter):
                 exc,
                 exc_info=True,
             )
+
+    async def _handle_link_button_ack(self, ack, **_kwargs: Any) -> None:
+        """Acknowledge a click on a link button and do nothing else.
+
+        A ``url`` button opens its link in the client; the interaction Slack
+        still sends carries no instruction and is deliberately never routed
+        anywhere — the only reason to receive it is to keep Slack from marking
+        the message as unhandled.
+        """
+        await ack()
 
     async def _handle_agent_reply_action(self, ack, body, action) -> None:
         """Handle a click on an agent-authored reply button (``:::card``).

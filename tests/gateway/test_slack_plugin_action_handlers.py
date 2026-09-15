@@ -213,6 +213,38 @@ class TestSlackAdapterPluginActionWiring:
         assert "hermes_approve_once" in action_ids
 
 
+    def test_link_buttons_are_acknowledged_and_never_dispatched(self):
+        """A ``url`` button (``hermes_card_url_N`` on an agent card,
+        ``businessos_ops_link_N`` on an ops notice) still sends a block_actions
+        interaction; Slack marks the message when it is not acknowledged. The
+        handler acks and does nothing else — no session, no dispatch."""
+        config = PlatformConfig(enabled=True, token="xoxb-fake")
+        adapter = SlackAdapter(config)
+        result, registered = _connect_with_recording_app(adapter, plugin_handlers=[])
+        assert result is True
+
+        patterns = [aid for aid, _cb in registered if hasattr(aid, "match")]
+        matching = {
+            name: [cb for aid, cb in registered if hasattr(aid, "match") and aid.match(name)]
+            for name in ("hermes_card_url_0", "hermes_card_url_17", "businessos_ops_link_3")
+        }
+        for name, cbs in matching.items():
+            assert len(cbs) == 1, f"{name} must be handled by exactly one registration ({patterns})"
+        # An unrelated id is not swallowed by the link-button patterns.
+        assert not any(aid.match("hermes_agent_reply") for aid, _ in registered if hasattr(aid, "match"))
+
+        ack = AsyncMock()
+        dispatch = MagicMock()
+        with patch.object(adapter, "_handle_agent_reply_action", dispatch):
+            asyncio.run(matching["hermes_card_url_0"][0](
+                ack=ack,
+                body={"message": {"ts": "1.1"}, "channel": {"id": "C1"}, "user": {"id": "U1"}},
+                action={"action_id": "hermes_card_url_0", "url": "https://x"},
+            ))
+        ack.assert_awaited_once()
+        dispatch.assert_not_called()
+
+
     def test_plugin_loader_failure_does_not_break_connect(self):
         """If get_plugin_manager() blows up, connect() must still succeed.
 
