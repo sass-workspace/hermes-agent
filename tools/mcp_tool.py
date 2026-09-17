@@ -2373,6 +2373,33 @@ class ElicitationHandler:
 # Server task -- each MCP server lives in one long-lived asyncio Task
 # ---------------------------------------------------------------------------
 
+
+def _terminate_on_close_kwargs(client_factory, config: dict) -> dict:
+    """``terminate_on_close=False`` for a streamable-HTTP client, by default.
+
+    On context exit the SDK sends an HTTP DELETE for the session BEFORE it
+    cancels its task group. With OAuth, every request of one provider is
+    serialised behind a single lock held until the previous response's
+    headers arrive — so when the server is slow (the very reason a keepalive
+    just failed) the DELETE queues behind a request that may take minutes to
+    time out, and the reconnect cannot start until it does. Observed
+    2026-09-17 against mcp.atlassian.com: Cloudflare 524s after 100-125 s
+    stretched one failed ping into 9 and 20 minutes without a session.
+    Skipping the DELETE costs a server-side session that expires on its own;
+    wrapping the exit in a deadline instead would cancel an in-flight
+    OAuth-locked request and can leave that lock held (the poisoned-provider
+    class). ``terminate_on_close: true`` in the server config restores the
+    SDK default. Guarded by signature so an SDK without the parameter is
+    called exactly as before.
+    """
+    try:
+        params = inspect.signature(client_factory).parameters
+    except (TypeError, ValueError):
+        return {}
+    if "terminate_on_close" not in params:
+        return {}
+    return {"terminate_on_close": bool(config.get("terminate_on_close", False))}
+
 class MCPServerTask:
     """Manages a single MCP server connection in a dedicated asyncio Task.
 
@@ -2398,6 +2425,8 @@ class MCPServerTask:
         "_inflight_tasks", "_reconnecting", "_suspect_reason",
         "_teardown_race", "_permanent_grace_used", "_stdio_child_pids",
         "_ever_connected",
+        "_degraded_since",
+        "_reestablish_noted",
     )
 
     def __init__(self, name: str):
@@ -2434,6 +2463,15 @@ class MCPServerTask:
         # failure that merely happens to occur while ``_ready`` is
         # momentarily clear — see the ``initial_retries`` ladder in run().
         self._ever_connected: bool = False
+        # Monotonic start of the current degraded episode (keepalive or
+        # health-check failure on a server that had been connected), or
+        # None. Cleared only by REAL proof of health — see
+        # ``_mark_session_proven``. Exists so a same-generation recovery
+        # is visible in the log at all: without it a reconnect that simply
+        # worked logged nothing, and anything reading the log (the
+        # availability watchdog) saw two failures and then silence.
+        self._degraded_since: Optional[float] = None
+        self._reestablish_noted: bool = False
         # True while parked (reconnect budget exhausted) or after a park,
         # until the session proves healthy again — used to log the
         # parked→revived transition exactly once.
@@ -2904,12 +2942,78 @@ class MCPServerTask:
                     "parking (state: parked → connected)",
                     self.name,
                 )
+            elif self._degraded_since is not None:
+                # The proof line for a recovery that never parked. Emitted
+                # HERE and nowhere earlier: a finished handshake or a listed
+                # tool set is an unproven session (#62212), and a log reader
+                # must never be told "healthy" on less than the runtime
+                # itself accepts.
+                logger.info(
+                    "MCP server '%s': recovered — session healthy again after "
+                    "reconnect (state: degraded → connected, degraded for "
+                    "%.0fs)",
+                    self.name, time.monotonic() - self._degraded_since,
+                )
+            self._degraded_since = None
+            self._reestablish_noted = False
             # A session that just proved healthy on a fresh transport clears
             # the one-time permanent-failure grace and any race bookkeeping.
             self._permanent_grace_used = False
             self._teardown_race = False
 
     # -- SuspectableBackend contract (agent.deadline) -----------------------
+
+    def _note_degraded(self) -> None:
+        """Open a degraded episode (idempotent within one episode)."""
+        if self._degraded_since is None:
+            self._degraded_since = time.monotonic()
+            self._reestablish_noted = False
+
+    def _note_session_established(self) -> None:
+        """One INFO line per degraded episode when a new session is up.
+
+        Informational only and worded so no log reader can mistake it for
+        proof: the session is UNPROVEN until a keepalive interval or a tool
+        call succeeds, which is when ``_mark_session_proven`` writes the
+        "recovered — session healthy again" line. Once per episode, so a
+        flapping transport does not turn this into per-rebuild chatter.
+        """
+        if self._degraded_since is not None and not self._reestablish_noted:
+            self._reestablish_noted = True
+            logger.info(
+                "MCP server '%s': session re-established after %.0fs, tools "
+                "listed — unproven until the next keepalive or tool call",
+                self.name, time.monotonic() - self._degraded_since,
+            )
+
+    async def _discover_tools_bounded(self, connect_timeout: float) -> None:
+        """``_discover_tools`` under ``connect_timeout`` — on EVERY path.
+
+        ``tools/list`` against a server that answers 200 and then only
+        trickles SSE keepalive comments never returns (httpx's read timeout
+        keeps resetting). Only the very first ``start()`` has a caller whose
+        ``wait_for`` would end that; every later attempt — a reconnect, and
+        equally the self-probe of a server that parked BEFORE it ever
+        connected (``_ever_connected`` still false, the caller long gone) —
+        runs with nobody waiting: keepalive not started, ``_reconnect_event``
+        without a listener, the server task silent until process restart. So
+        the deadline is unconditional; on the first start it merely sits
+        inside the caller's own (``connect_timeout`` + 30 s).
+
+        Same-task ``wait_for`` on purpose: the cancellation unwinds
+        ``_rpc_lock`` through its ``async with``, which a detached task would
+        strand. A timeout propagates as a connection failure: counted retry,
+        backoff, park — the existing, logged machinery.
+        """
+        try:
+            await asyncio.wait_for(self._discover_tools(), timeout=connect_timeout)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "MCP server '%s': tools/list did not answer within %.0fs — "
+                "abandoning this transport and retrying",
+                self.name, connect_timeout,
+            )
+            raise
 
     def mark_suspect(self, reason: str) -> None:
         """Latch a suspicion about this connection. Cheap — no I/O.
@@ -2953,6 +3057,7 @@ class MCPServerTask:
             )
             self._suspect_reason = None
             self.mark_suspect(f"health check failed after {reason}")
+            self._note_degraded()
             self.session = None
             self._ready.clear()
             self._reconnect_event.set()
@@ -3104,6 +3209,7 @@ class MCPServerTask:
                         self.mark_suspect(
                             f"keepalive failed: {type(root).__name__}: {root}"
                         )
+                        self._note_degraded()
                         self._reconnect_event.set()
                         break
                     # Keepalive succeeded — the session survived a full
@@ -3335,9 +3441,10 @@ class MCPServerTask:
                     )
                     self.session = session
                     self._mark_lifecycle_started()
-                    await self._discover_tools()
+                    await self._discover_tools_bounded(float(connect_timeout))
                     self._ready.set()
                     self._ever_connected = True
+                    self._note_session_established()
                     # Session is live again: clear any breaker state from a
                     # prior outage so the first call after recovery isn't
                     # gated on a stale consecutive-failure count (#16788).
@@ -3713,9 +3820,10 @@ class MCPServerTask:
                             session, float(connect_timeout)
                         )
                         self.session = session
-                        await self._discover_tools()
+                        await self._discover_tools_bounded(float(connect_timeout))
                         self._ready.set()
                         self._ever_connected = True
+                        self._note_session_established()
                         # Session is live again: clear any breaker state from a
                         # prior outage so the first call after recovery isn't
                         # gated on a stale consecutive-failure count (#16788).
@@ -3771,7 +3879,10 @@ class MCPServerTask:
                     # 1.x yields (read, write, get_session_id) and 2.x yields
                     # (read, write). This file supports both SDK generations,
                     # and get_session_id was never used here.
-                    async with streamable_http_client(url, http_client=http_client) as _streams:
+                    async with streamable_http_client(
+                        url, http_client=http_client,
+                        **_terminate_on_close_kwargs(streamable_http_client, config),
+                    ) as _streams:
                         read_stream, write_stream = _streams[0], _streams[1]
                         async with ClientSession(read_stream, write_stream, **sampling_kwargs) as session:
                             # Bound the handshake (#59349) — see stdio path.
@@ -3779,9 +3890,10 @@ class MCPServerTask:
                                 session, float(connect_timeout)
                             )
                             self.session = session
-                            await self._discover_tools()
+                            await self._discover_tools_bounded(float(connect_timeout))
                             self._ready.set()
                             self._ever_connected = True
+                            self._note_session_established()
                             # Session is live again: clear any breaker state from
                             # a prior outage so the first call after recovery
                             # isn't gated on a stale failure count (#16788).
@@ -3818,6 +3930,9 @@ class MCPServerTask:
             if _oauth_auth is not None:
                 _http_kwargs["auth"] = _oauth_auth
             try:
+                _http_kwargs.update(
+                    _terminate_on_close_kwargs(streamablehttp_client, config)
+                )
                 async with streamablehttp_client(url, **_http_kwargs) as (
                     read_stream, write_stream, _get_session_id,
                 ):
@@ -3827,9 +3942,10 @@ class MCPServerTask:
                             session, float(connect_timeout)
                         )
                         self.session = session
-                        await self._discover_tools()
+                        await self._discover_tools_bounded(float(connect_timeout))
                         self._ready.set()
                         self._ever_connected = True
+                        self._note_session_established()
                         # Session is live again: clear any breaker state from a
                         # prior outage so the first call after recovery isn't
                         # gated on a stale consecutive-failure count (#16788).
