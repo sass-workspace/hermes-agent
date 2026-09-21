@@ -611,7 +611,8 @@ def _extract_text_from_slack_attachments(attachments: list) -> str:
         if not isinstance(att, dict):
             continue
         # Permalink unfurls repeat a message the agent already reads (inbound path skips them too).
-        if att.get("is_msg_unfurl"):
+        # A FORWARDED message carries ``is_share`` beside ``is_msg_unfurl`` and is the content itself.
+        if att.get("is_msg_unfurl") and not att.get("is_share"):
             continue
         got: list[str] = [str(att[key]) for key in ("pretext", "title", "text") if att.get(key)]
         for field in att.get("fields", []) or []:
@@ -4330,6 +4331,88 @@ class SlackAdapter(BasePlatformAdapter):
             normalized_event["_slack_changed_event_ts"] = changed_event_ts
         return normalized_event
 
+    # Generous cap for a forwarded source message: a forwarded client request must survive whole
+    # (the 500-char unfurl cap is for link previews, not first-class input) while a pathological
+    # payload stays bounded.
+    _SHARED_MESSAGE_MAX_CHARS = 8000
+
+    async def _render_shared_message_attachment(
+        self, att: dict, team_id: str = "", existing_text: str = "") -> str:
+        """One forwarded/shared Slack message as quoted source content. Slack's "Forward message"
+        composer delivers the source message in ``attachments`` with BOTH ``is_share`` and
+        ``is_msg_unfurl`` set, carrying its text (``text``/``blocks``), author, source channel
+        (``channel_id``), ``ts``, permalink (``from_url``) and ``files``. Provenance stays explicit
+        — the source author is quoted evidence, never merged with the forwarding user. ``""``
+        when the source text is already in ``existing_text`` (quoted via ``rich_text_quote``
+        blocks and already extracted). Files ride the normal file-download path."""
+        author = str(att.get("author_name") or att.get("author_subname") or "").strip()
+        source_channel_id = str(att.get("channel_id") or "")
+        body = str(att.get("text") or "").strip()
+        if not body:
+            body = _extract_text_from_slack_blocks(att.get("blocks") or []).strip()
+        if body and existing_text and body in existing_text:
+            return ""
+        files = [f for f in (att.get("files") or []) if isinstance(f, dict)]
+        channel_label = source_channel_id
+        if source_channel_id:
+            resolved = await self._resolve_channel_name(
+                source_channel_id, team_id=str(att.get("channel_team") or team_id or ""))
+            if resolved and resolved != source_channel_id:
+                channel_label = f"#{resolved} ({source_channel_id})"
+        header_bits = ["Forwarded message"]
+        header_bits += [f"from: {author}"] if author else []
+        header_bits += [f"channel: {channel_label}"] if channel_label else []
+        header_bits += [f"ts: {att.get('ts')}"] if att.get("ts") else []
+        header_bits += [f"{len(files)} attached file(s)"] if files else []
+        header = "[" + " · ".join(header_bits) + "]"
+        if not body and not files:
+            return (header + "\n[Forwarded message could not be read: the Slack payload contained "
+                    "no source text and no files]")
+        if len(body) > self._SHARED_MESSAGE_MAX_CHARS:
+            body = body[: self._SHARED_MESSAGE_MAX_CHARS - 16].rstrip() + "\n… [truncated]"
+        parts = [header]
+        if body:
+            parts.append("\n".join("> " + line for line in body.splitlines()))
+        if att.get("from_url"):
+            parts.append(f"[source: {att.get('from_url')}]")
+        return "\n".join(parts)
+
+    async def _append_shared_messages(self, text: str, slack_attachments: list, team_id: str) -> str:
+        """Append forwarded/shared source messages (``is_share`` attachments) to ``text``. The
+        unfurl pass skips them as ``is_msg_unfurl`` echoes, which used to drop the whole forwarded
+        message: the outer instruction arrived, the request it pointed at did not."""
+        sections: list[str] = []
+        for att in slack_attachments:
+            if not (isinstance(att, dict) and att.get("is_share")):
+                continue
+            section = await self._render_shared_message_attachment(att, team_id=team_id, existing_text=text)
+            if section and section not in text:
+                sections.append(section)
+        if sections:
+            text = (text.strip() + "\n\n" + "\n\n".join(sections)).strip()
+            logger.debug("Slack: appended %d forwarded message(s) to message text", len(sections))
+        return text
+
+    @staticmethod
+    def _inbound_files(event: dict) -> list:
+        """The message's own files, then the files of forwarded source messages
+        (``attachments[].files`` on ``is_share`` attachments) in attachment order, deduped by file
+        id — forwarded screenshots reach the agent without re-upload. They deliberately download
+        with the OUTER event's team token: that workspace received the event, so its token is the
+        one authorized for the file, including Slack Connect files hosted in the source workspace."""
+        files = list(event.get("files") or [])
+        seen = {f.get("id") for f in files if isinstance(f, dict) and f.get("id")}
+        for att in event.get("attachments") or []:
+            if not (isinstance(att, dict) and att.get("is_share")):
+                continue
+            for f in att.get("files") or []:
+                if not isinstance(f, dict) or (f.get("id") and f.get("id") in seen):
+                    continue
+                if f.get("id"):
+                    seen.add(f.get("id"))
+                files.append(f)
+        return files
+
     @staticmethod
     def _append_link_unfurls(text: str, slack_attachments: list) -> str:
         """Append link-unfurl previews (``attachments``) to ``text``; ``is_msg_unfurl`` echoes our
@@ -4727,6 +4810,10 @@ class SlackAdapter(BasePlatformAdapter):
         _claim_ts = str(event.get("ts") or "")
         if _claim_ts:
             self._remember_processed_message_ts(_claim_ts)
+        # Forwarded/shared source messages: rendered only now — after the unauthorized-user reject
+        # and the channel gates — because it resolves the source channel through the API.
+        if not is_command_text:
+            text = await self._append_shared_messages(text, event.get("attachments") or [], team_id)
         if is_mentioned:
             text, original_text, command_probe_text, is_command_text = self._apply_bot_mention(
                 text, original_text, command_probe_text, is_command_text, bot_uid, thread_ts,
@@ -4933,7 +5020,7 @@ class SlackAdapter(BasePlatformAdapter):
         media_types = list(thread_root_media_types)
         media_text_inlined: List[bool] = [False] * len(media_urls)
         notices: List[str] = []
-        for f in event.get("files", []):
+        for f in self._inbound_files(event):
             if f.get("file_access") == "check_file_info":
                 f = await self._resolve_file_stub(f, channel_id, team_id, notices)
                 if f is None:
