@@ -4,6 +4,7 @@ protocol negotiation and initial tool discovery. Split from tools/mcp_tool.py.""
 
 import logging
 import asyncio
+import inspect
 import os
 import urllib.parse
 import urllib.request
@@ -75,6 +76,26 @@ def _mcp_proxy_mounts(httpx_mod, url: str, ssl_verify, client_cert, server_name:
         mounts[f"{scheme}://"] = _make_mcp_body_cap_transport(httpx_mod, httpx_mod.AsyncHTTPTransport(
             proxy=proxy_url, verify=ssl_verify, **_present(cert=client_cert)))
     return mounts or None
+
+
+def _terminate_on_close_kwargs(client_factory, terminate_on_close: bool = False) -> dict:
+    """``terminate_on_close=False`` for a streamable-HTTP client, by default. On context exit the
+    SDK sends an HTTP DELETE for the session BEFORE it cancels its task group. With OAuth that
+    DELETE queues behind the provider's request serialisation — so when the server is slow (the
+    very reason a keepalive just failed) it waits on a request that may take minutes to time out,
+    and the reconnect cannot start until it does. Observed against mcp.atlassian.com: Cloudflare
+    524s after 100-125 s stretched one failed ping into 9 and 20 minutes without a session.
+    Skipping the DELETE costs a server-side session that expires on its own; wrapping the exit in
+    a deadline instead would cancel an in-flight OAuth-locked request. ``terminate_on_close: true``
+    in the server config restores the SDK default. Guarded by signature so an SDK without the
+    parameter is called exactly as before."""
+    try:
+        params = inspect.signature(client_factory).parameters
+    except (TypeError, ValueError):
+        return {}
+    if "terminate_on_close" not in params:
+        return {}
+    return {"terminate_on_close": bool(terminate_on_close)}
 
 
 def _pgroup_alive(pgid: Optional[int]) -> bool:
@@ -191,9 +212,10 @@ class MCPServerTransportMixin:
         self.session = session
         if mark_lifecycle:
             self._mark_lifecycle_started()
-        await self._discover_tools()
+        await self._discover_tools_bounded(float(connect_timeout))
         self._ready.set()
         self._ever_connected = True
+        self._note_session_established()
         _core._reset_server_error(self.name)
         # Session is live again: clear any breaker state from a prior outage so the first call after
         # recovery isn't gated on a stale consecutive-failure count (#16788).
@@ -464,7 +486,8 @@ class MCPServerTransportMixin:
 
     def _streamable_http_transport(self, url: str, headers: dict, connect_timeout: float,
                                    ssl_verify, client_cert, oauth_auth,
-                                   strict_cfg_headers: bool, configured_header_names: set):
+                                   strict_cfg_headers: bool, configured_header_names: set,
+                                   terminate_on_close: bool = False):
         """Streamable HTTP context manager: mcp >= 1.24.0 gets a caller-owned httpx client; on the
         deprecated API (mcp < 1.24.0) the SDK owns the client."""
         if not _core._MCP_NEW_HTTP:
@@ -473,7 +496,8 @@ class MCPServerTransportMixin:
                                   "enforce the portable redirect-header boundary "
                                   "(strict_redirect_headers). Upgrade the mcp package.")
             return _core.streamablehttp_client(url, headers=headers, timeout=float(connect_timeout), verify=ssl_verify,
-                                               **_present(auth=oauth_auth))
+                                               **_present(auth=oauth_auth),
+                                               **_terminate_on_close_kwargs(_core.streamablehttp_client, terminate_on_close))
         # Explicit AsyncClient matching the SDK's create_mcp_http_client defaults; MUST come from the
         # SDK's httpx (httpx2 on mcp >= 2.0) since the SDK sends its own Requests through it.
         httpx = _core.sdk_httpx()
@@ -492,7 +516,9 @@ class MCPServerTransportMixin:
         @asynccontextmanager
         async def _owned_client_streams():  # the SDK skips cleanup when http_client is provided
             async with _build_client(**client_kwargs) as http_client:
-                async with _core.streamable_http_client(url, http_client=http_client) as streams:
+                async with _core.streamable_http_client(
+                        url, http_client=http_client,
+                        **_terminate_on_close_kwargs(_core.streamable_http_client, terminate_on_close)) as streams:
                     yield streams
         return _owned_client_streams()
 
@@ -525,7 +551,8 @@ class MCPServerTransportMixin:
             # HTTP attempt on reconnects instead of flapping into the retry budget.
             logger.info("MCP server '%s': using latched SSE fallback transport", self.name)
             return await self._serve_transport(self._sse_transport(*common), "SSE", float(connect_timeout))
-        transport = self._streamable_http_transport(*common, configured_header_names)
+        transport = self._streamable_http_transport(*common, configured_header_names,
+                                                    terminate_on_close=bool(config.get("terminate_on_close", False)))
         label = "HTTP" if _core._MCP_NEW_HTTP else "legacy HTTP"
         try:
             return await self._serve_transport(transport, label, float(connect_timeout))
@@ -566,6 +593,23 @@ class MCPServerTransportMixin:
                     "endpoint, or pin `transport: sse` if the server is SSE-only.") from sse_exc
 
     # -------------------------------------------------------------- discovery
+
+    async def _discover_tools_bounded(self, connect_timeout: float) -> None:
+        """``_discover_tools`` under ``connect_timeout`` — on EVERY path. ``tools/list`` against a
+        server that answers 200 and then only trickles SSE keepalive comments never returns
+        (httpx's read timeout keeps resetting). Only the very first ``start()`` has a caller whose
+        ``wait_for`` would end that; a reconnect — and equally the self-probe of a server that
+        parked BEFORE it ever connected — runs with nobody waiting: keepalive not started,
+        ``_reconnect_event`` without a listener, the server task silent until process restart.
+        Same-task ``wait_for`` on purpose: the cancellation unwinds ``_rpc_lock`` through its
+        ``async with``, which a detached task would strand. A timeout propagates as a connection
+        failure: counted retry, backoff, park — the existing, logged machinery."""
+        try:
+            await asyncio.wait_for(self._discover_tools(), timeout=connect_timeout)
+        except asyncio.TimeoutError:
+            logger.warning("MCP server '%s': tools/list did not answer within %.0fs — abandoning "
+                           "this transport and retrying", self.name, connect_timeout)
+            raise
 
     # Legacy Streamable-HTTP transport TaskGroup dropped: reconnect immediately instead of backoff/park
     # (#66092).
