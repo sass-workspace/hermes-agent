@@ -16,6 +16,7 @@ from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.delegation_context import is_dispatcher_owned_worker_context
 from agent.interrupt_control import interrupted_during_api_call_reason
 from agent.turn_failure_copy import exit_reason_failure, stamp_failure
+from agent.turn_latency import model_call_timer
 from agent.context_compressor import _DB_PERSISTED_MARKER
 from agent.message_content import flatten_message_text
 from agent.message_metadata import append_message, stamp_message_timestamp
@@ -160,7 +161,10 @@ def _resolve_budget_fallback(
                 )
             _summary_start = time.time()
             try:
-                final_response = agent._handle_max_iterations(messages, api_call_count)
+                # Calls the provider directly, outside the loop's per-attempt timer: untimed it lands in
+                # `other` on exactly the turns that ran long enough to exhaust the iteration budget.
+                with model_call_timer(str(getattr(agent, "_current_turn_id", "") or "")):
+                    final_response = agent._handle_max_iterations(messages, api_call_count)
             except InterruptedError:
                 # The turn ends interrupted, so the pending interrupt message is returned
                 # for requeue instead of being cleared behind a fallback summary. A redirect
