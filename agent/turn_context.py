@@ -544,6 +544,10 @@ def _bind_turn_identity(
     # (concurrent turns interleave transcript writes). Cleared in _persist_session.
     from agent.agent_runtime_helpers import note_turn_start
     note_turn_start(agent, turn_id)
+    # Open this turn's latency ledger; closed (and logged) by the run_conversation facade's
+    # finally, so an interrupted or crashed turn still reports where its wall clock went.
+    from agent.turn_latency import start_turn as _start_latency_turn
+    _start_latency_turn(turn_id)
     return effective_task_id, turn_id
 
 

@@ -194,6 +194,10 @@ class TurnFacadeMixin:
                         self._reset_activity_labels_after_turn()
                     if getattr(self, "_relay_pending_turn_id", None) == relay_turn_id:
                         self._relay_pending_turn_id = None
+                    # Close the turn's latency ledger and log where the wall clock went — on every
+                    # exit: a slow turn that crashed is exactly the one worth accounting for.
+                    from agent.turn_latency import finish_turn as _finish_latency_turn
+                    _finish_latency_turn(relay_turn_id)
                     if acct_token is not None:
                         reset_accounting_context(acct_token)
                     if token is not None:

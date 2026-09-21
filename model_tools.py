@@ -682,6 +682,11 @@ def _emit_post_tool_call_hook(
     fields are derived from the result only past that gate when status is None."""
     if _post_tool_call_hook_suppressed.get():
         return
+    # Past the suppression gate this runs exactly once per tool_call_id (dispatcher, inline
+    # executors and the tool executor all emit their terminal hook through here), with or
+    # without a registered hook — which makes it the turn-latency ledger's one recording point.
+    from agent.turn_latency import record_tool_call
+    record_tool_call(turn_id or "", function_name, duration_ms)
     try:
         from hermes_cli.lifecycle import has_hook, invoke_hook
         if not has_hook("post_tool_call"):
