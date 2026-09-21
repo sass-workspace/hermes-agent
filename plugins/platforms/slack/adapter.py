@@ -51,9 +51,13 @@ from gateway.platforms.base import (
 from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
 
 try:  # sibling module; support both package and flat plugin-dir import
-    from .block_kit import render_blocks, sanitize_blocks
+    from .block_kit import (
+        group_mrkdwn_text, group_notification_text, partition_blocks, payload_size, render_blocks,
+        sanitize_blocks, strip_directives)
 except ImportError:  # pragma: no cover - plugin loaded outside package context
-    from block_kit import render_blocks, sanitize_blocks  # type: ignore
+    from block_kit import (  # type: ignore
+        group_mrkdwn_text, group_notification_text, partition_blocks, payload_size, render_blocks,
+        sanitize_blocks, strip_directives)
 
 
 logger = logging.getLogger(__name__)
@@ -1012,6 +1016,7 @@ class SlackAdapter(BasePlatformAdapter):
     _REACTING_MESSAGE_IDS_MAX = _TITLED_ASSISTANT_THREADS_MAX = 5000
     _CHANNEL_TEAM_MAX = 10000
     _APPROVAL_RESOLVED_MAX = _CLARIFY_RESOLVED_MAX = _ACTIVE_STATUS_THREADS_MAX = 1000
+    _AGENT_REPLY_DISPATCHED_MAX = 2000
     _CLARIFY_MESSAGE_MAX = 1000
     # Tighter cap than the approval/clarify dicts: each entry holds the
     # full provider list, and a picker is only live for minutes.
@@ -1060,6 +1065,9 @@ class SlackAdapter(BasePlatformAdapter):
         # approval / clarify message_ts (or (team_id, ts)) → resolved; blocks double-clicks.
         # Bounded: never-clicked prompts would otherwise leak forever.
         self._approval_resolved: Dict[Any, bool] = {}
+        # One dispatch per (team, message ts, instruction) for agent-authored reply buttons: a
+        # double-click must never run an instruction twice. Insertion-ordered for the FIFO trim.
+        self._agent_reply_dispatched: Dict[Tuple[str, str, str], bool] = {}
         self._clarify_resolved: Dict[Any, bool] = {}
         # clarify_id → (channel_id, message_ts, rendered_question) so the gateway can retire a
         # card whose clarify ended without a click (timeout, reset, superseding prose).
@@ -1670,6 +1678,17 @@ class SlackAdapter(BasePlatformAdapter):
         for _action_id in self._CONFIRM_CHOICES:
             self._app.action(_action_id)(self._handle_slash_confirm_action)
         self._app.action("hermes_feedback")(self._handle_feedback_action)
+        # Agent-authored reply buttons and overflow menus (block_kit ``:::card``): one fixed
+        # action_id each; the value carries the instruction text, dispatched into the thread's
+        # session as the clicker's message (see _handle_agent_reply_action).
+        self._app.action("hermes_agent_reply")(self._handle_agent_reply_action)
+        self._app.action("hermes_agent_menu")(self._handle_agent_reply_action)
+        # Link buttons — on agent-authored cards (``hermes_card_url_N``) and on notices other
+        # senders post through this app (``businessos_ops_link_N``) — open their URL client-side,
+        # but Slack still delivers a block_actions interaction that must be acknowledged within
+        # 3 s, or it marks the message with a warning. Acknowledge and do NOTHING else.
+        self._app.action(re.compile(r"^hermes_card_url_\d+$"))(self._handle_link_button_ack)
+        self._app.action(re.compile(r"^businessos_ops_link_\d+$"))(self._handle_link_button_ack)
         # Clarify buttons (tools/clarify_gateway.py); indexed action IDs because
         # Block Kit requires unique IDs within an actions block.
         self._app.action(re.compile(r"^hermes_clarify_choice_\d+$"))(self._handle_clarify_action)
@@ -2172,19 +2191,18 @@ class SlackAdapter(BasePlatformAdapter):
         self, client_fn: Callable[[], Any], method: str, kwargs: Dict[str, Any], verb: str) -> Any:
         """``client_fn().<method>(**kwargs)``; on a Block Kit rejection retry once without
         ``blocks`` (an edit sends ``blocks=[]`` so the message drops its stale layout). The client
-        is re-resolved for the retry."""
+        is re-resolved for the retry. The retry is written back into ``kwargs``, so a caller sees
+        the layout is gone (``not kwargs.get("blocks")``) and posts no overflow groups."""
         try:
             return await getattr(client_fn(), method)(**kwargs)
         except Exception as e:
             if kwargs.get("blocks") and self._is_block_payload_rejection(e):
-                retry_kwargs = dict(kwargs)
+                self._log_block_rejection(e, kwargs.get("blocks"), verb)
                 if verb == "edit":
-                    retry_kwargs["blocks"] = []
+                    kwargs["blocks"] = []
                 else:
-                    retry_kwargs.pop("blocks", None)
-                logger.info(
-                    "[Slack] Block Kit payload rejected; retrying %s without blocks: %s", verb, e)
-                return await getattr(client_fn(), method)(**retry_kwargs)
+                    kwargs.pop("blocks", None)
+                return await getattr(client_fn(), method)(**kwargs)
             raise
 
     async def send(
@@ -2216,7 +2234,9 @@ class SlackAdapter(BasePlatformAdapter):
                 # stay stuck on "is thinking..." (#24117).
                 return SendResult(success=True)
             thread_ts = self._resolve_thread_ts(reply_to, metadata)
-            last_result = await self._post_chunks(chat_id, team_id, content, formatted, thread_ts)
+            last_result = await self._post_chunks(
+                chat_id, team_id, content, formatted, thread_ts,
+                one_post=bool((metadata or {}).get("expect_edits")))
             # Clear Slack Assistant status as soon as the final message is posted.
             if thread_ts:
                 await self.stop_typing(chat_id, metadata=metadata)
@@ -2244,15 +2264,21 @@ class SlackAdapter(BasePlatformAdapter):
                 retry_after=self._retry_after_from_exc(e) if _retryable else None)
 
     async def _post_chunks(
-        self, chat_id: str, team_id: str, content: str, formatted: str, thread_ts: Optional[str]
+        self, chat_id: str, team_id: str, content: str, formatted: str, thread_ts: Optional[str],
+        *, one_post: bool = False,
     ) -> Any:
         """``chat.postMessage`` each ``MAX_MESSAGE_LENGTH`` chunk; returns the last response.
         Block Kit only for single-chunk messages (a >39k response is pathological for the 50-block /
-        3000-char limits); ``text`` stays the notification/accessibility fallback. With
+        3000-char limits); ``text`` stays the notification/accessibility fallback. A layout past
+        one payload's budget continues in follow-up posts — unless ``one_post`` (an editable status
+        message is later edited in place by its ts alone; overflow posts would go stale). With
         ``reply_broadcast`` only the first chunk is also posted to the main channel."""
         chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
         broadcast = self.config.extra.get("reply_broadcast", False)
-        blocks = self._maybe_blocks(content) if len(chunks) == 1 else None
+        groups = self._block_groups(content) if len(chunks) == 1 else None
+        if groups and len(groups) > 1 and one_post:
+            groups = None
+        blocks = groups[0] if groups else None
         last_result = None
         for i, chunk in enumerate(chunks):
             kwargs = {
@@ -2267,6 +2293,10 @@ class SlackAdapter(BasePlatformAdapter):
             client_fn = lambda: self._get_client(chat_id, team_id=team_id)  # noqa: E731
             last_result = await self._call_with_block_fallback(
                 client_fn, "chat_postMessage", kwargs, "send")
+            if blocks and i == 0 and not kwargs.get("blocks"):
+                groups = None  # rejected and sent flat: the layout is gone, no follow-ups
+        if groups and len(groups) > 1 and last_result:
+            await self._post_block_followups(chat_id, groups, thread_ts, team_id)
         return last_result
 
     @staticmethod
@@ -2370,12 +2400,16 @@ class SlackAdapter(BasePlatformAdapter):
                 "channel": chat_id, "ts": message_id, "text": formatted}
             # Block Kit only on the FINAL edit: re-deriving a layout on every streaming flush
             # would be wasteful and jittery. ``text`` is the fallback either way.
-            if finalize:
-                blocks = self._maybe_blocks(content)
-                if blocks:
-                    update_kwargs["blocks"] = blocks
+            groups = self._block_groups(content) if finalize else None
+            if groups:
+                update_kwargs["blocks"] = groups[0]
             await self._call_with_block_fallback(
                 lambda: self._client_for(chat_id, metadata), "chat_update", update_kwargs, "edit")
+            if groups and len(groups) > 1 and update_kwargs.get("blocks"):
+                # The edited message keeps group 1; overflow follows in its context.
+                await self._post_block_followups(
+                    chat_id, groups, self._resolve_thread_ts(None, metadata),
+                    self._metadata_team_id(metadata))
             if finalize:
                 await self._clear_thread_status_quietly(chat_id, metadata)
             return SendResult(success=True, message_id=message_id)
@@ -2936,7 +2970,7 @@ class SlackAdapter(BasePlatformAdapter):
     def _is_block_payload_rejection(error: BaseException) -> bool:
         """Errors recoverable by retrying without ``blocks`` (an enhancement over ``text``, so a
         rejected/oversized payload must not drop the whole response)."""
-        recoverable_codes = {"invalid_blocks", "msg_too_long", "too_many_blocks"}
+        recoverable_codes = {"invalid_blocks", "msg_too_long", "msg_blocks_too_long", "too_many_blocks"}
         response_get = getattr(getattr(error, "response", None), "get", None)
         if callable(response_get):
             try:
@@ -2991,18 +3025,77 @@ class SlackAdapter(BasePlatformAdapter):
         1. ``markdown_blocks`` — Slack's native ``markdown`` block renders the *raw* standard markdown
         (tables, headers, code fences with syntax highlighting) with Slack doing the translation (#8552). 2.
         """
+        groups = self._block_groups(content)
+        return groups[0] if groups else None
+
+    def _block_groups(self, content: str) -> Optional[List[list]]:
+        """``content`` as one or more Block Kit payloads: the first group is the message itself,
+        further groups are overflow the caller posts as consecutive follow-ups
+        (``_post_block_followups``). Partitioning replaces "decline above 50 blocks / let Slack
+        reject and retry flat": a long brief costs a second post, never its layout. The feedback
+        block rides on the LAST group (one per response); ``sanitize_blocks`` runs per group
+        because its cumulative markdown budget is a per-payload limit."""
         if self._extra_flag("markdown_blocks"):
             md_blocks = self._markdown_block_payload(content)
             if md_blocks:
-                return sanitize_blocks(self._append_feedback_block(md_blocks))
+                sanitized = sanitize_blocks(self._append_feedback_block(md_blocks))
+                return [sanitized] if sanitized else None
         if not self._extra_flag("rich_blocks"):
             return None
         try:
-            blocks = render_blocks(content, mrkdwn_fn=self.format_message)
-            return sanitize_blocks(self._append_feedback_block(blocks))
+            groups = partition_blocks(render_blocks(content, mrkdwn_fn=self.format_message) or [])
+            if not groups:
+                return None
+            groups[-1] = self._append_feedback_block(groups[-1]) or groups[-1]
+            return [sg for sg in (sanitize_blocks(g) for g in groups) if sg] or None
         except Exception:  # pragma: no cover - renderer already guards itself
             logger.debug("[Slack] block render failed; using plain text", exc_info=True)
             return None
+
+    async def _post_block_followups(
+        self, chat_id: str, groups: List[list], thread_ts: Optional[str], team_id: Optional[str]
+    ) -> None:
+        """Post overflow block groups as consecutive messages in the first post's context
+        (``thread_ts`` when it was a thread reply, otherwise top-level — a brief's second half must
+        never hide under the first as "1 reply"). Each carries its own plain-text fallback; a
+        rejected follow-up is retried flat with the WHOLE overflow as text, and a failure never
+        fails the already-delivered first message. Never ``reply_broadcast``."""
+        total = len(groups)
+        for idx, group in enumerate(groups[1:], 1):
+            kwargs: Dict[str, Any] = {
+                "channel": chat_id, "text": group_notification_text(group, idx, total),
+                "mrkdwn": True, "blocks": group}
+            if thread_ts:
+                kwargs["thread_ts"] = thread_ts
+            try:
+                try:
+                    result = await self._get_client(chat_id, team_id=team_id).chat_postMessage(**kwargs)
+                except Exception as e:
+                    if not self._is_block_payload_rejection(e):
+                        raise
+                    self._log_block_rejection(e, group, "follow-up")
+                    retry = {k: v for k, v in kwargs.items() if k != "blocks"}
+                    retry["text"] = group_mrkdwn_text(group)
+                    result = await self._get_client(chat_id, team_id=team_id).chat_postMessage(**retry)
+                ts = result.get("ts") if result else None
+                if ts:
+                    self._bot_message_ts.add(self._workspace_message_marker(team_id, str(ts)))
+            except Exception as e:
+                logger.warning(
+                    "[Slack] Block Kit follow-up %d/%d to %s failed: %s", idx + 1, total, chat_id, e)
+        self._trim_bot_message_timestamps()
+
+    @staticmethod
+    def _log_block_rejection(error: BaseException, blocks: Optional[list], where: str) -> None:
+        """A size rejection after partitioning is a budget-tuning signal (WARNING);
+        ``invalid_blocks`` is a renderer bug (INFO, retried flat as before)."""
+        message = str(error)
+        if any(code in message for code in ("msg_too_long", "msg_blocks_too_long", "too_many_blocks")):
+            logger.warning(
+                "[Slack] Block Kit payload rejected by size on %s (%d bytes, %d blocks) — lower "
+                "BLOCK_PAYLOAD_BUDGET: %s", where, payload_size(blocks), len(blocks or []), error)
+        else:
+            logger.info("[Slack] Block Kit payload rejected; retrying %s without blocks: %s", where, error)
 
     def format_tool_preview(self, preview) -> str:
         """Keep compact tool arguments out of mrkdwn emphasis conversion."""
@@ -3015,6 +3108,11 @@ class SlackAdapter(BasePlatformAdapter):
         before entity protection so output can't ping @channel."""
         if not content:
             return content
+        # Structured-output directive scaffolding (:::card fences, "-# " footers, card key
+        # prefixes) is Block-Kit-only syntax the renderer consumes: content reaching THIS mrkdwn
+        # conversion — the plain-text fallback, streaming partial edits — sheds the markers and
+        # keeps their content. Fenced examples survive untouched; the helper never raises.
+        content = strip_directives(content)
         content = _wrap_markdown_tables(content)
         placeholders: dict = {}
         counter = [0]
@@ -5433,6 +5531,80 @@ class SlackAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.error(
                 "Failed to resolve slash-confirm from Slack button: %s", exc, exc_info=True)
+
+    async def _handle_link_button_ack(self, ack, **_kwargs: Any) -> None:
+        """Acknowledge a click on a link button and do nothing else: the ``url`` opens in the
+        client, the interaction carries no instruction and is deliberately never routed anywhere."""
+        await ack()
+
+    async def _handle_agent_reply_action(self, ack, body, action) -> None:
+        """A click on an agent-authored reply button or overflow-menu option (``:::card``).
+
+        Contract (the load-bearing decision of the button feature): a click means exactly ONE
+        thing — the authorized clicker's instruction text, dispatched into the thread's session
+        through the SAME inbound path a typed reply takes (session keying, steer/queue, guards,
+        audit all included). There is deliberately no direct click→action wiring: a button that
+        mutated a business system without passing through the session would bypass the profile's
+        pre/post tool-call hooks. One dispatch per (message, instruction) for the process
+        lifetime — a double-click updates nothing and dispatches nothing."""
+        started = await self._begin_interaction(ack, body, action, "agent-reply")
+        if started is None:
+            return
+        team_id, _action_id, value, message, msg_ts, channel_id, user_name, user_id = started
+        try:
+            # Buttons carry the instruction in ``value``; menu selections in
+            # ``selected_option.value``. A ``url_N`` placeholder is a link the client opens:
+            # nothing is dispatched.
+            option = action.get("selected_option") or {}
+            value = str(value or "").strip()
+            if not value or value.startswith("url_"):
+                selected = str(option.get("value") or "").strip()
+                value = "" if selected.startswith("url_") else selected
+            if not value or not channel_id or not msg_ts:
+                return
+            click_key = (team_id, msg_ts, value)
+            if click_key in self._agent_reply_dispatched:
+                logger.debug("[Slack] Duplicate agent-reply click ignored: %s", click_key)
+                return
+            self._agent_reply_dispatched[click_key] = True
+            if len(self._agent_reply_dispatched) > self._AGENT_REPLY_DISPATCHED_MAX:
+                for stale in list(self._agent_reply_dispatched)[: self._AGENT_REPLY_DISPATCHED_MAX // 2]:
+                    self._agent_reply_dispatched.pop(stale, None)
+            # The display name up front: the card marking and the dispatched event both carry
+            # the person's name, not the login handle.
+            actor = (await self._resolve_user_name(user_id, chat_id=channel_id, team_id=team_id)
+                     or user_name or "unknown").strip()
+            label = ((action.get("text") or {}).get("text") or (option.get("text") or {}).get("text")
+                     or "Auswahl").strip()
+            # Mark the click on the card itself (chat.update, appended context line): the actor is
+            # visible in the thread without a notification-generating post. Best-effort.
+            try:
+                marked = list(message.get("blocks") or []) + [{
+                    "type": "context",
+                    "elements": [{"type": "mrkdwn", "text": f"→ *{label}* · von {actor}"}]}]
+                await self._get_client(channel_id, team_id=team_id or None).chat_update(
+                    channel=channel_id, ts=msg_ts, text=message.get("text") or f"→ {label} · von {actor}",
+                    blocks=sanitize_blocks(marked))
+            except Exception:
+                logger.debug("[Slack] agent-reply card update failed; dispatching anyway", exc_info=True)
+            # Session scoping by the rule a typed message obeys (``_session_thread_ts``): a card in
+            # a thread joins that thread's session; a top-level card under ``reply_in_thread:
+            # false`` joins the whole-channel session instead of forking one keyed on its own ts
+            # (which would also slip past the busy-session queue of the active channel session).
+            is_dm = channel_id.startswith("D")
+            thread_ts = self._session_thread_ts({"thread_ts": message.get("thread_ts")}, msg_ts, is_dm, {})
+            source = self.build_source(
+                chat_id=channel_id, chat_name=await self._resolve_channel_name(channel_id, team_id=team_id),
+                chat_type="dm" if is_dm else "group", user_id=user_id,
+                user_name=actor, thread_id=thread_ts, scope_id=str(team_id) if team_id else None)
+            await self.handle_message(MessageEvent(
+                text=value, message_type=MessageType.TEXT, source=source, raw_message=body,
+                message_id=str(action.get("action_ts") or msg_ts),
+                reply_to_message_id=thread_ts if thread_ts and thread_ts != msg_ts else None,
+                metadata={"slack_team_id": team_id, "slack_channel_id": channel_id,
+                          "slack_thread_ts": thread_ts or "", "slack_agent_reply_button": label}))
+        except Exception:
+            logger.error("[Slack] agent-reply action handler failed", exc_info=True)
 
     async def _handle_feedback_action(self, ack, body, action) -> None:
         """Ack Slack AI feedback button clicks and log the choice."""

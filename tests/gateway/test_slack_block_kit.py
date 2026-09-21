@@ -70,9 +70,113 @@ class TestInlineFormatting:
         assert blocks is not None
         els = blocks[0]["elements"][0]["elements"][0]["elements"]
         assert all(e.get("type") != "link" for e in els)
+        # rich_text does not interpret mrkdwn: a user mention becomes the native element (a
+        # literal "<@U123>" would render as text, not a mention); a channel ref stays text.
+        assert {"type": "user", "user_id": "U123"} in els
         blob = "".join(e.get("text") or "" for e in els)
-        assert "<@U123>" in blob
         assert "<#C456>" in blob
+
+    def test_slack_links_and_native_tokens_compose_inside_emphasis(self):
+        """Order is code → md-links → <url|label> → token mask → emphasis: beside a Slack link,
+        bold still spans a native token and the shortcode's underscores are never italic."""
+        els = self._bullet_elements("- **ok :white_check_mark: done** — <https://x.io/a_b|the docs>")
+        assert {"type": "link", "url": "https://x.io/a_b", "text": "the docs"} in els
+        assert {"type": "emoji", "name": "white_check_mark"} in els
+        bold = [e["text"] for e in els if (e.get("style") or {}).get("bold")]
+        assert bold == ["ok ", " done"]
+        assert not any((e.get("style") or {}).get("italic") for e in els)
+        assert not any("*" in (e.get("text") or "") for e in els)
+
+
+    @staticmethod
+    def _bullet_elements(md):
+        blocks = render_blocks(md)
+        rich = [b for b in blocks if b["type"] == "rich_text"][0]
+        lst = [e for e in rich["elements"] if e["type"] == "rich_text_list"][0]
+        return lst["elements"][0]["elements"]
+
+    def test_date_token_in_list_item_becomes_date_element(self):
+        """A <!date…> token inside a bullet must be a native ``date`` element —
+        as a ``text`` element it reaches the reader as literal characters."""
+        els = self._bullet_elements(
+            "- [TUR-1](https://x/1) **Freigabe** — wartet seit <!date^1789106400^{ago}|3 Tagen>")
+        dates = [e for e in els if e["type"] == "date"]
+        assert len(dates) == 1
+        assert dates[0]["timestamp"] == 1789106400
+        assert dates[0]["format"] == "{ago}"
+        assert dates[0]["fallback"] == "3 Tagen"
+        assert "url" not in dates[0]
+        # no raw token survives as text, and the bold before it is intact
+        assert not any("<!date" in e.get("text", "") for e in els if e["type"] == "text")
+        assert any(e["type"] == "text" and e.get("style", {}).get("bold") for e in els)
+        assert any(e["type"] == "link" for e in els)
+
+    def test_date_token_with_url_carries_the_url(self):
+        els = self._bullet_elements("- seit <!date^1789106400^{date_short}^https://x/1|01.09.>")
+        d = [e for e in els if e["type"] == "date"][0]
+        assert d["url"] == "https://x/1" and d["fallback"] == "01.09."
+
+    def test_emoji_shortcode_in_list_item_becomes_emoji_element(self):
+        els = self._bullet_elements("- :iris-followup: [TUR-1](https://x/1) **Aktion** — Kunde")
+        assert els[0] == {"type": "emoji", "name": "iris-followup"}
+        assert not any(":iris-followup:" in e.get("text", "") for e in els if e["type"] == "text")
+
+    def test_time_and_ratio_are_not_emoji(self):
+        els = self._bullet_elements("- Termin 10:30:45 und a:b:c bleiben Text")
+        assert not any(e["type"] == "emoji" for e in els)
+        assert "".join(e.get("text", "") for e in els) == "Termin 10:30:45 und a:b:c bleiben Text"
+
+    def test_token_inside_code_span_stays_text(self):
+        els = self._bullet_elements("- der Token `<!date^1^{ago}|x>` und `:iris-overdue:` als Code")
+        assert not any(e["type"] in ("date", "emoji") for e in els)
+        assert any(e.get("style", {}).get("code") and "<!date^1^{ago}|x>" == e["text"] for e in els)
+
+    def test_user_mention_in_list_item_becomes_user_element(self):
+        els = self._bullet_elements("- Rückfrage an <@U0123ABC> offen")
+        assert {"type": "user", "user_id": "U0123ABC"} in els
+
+    def test_table_cell_carries_a_date_element(self):
+        # The token's own pipe would split the cell like any other pipe; inside
+        # a table it is written escaped (``\|``), which the cell splitter
+        # restores before the tokenizer sees it.
+        md = "| Kunde | Alter |\n|---|---|\n| Turbogrün | <!date^1789106400^{ago}\\|3 T> |"
+        blocks = render_blocks(md)
+        table = [b for b in blocks if b["type"] == "table"][0]
+        cell = table["rows"][1][1]
+        els = cell["elements"][0]["elements"]
+        assert any(e["type"] == "date" and e["fallback"] == "3 T" for e in els)
+
+    def test_group_notification_text_uses_the_date_fallback_and_drops_emoji(self):
+        from plugins.platforms.slack.block_kit import group_notification_text
+        blocks = render_blocks(
+            "- :iris-followup: [TUR-1](https://x/1) **Aktion** — seit <!date^1789106400^{ago}|3 Tagen>")
+        text = group_notification_text(blocks, 0, 1)
+        assert "3 Tagen" in text
+        assert "{ago}" not in text and "1789106400" not in text
+        assert "iris-followup" not in text
+
+    def test_mrkdwn_flattening_round_trips_the_tokens(self):
+        from plugins.platforms.slack.block_kit import group_mrkdwn_text
+        blocks = render_blocks("- :iris-overdue: <@U0123ABC> seit <!date^1789106400^{ago}|3 T>")
+        els = self._bullet_elements("- :iris-overdue: <@U0123ABC> seit <!date^1789106400^{ago}|3 T>")
+        # native elements first — otherwise a reverted tokenizer would pass on raw text
+        assert [e["type"] for e in els if e["type"] != "text"] == ["emoji", "user", "date"]
+        flat = group_mrkdwn_text(blocks)
+        assert ":iris-overdue:" in flat and "<@U0123ABC>" in flat and "3 T" in flat
+
+    def test_bold_spanning_a_token_keeps_its_bold(self):
+        """``**A :x: B**`` — the token is masked before emphasis runs, so the
+        bold pairs across it instead of leaving literal asterisks."""
+        els = self._bullet_elements("- **Freigabe :iris-followup: erteilen** — Kunde")
+        assert els[0] == {"type": "text", "text": "Freigabe ", "style": {"bold": True}}
+        assert els[1] == {"type": "emoji", "name": "iris-followup"}
+        assert els[2] == {"type": "text", "text": " erteilen", "style": {"bold": True}}
+        assert not any("**" in e.get("text", "") for e in els if e["type"] == "text")
+
+    def test_underscores_inside_a_shortcode_are_not_italic(self):
+        els = self._bullet_elements("- done :white_check_mark: today")
+        assert {"type": "emoji", "name": "white_check_mark"} in els
+        assert not any(e.get("style", {}).get("italic") for e in els if e["type"] == "text")
 
 
     def test_blank_line_separated_ordered_items_stay_in_one_list(self):
@@ -136,10 +240,80 @@ class TestTables:
 
 class TestLimits:
 
-    def test_too_many_blocks_returns_none(self):
-        # 60 dividers => 60 blocks > MAX_BLOCKS => decline (caller uses text)
+    def test_too_many_blocks_no_longer_declines(self):
+        # 60 dividers => 60 blocks. The renderer used to return None (caller
+        # fell back to flat text); the adapter now partitions instead.
         md = "\n\n".join(["---"] * (MAX_BLOCKS + 10))
-        assert render_blocks(md) is None
+        blocks = render_blocks(md)
+        assert blocks is not None and len(blocks) == MAX_BLOCKS + 10
+
+
+class TestPayloadPartition:
+    """partition_blocks: <= budget and <= MAX_BLOCKS per group, never inside a block."""
+
+    def _brief(self, clients=8, items=6, heading="**Kunde {c} · Matien**"):
+        parts = ["## Täglicher Exception-Brief · 27. August 2026", ""]
+        for c in range(clients):
+            parts.append(heading.format(c=c))
+            parts.append("")
+            for i in range(items):
+                k = 400 + c * 10 + i
+                parts.append(
+                    f"- 🟡 **Freigabe nötig** · [TUR-{k}](https://elbdev.atlassian.net/browse/TUR-{k}) "
+                    "— Warenkorb-Rabatt ist veröffentlichungsbereit; Feedback zu Banner und Farbe muss geprüft werden."
+                )
+            parts.append("")
+        return "\n".join(parts)
+
+    def test_payload_size_counts_serialized_bytes(self):
+        from plugins.platforms.slack.block_kit import payload_size
+        assert payload_size(None) == 0
+        assert 0 < payload_size(render_blocks("hallo")) < payload_size(render_blocks("hallo " * 500))
+
+    def test_under_budget_stays_one_group(self):
+        from plugins.platforms.slack.block_kit import partition_blocks
+        blocks = render_blocks(self._brief(clients=2, items=3))
+        assert partition_blocks(blocks) == [blocks]
+
+    def test_over_budget_splits_and_respects_limits(self):
+        from plugins.platforms.slack.block_kit import partition_blocks, payload_size
+        blocks = render_blocks(self._brief(clients=8, items=6))
+        groups = partition_blocks(blocks, budget=6000)
+        assert len(groups) > 1
+        assert [b for g in groups for b in g] == blocks  # order preserved, nothing lost
+        for g in groups:
+            assert payload_size(g) <= 6000 or len(g) == 1
+            assert len(g) <= MAX_BLOCKS
+            assert g[-1]["type"] != "divider"
+
+    def test_block_count_alone_splits(self):
+        from plugins.platforms.slack.block_kit import partition_blocks
+        groups = partition_blocks(render_blocks("\n\n".join(["---"] * (MAX_BLOCKS + 10))))
+        assert len(groups) >= 2 and all(len(g) <= MAX_BLOCKS for g in groups)
+
+    def test_header_opens_the_next_group(self):
+        from plugins.platforms.slack.block_kit import partition_blocks
+        blocks = render_blocks(self._brief(clients=6, items=6, heading="## Kunde {c}"))
+        groups = partition_blocks(blocks, budget=5000)
+        assert len(groups) > 1
+        assert all(g[0]["type"] == "header" for g in groups[1:])
+
+    def test_markdown_group_uses_the_lower_budget(self):
+        from plugins.platforms.slack.block_kit import partition_blocks, MARKDOWN_GROUP_BUDGET, payload_size
+        report = ":::report\n" + "\n".join(f"- Zeile {i} " + "x" * 80 for i in range(120)) + "\n:::"
+        md = "Vorab.\n\n" + report + "\n\n" + "\n".join(f"- Punkt {i} " + "y" * 200 for i in range(40))
+        groups = partition_blocks(render_blocks(md))
+        assert len(groups) >= 2
+        for g in groups:
+            if any(b["type"] == "markdown" for b in g):
+                assert payload_size(g) <= MARKDOWN_GROUP_BUDGET or len(g) == 1
+
+    def test_group_notification_text_is_plain_words(self):
+        from plugins.platforms.slack.block_kit import group_notification_text
+        blocks = render_blocks("**Kunde 1**\n\n- 🟡 **Freigabe** · [TUR-1](https://x/1) — warum")
+        text = group_notification_text(blocks, 1, 2)
+        assert "TUR-1" in text and "*" not in text and "https://" not in text
+        assert group_notification_text([{"type": "divider"}], 1, 3) == "(Teil 2/3)"
 
 
 class TestEmptyContentGuards:
@@ -262,3 +436,23 @@ class TestSplitTextFenceBalanced:
             )
 
 
+
+
+class TestPartitionReviewFindings:
+    """Codex review 2026-08-28: the carried tail must be re-checked."""
+
+    def test_backed_off_tail_never_leaves_over_budget(self):
+        from plugins.platforms.slack.block_kit import partition_blocks, payload_size
+        items = "\n".join(f"- Punkt {i} " + "x" * 200 for i in range(50))
+        md = f"p\n\n## Header\n\n{items}\n\n{items}"
+        blocks = render_blocks(md)
+        groups = partition_blocks(blocks)
+        for g in groups:
+            assert payload_size(g) <= 20000 or len(g) == 1, [payload_size(x) for x in groups]
+        assert [b for g in groups for b in g] == blocks
+
+    def test_group_mrkdwn_text_carries_the_whole_group(self):
+        from plugins.platforms.slack.block_kit import group_mrkdwn_text
+        md = "## Titel\n\n**Lead**\n\n- 🟡 **Freigabe** · [TUR-1](https://x/1) — warum\n- zweiter Punkt\n\n-# Quelle: Jira"
+        text = group_mrkdwn_text(render_blocks(md))
+        assert "*Titel*" in text and "<https://x/1|TUR-1>" in text and "zweiter Punkt" in text and "Quelle: Jira" in text
