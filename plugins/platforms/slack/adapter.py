@@ -6906,6 +6906,56 @@ def _standalone_format_mrkdwn(text: str) -> str:
         return text
 
 
+_BLOCK_REJECTION_ERRORS = frozenset({"invalid_blocks", "msg_too_long", "msg_blocks_too_long", "too_many_blocks"})
+
+
+def _standalone_block_groups(pconfig, message: str) -> Optional[List[list]]:
+    """Block Kit groups for the standalone lane — the adapter's own switches (``rich_blocks`` /
+    ``markdown_blocks`` / ``feedback_buttons`` in the platform ``extra``), renderer and
+    partitioning, evaluated on a config-only adapter shell."""
+    if not message or not message.strip():
+        return None
+    try:
+        shell = SlackAdapter.__new__(SlackAdapter)
+        shell.config = pconfig
+        return shell._block_groups(message)
+    except Exception:
+        logger.debug("[Slack] _standalone_send: block render failed; plain text", exc_info=True)
+        return None
+
+
+def _standalone_notification_text(message: str) -> str:
+    try:
+        return SlackAdapter.__new__(SlackAdapter).notification_text(message)
+    except Exception:
+        return ""
+
+
+async def _standalone_post_block_followups(
+    session, tok: str, chat_id: str, groups: List[list], thread_id: Optional[str], req_kw: dict,
+    unfurl_kwargs: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Overflow block groups as consecutive posts (same context and unfurl settings as the first
+    post, own text fallback, flat retry with the whole overflow as text); a failure never fails
+    the delivered first message."""
+    total = len(groups)
+    for idx, group in enumerate(groups[1:], 1):
+        follow = _standalone_post_kwargs(
+            chat_id, group_notification_text(group, idx, total), unfurl_kwargs or {}, thread_id)
+        follow["blocks"] = group
+        data = await _slack_json_post(session, tok, "chat.postMessage", follow, req_kw)
+        if not data.get("ok") and data.get("error") in _BLOCK_REJECTION_ERRORS:
+            logger.warning(
+                "[Slack] _standalone_send: follow-up %d/%d blocks rejected (%s); retrying flat",
+                idx + 1, total, data.get("error"))
+            flat = {k: v for k, v in follow.items() if k != "blocks"}
+            flat["text"] = group_mrkdwn_text(group)
+            data = await _slack_json_post(session, tok, "chat.postMessage", flat, req_kw)
+        if not data.get("ok"):
+            logger.warning(
+                "[Slack] _standalone_send: follow-up %d/%d failed: %s", idx + 1, total, data.get("error"))
+
+
 async def _standalone_send(
     pconfig, chat_id, message, *, thread_id=None, media_files=None, force_document=False,
     caption=None):
@@ -6955,12 +7005,32 @@ async def _standalone_send(
     try:
         _sess_kw, _req_kw = _standalone_proxy_kwargs()
         last_error = "unknown"
+        # Block Kit parity with the live adapter: the same job arrived as flat mrkdwn from
+        # ``hermes cron run`` and with the full layout from the gateway's ticker. Same renderer,
+        # same partitioning, same text fallback.
+        groups = _standalone_block_groups(pconfig, message)
         async with aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=30), **_sess_kw) as session:
-            payload = _standalone_post_kwargs(chat_id, formatted, unfurl_kwargs, thread_id)
+            flat_payload = _standalone_post_kwargs(chat_id, formatted, unfurl_kwargs, thread_id)
+            block_payload = None
+            if groups:
+                block_payload = dict(flat_payload, blocks=groups[0],
+                                     text=_standalone_notification_text(message) or formatted)
             for tok in tokens:
+                # Per token: a wrong-workspace token that rejected the layout must not cost the
+                # NEXT token its blocks and follow-ups.
+                payload, tok_groups = block_payload or flat_payload, groups
                 data = await _slack_json_post(session, tok, "chat.postMessage", payload, _req_kw)
+                if not data.get("ok") and payload.get("blocks") and data.get("error") in _BLOCK_REJECTION_ERRORS:
+                    logger.warning(
+                        "[Slack] _standalone_send: Block Kit payload rejected (%s, %d bytes); retrying "
+                        "without blocks", data.get("error"), payload_size(payload["blocks"]))
+                    tok_groups = None
+                    data = await _slack_json_post(session, tok, "chat.postMessage", flat_payload, _req_kw)
                 if data.get("ok"):
+                    if tok_groups and len(tok_groups) > 1:
+                        await _standalone_post_block_followups(
+                            session, tok, chat_id, tok_groups, thread_id, _req_kw, unfurl_kwargs)
                     return {
                         "success": True, "platform": "slack", "chat_id": chat_id,
                         "message_id": data.get("ts")}
