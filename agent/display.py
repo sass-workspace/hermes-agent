@@ -600,6 +600,13 @@ def build_status_phrase(tool_name: str, args: dict | None, max_len: int = 49) ->
     if not tool_name or tool_name == "_thinking" or not _friendly_tool_labels:
         return None
     verb = _tool_verb(tool_name)
+    if not verb:
+        # An MCP tool's name is its transport identifier and must never reach the user; these
+        # phrases are complete and follow the bot's display name (no "is <verb>" form).
+        from agent.mcp_status_phrases import mcp_status_phrase
+        mcp_phrase = mcp_status_phrase(tool_name)
+        if mcp_phrase:
+            return mcp_phrase[: max_len - 2].rstrip() + "…" if len(mcp_phrase) > max_len - 1 else mcp_phrase + "…"
     phrase = (t("display.status_phrase.verb", verb=f"{verb[0].lower()}{verb[1:]}") if verb
               else t("display.status_phrase.using_tool", tool=tool_name))
     with_preview = args and verb and tool_name not in _TOOL_VERBS_NO_PREVIEW
