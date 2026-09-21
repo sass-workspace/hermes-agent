@@ -2188,7 +2188,8 @@ class SlackAdapter(BasePlatformAdapter):
         return None
 
     async def _call_with_block_fallback(
-        self, client_fn: Callable[[], Any], method: str, kwargs: Dict[str, Any], verb: str) -> Any:
+        self, client_fn: Callable[[], Any], method: str, kwargs: Dict[str, Any], verb: str,
+        flat_text: Optional[str] = None) -> Any:
         """``client_fn().<method>(**kwargs)``; on a Block Kit rejection retry once without
         ``blocks`` (an edit sends ``blocks=[]`` so the message drops its stale layout). The client
         is re-resolved for the retry. The retry is written back into ``kwargs``, so a caller sees
@@ -2202,6 +2203,8 @@ class SlackAdapter(BasePlatformAdapter):
                     kwargs["blocks"] = []
                 else:
                     kwargs.pop("blocks", None)
+                if flat_text is not None:
+                    kwargs["text"] = flat_text  # without blocks ``text`` IS the body again
                 return await getattr(client_fn(), method)(**kwargs)
             raise
 
@@ -2279,6 +2282,9 @@ class SlackAdapter(BasePlatformAdapter):
         if groups and len(groups) > 1 and one_post:
             groups = None
         blocks = groups[0] if groups else None
+        # With blocks attached ``text`` is only the notification / screen-reader fallback, so it
+        # carries cleaned prose. Without them it IS the message body and stays untouched.
+        notify = self.notification_text(content) if blocks else ""
         last_result = None
         for i, chunk in enumerate(chunks):
             kwargs = {
@@ -2286,13 +2292,15 @@ class SlackAdapter(BasePlatformAdapter):
                 "mrkdwn": True, **_slack_unfurl_kwargs(self.config.extra)}
             if blocks and i == 0:
                 kwargs["blocks"] = blocks
+                if notify:
+                    kwargs["text"] = notify
             if thread_ts:
                 kwargs["thread_ts"] = thread_ts
                 if broadcast and i == 0:
                     kwargs["reply_broadcast"] = True
             client_fn = lambda: self._get_client(chat_id, team_id=team_id)  # noqa: E731
             last_result = await self._call_with_block_fallback(
-                client_fn, "chat_postMessage", kwargs, "send")
+                client_fn, "chat_postMessage", kwargs, "send", flat_text=chunk)
             if blocks and i == 0 and not kwargs.get("blocks"):
                 groups = None  # rejected and sent flat: the layout is gone, no follow-ups
         if groups and len(groups) > 1 and last_result:
@@ -2403,8 +2411,11 @@ class SlackAdapter(BasePlatformAdapter):
             groups = self._block_groups(content) if finalize else None
             if groups:
                 update_kwargs["blocks"] = groups[0]
+                # Same rule as send(): this path carries the final message whenever streaming is on.
+                update_kwargs["text"] = self.notification_text(content) or formatted
             await self._call_with_block_fallback(
-                lambda: self._client_for(chat_id, metadata), "chat_update", update_kwargs, "edit")
+                lambda: self._client_for(chat_id, metadata), "chat_update", update_kwargs, "edit",
+                flat_text=formatted)
             if groups and len(groups) > 1 and update_kwargs.get("blocks"):
                 # The edited message keeps group 1; overflow follows in its context.
                 await self._post_block_followups(
@@ -3096,6 +3107,64 @@ class SlackAdapter(BasePlatformAdapter):
                 "BLOCK_PAYLOAD_BUDGET: %s", where, payload_size(blocks), len(blocks or []), error)
         else:
             logger.info("[Slack] Block Kit payload rejected; retrying %s without blocks: %s", where, error)
+
+    # Slack shows the ``text`` field — not the blocks — in push notifications, desktop banners and
+    # the sidebar preview. The whole converted message there means a preview that opens on
+    # "*Titel* --- ``` | Prio |" instead of on words. Keep the full prose (screen readers read
+    # this field rather than block content) and strip only the layout scaffolding.
+    _NOTIFICATION_MAX = 600
+    _NOTIFICATION_STATE_EMOJI = "🔴🟡🔵🟢"
+
+    def notification_text(self, content: str) -> str:
+        """Readable plain-text fallback for a Block Kit payload. Works on the RAW markdown: once
+        :meth:`format_message` has run, tables are column-padded inside a code fence and can no
+        longer be flattened; the cleaned result goes back through ``format_message`` so escaping
+        stays identical to the normal path. ``""`` when nothing readable survives — callers then
+        keep the ordinary converted text rather than sending an empty notification."""
+        if not content or not content.strip():
+            return ""
+        # format_message would strip directive scaffolding too, but the line passes below must
+        # never see ":::" markers.
+        content = strip_directives(content)
+        out: List[str] = []
+        in_fence = False
+        for raw in content.splitlines():
+            line = raw.rstrip()
+            if re.match(r"^\s*(```|~~~)", line):
+                in_fence = not in_fence
+                continue
+            if in_fence:
+                continue
+            if re.match(r"^\s{0,3}([-*_])(?:\s*\1){2,}\s*$", line):  # divider rules carry no words
+                continue
+            # Table separator rows go; real rows flatten to "a · b · c".
+            if re.match(r"^\s*\|?[\s:|-]*-{2,}[\s:|-]*\|?\s*$", line) and "|" in line:
+                continue
+            if line.strip().startswith("|"):
+                cells = [c.strip() for c in line.strip().strip("|").split("|")]
+                line = " · ".join(c for c in cells if c)
+            # Headings, list markers and quote marks are layout, not words.
+            line = re.sub(r"^\s{0,3}#{1,6}\s+", "", line)
+            line = re.sub(r"^\s*[-*+]\s+", "", line)
+            line = re.sub(r"^\s*\d+[.)]\s+", "", line)
+            line = re.sub(r"^\s*>\s?", "", line)
+            line = re.sub(r"<!date\^[^^>]*\^[^|>]*\|([^>]*)>", r"\1", line)  # a date token speaks its fallback
+            line = re.sub(r"(?<!!)\[([^\]]+)\]\([^()]*(?:\([^()]*\)[^()]*)*\)", r"\1", line)  # label, not URL
+            line = re.sub(r"\*\*([^*]+)\*\*", r"\1", line)
+            line = re.sub(r"(?<!\*)\*([^*\n]+)\*(?!\*)", r"\1", line)
+            line = re.sub(r"~~?([^~\n]+)~~?", r"\1", line)
+            line = line.replace("`", "")
+            # A leading state emoji is redundant with a word in the same row, and a preview
+            # renders it as ":red_circle:" anyway.
+            line = re.sub(rf"^[{self._NOTIFICATION_STATE_EMOJI}\ufe0f]+\s*", "", line).strip()
+            if line:
+                out.append(line)
+        text = "\n".join(out).strip()
+        if not text:
+            return ""
+        if len(text) > self._NOTIFICATION_MAX:
+            text = text[: self._NOTIFICATION_MAX - 1].rstrip() + "…"
+        return self.format_message(text)
 
     def format_tool_preview(self, preview) -> str:
         """Keep compact tool arguments out of mrkdwn emphasis conversion."""
