@@ -317,6 +317,7 @@ class MCPServerTask(MCPServerRunMixin, MCPServerTransportMixin, MCPServerHealthM
         "_auth_park",
         "_auth_type",
         "_config",
+        "_degraded_since",
         "_elicitation",
         "_error",
         "_ever_connected",
@@ -337,6 +338,7 @@ class MCPServerTask(MCPServerRunMixin, MCPServerTransportMixin, MCPServerHealthM
         "_reconnect_retries",
         "_reconnecting",
         "_recycled_reason",
+        "_reestablish_noted",
         "_refresh_lock",
         "_registered_tool_names",
         "_resolved_identity",
@@ -401,6 +403,12 @@ class MCPServerTask(MCPServerRunMixin, MCPServerTransportMixin, MCPServerHealthM
         # Digest of the resolved inputs the transport last connected with; a cross-profile adopter
         # must resolve the same digest in its own scope. None until the transport publishes it.
         self._resolved_identity: Optional[str] = None
+        # Monotonic start of the current degraded episode (keepalive / health-check failure, dead
+        # stdio child), or None. Cleared only by REAL proof of health (_mark_session_proven), which
+        # logs the recovery of a reconnect that never parked — otherwise a reconnect that simply
+        # worked logs nothing and a log reader sees two failures and then silence.
+        self._degraded_since: Optional[float] = None
+        self._reestablish_noted: bool = False
         # In-flight RPC tasks so a deliberate teardown fails them fast; _reconnecting is True
         # during that teardown so _track_inflight_rpc turns the cancel into a retryable error.
         # In-flight RPC bookkeeping (#48069 salvage): user-visible requests registered while running so a
