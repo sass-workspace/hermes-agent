@@ -284,9 +284,19 @@ def _sdk_supports_agent_sessions() -> bool:
     return _AGENT_SESSIONS_SUPPORTED
 
 
+# Latched to True once Slack itself answered that this app cannot use the Agent Sessions API:
+# the SDK shipping the method says nothing about the installed app's entitlement, and a status
+# line that silently vanishes on every turn is worse than the legacy method it replaces.
+_AGENT_SESSIONS_REJECTED = False
+_AGENT_SESSIONS_REJECTION_ERRORS = frozenset({
+    "unknown_method", "invalid_method", "method_deprecated", "not_allowed", "missing_scope",
+    "feature_not_enabled", "not_authed", "invalid_arguments", "invalid_arg_name",
+    "agent_sessions_not_enabled", "not_supported"})
+
+
 def _session_status_method(client: Any):
     """Return the status setter: Agent Sessions API when available, else legacy."""
-    if _sdk_supports_agent_sessions():
+    if _sdk_supports_agent_sessions() and not _AGENT_SESSIONS_REJECTED:
         method = getattr(client, "agents_sessions_setStatus", None)
         if method is not None:
             return method
@@ -295,11 +305,43 @@ def _session_status_method(client: Any):
 
 def _session_title_method(client: Any):
     """Return the title setter: ``agents.sessions.rename`` when available, else legacy."""
-    if _sdk_supports_agent_sessions():
+    if _sdk_supports_agent_sessions() and not _AGENT_SESSIONS_REJECTED:
         method = getattr(client, "agents_sessions_rename", None)
         if method is not None:
             return method
     return client.assistant_threads_setTitle
+
+
+def _agent_sessions_rejected(error: BaseException) -> bool:
+    """Whether *error* says the app may not use the Agent Sessions API (as opposed to a transport
+    blip or a bad thread), read from the SDK response's ``error`` code."""
+    response_get = getattr(getattr(error, "response", None), "get", None)
+    code = None
+    if callable(response_get):
+        try:
+            code = response_get("error")
+        except Exception:
+            code = None
+    return code in _AGENT_SESSIONS_REJECTION_ERRORS
+
+
+async def _call_session_method(client: Any, modern: Any, legacy: Any, what: str, **kwargs: Any) -> None:
+    """``modern(**kwargs)``, falling back to ``legacy(**kwargs)`` — once per process, with a WARNING —
+    when Slack rejects the Agent Sessions call for this app; any other failure propagates."""
+    global _AGENT_SESSIONS_REJECTED
+    if modern is legacy or _AGENT_SESSIONS_REJECTED:
+        await legacy(**kwargs)
+        return
+    try:
+        await modern(**kwargs)
+    except Exception as e:
+        if not _agent_sessions_rejected(e):
+            raise
+        _AGENT_SESSIONS_REJECTED = True
+        logger.warning(
+            "[Slack] Agent Sessions API rejected the %s call (%s); this app is not entitled to it — "
+            "using the legacy assistant.threads methods from now on", what, e)
+        await legacy(**kwargs)
 
 
 def slack_deps_present() -> bool:
@@ -2729,8 +2771,10 @@ class SlackAdapter(BasePlatformAdapter):
         self, chat_id: str, team_id: str, thread_ts: str, status: str, fail_label: str) -> None:
         """``assistant.threads.setStatus`` (empty ``status`` clears); failures are debug-logged."""
         try:
-            _set_status = _session_status_method(self._get_client(chat_id, team_id=team_id))
-            await _set_status(channel_id=chat_id, thread_ts=thread_ts, status=status)
+            client = self._get_client(chat_id, team_id=team_id)
+            await _call_session_method(
+                client, _session_status_method(client), client.assistant_threads_setStatus, "setStatus",
+                channel_id=chat_id, thread_ts=thread_ts, status=status)
         except Exception as e:
             logger.debug("[Slack] assistant.threads.setStatus %s: %s", fail_label, e)
 
@@ -3832,8 +3876,10 @@ class SlackAdapter(BasePlatformAdapter):
             return
         title = title[:77].rstrip() + "..." if len(title) > 80 else title
         try:
-            _set_title = _session_title_method(self._get_client(channel_id, team_id=team_id))
-            await _set_title(channel_id=channel_id, thread_ts=thread_ts, title=title)
+            client = self._get_client(channel_id, team_id=team_id)
+            await _call_session_method(
+                client, _session_title_method(client), client.assistant_threads_setTitle, "rename",
+                channel_id=channel_id, thread_ts=thread_ts, title=title)
         except Exception as e:
             logger.debug("[Slack] session title set failed: %s", e)
             return
