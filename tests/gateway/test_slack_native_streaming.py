@@ -443,14 +443,48 @@ class TestSendFinalization:
         assert not _open_streams(adapter)
 
     @pytest.mark.asyncio
-    async def test_rewritten_turn_final_seals_stale_stream_then_posts(self):
-        """A turn-final (notify=True) that no longer continues the stream."""
+    async def test_rewritten_turn_final_seals_stale_stream_and_commits_in_place(self):
+        """A turn-final (notify=True) that no longer continues the stream is committed INTO
+        the streamed bubble, never posted beside it (the duplicate-final class seen in
+        #iris-ops on 2026-09-24: the stream with raw directives, then the rendered final as a
+        second bubble)."""
         adapter, client = _make_adapter()
+        await adapter.send_draft("D1", 7, "Draft answer that got rewritten", metadata=META)
+        result = await adapter.send("D1", "Completely new answer", metadata=dict(META, notify=True))
+        assert result.success and result.message_id == "123.456"
+        client.chat_stopStream.assert_awaited_once()
+        assert "markdown_text" not in client.chat_stopStream.await_args.kwargs
+        client.chat_update.assert_awaited_once()
+        kwargs = client.chat_update.await_args.kwargs
+        assert kwargs["ts"] == "123.456" and "Completely new answer" in kwargs["text"]
+        client.chat_postMessage.assert_not_awaited()
+        assert not _open_streams(adapter)
+
+    @pytest.mark.asyncio
+    async def test_rewritten_final_with_directives_renders_blocks_into_the_stream(self):
+        """The rewritten final carries a :::card — the in-place commit applies the layout
+        (Block Kit on the streamed ts), and no second bubble appears."""
+        adapter, client = _make_adapter({"rich_blocks": True})
+        await adapter.send_draft("D1", 7, "Working on it", metadata=META)
+        final = "JU-1\n\n:::card\ntitle: Zeit gebucht\nsubtitle: JU-1 · 5 Stunden\nBody.\n:::\n\n-# verifiziert"
+        result = await adapter.send("D1", final, metadata=dict(META, notify=True))
+        assert result.success and result.message_id == "123.456"
+        client.chat_update.assert_awaited_once()
+        kwargs = client.chat_update.await_args.kwargs
+        assert kwargs["ts"] == "123.456" and kwargs.get("blocks")
+        assert ":::" not in kwargs["text"]
+        client.chat_postMessage.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_rewritten_final_falls_back_to_fresh_post_when_commit_fails(self):
+        """Only an in-place commit that fails may post the rewritten final beside the stream."""
+        adapter, client = _make_adapter()
+        client.chat_update = AsyncMock(side_effect=Exception("boom"))
         await adapter.send_draft("D1", 7, "Draft answer that got rewritten", metadata=META)
         result = await adapter.send("D1", "Completely new answer", metadata=dict(META, notify=True))
         assert result.success
         client.chat_stopStream.assert_awaited_once()
-        assert "markdown_text" not in client.chat_stopStream.await_args.kwargs
+        client.chat_update.assert_awaited_once()
         client.chat_postMessage.assert_awaited_once()
         assert not _open_streams(adapter)
 

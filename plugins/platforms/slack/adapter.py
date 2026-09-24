@@ -2682,11 +2682,25 @@ class SlackAdapter(BasePlatformAdapter):
         kind, delta = self._stream_relation(stream.get("sent", ""), text)
         if kind == "unrelated":
             if md.get("notify"):
-                # A turn-final that does not continue the stream (the model rewrote its answer):
-                # close the stale stream on what is visible so no live-typing indicator hangs,
-                # then let send() post the real final.
+                # A turn-final that does not continue the stream (the model rewrote its answer,
+                # or the final differs from the last streamed segment): the streamed bubble is
+                # still THIS turn's bubble. Close the stale stream on what is visible, then
+                # commit the real final into it in place — a fresh post beside the stale
+                # stream is the duplicate-final class (two bubbles of one answer, the first
+                # showing raw directives, 2026-09-24 #iris-ops). Only when the in-place
+                # commit fails does send() post a fresh message (a duplicate beats a lost
+                # answer).
                 self._active_streams.pop(key, None)
+                ts = stream["ts"]
                 await self._seal_stream(chat_id, stream)
+                committed = await self.edit_message(
+                    chat_id, ts, text, finalize=True, metadata=metadata)
+                if committed.success:
+                    await self.stop_typing(chat_id, metadata)
+                    return SendResult(success=True, message_id=ts)
+                logger.warning(
+                    "[Slack] Native stream %s/%s could not take the rewritten final in place; "
+                    "delivering it as a fresh post", chat_id, ts)
             return None
         if kind == "extends" and len(delta) > self.MAX_MESSAGE_LENGTH:
             # Tail too large for one append: close the stream on what is visible and let the
