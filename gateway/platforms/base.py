@@ -3464,9 +3464,15 @@ class BasePlatformAdapter(ABC):
         if log_cmd is not None:
             logger.info("[%s] Sending command '/%s' response (%d chars) to %s", self.name, log_cmd,
                         len(text), event.source.chat_id)
+        # An inline reply (/status, /approve, clarify) arrives while a turn may still be
+        # streaming: it is never that turn's final, whatever its text looks like. Without the
+        # marker a stream-is-the-message adapter seals the live stream with it or commits it
+        # into the streamed bubble (gateway/AGENTS.md: every mid-turn send carries it).
+        inline_meta = _mark_notify_metadata(thread_meta)
+        inline_meta["_interim_send"] = True
         result = await self._send_with_retry(
             chat_id=event.source.chat_id, content=text, reply_to=_reply_anchor_for_event(event),
-            metadata=_mark_notify_metadata(thread_meta))
+            metadata=inline_meta)
         if eph_ttl > 0 and result.success and result.message_id:
             self._schedule_ephemeral_delete(event.source.chat_id, result.message_id, eph_ttl)
 

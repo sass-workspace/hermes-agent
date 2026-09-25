@@ -2643,6 +2643,28 @@ class SlackAdapter(BasePlatformAdapter):
             return ("extends" if delta.strip() else "equal"), delta
         return "unrelated", ""
 
+    async def abandon_open_draft(
+        self, chat_id: str, content: str, metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Seal this thread's native stream when its turn dies (/stop, /new, supersede) on
+        what is already visible — the seal adds and claims nothing; otherwise the live
+        indicator stays until Slack expires it. Failure is reported, never raised."""
+        key = self._stream_key(chat_id, metadata or {})
+        stream = self._active_streams.get(key)
+        if stream is None:
+            return SendResult(success=True)  # nothing open — no-op
+        # Only the abandoning consumer's OWN stream: a superseded turn's consumer can wake up
+        # after the replacement turn opened a stream in the same thread. The stream is ours
+        # when what it shows is what we sent (``content`` is the consumer's visible text).
+        if self._stream_relation(stream.get("sent", ""), content or "")[0] == "unrelated":
+            return SendResult(success=True)  # another turn's stream — never touch it
+        # get-check-pop without an await in between: finalization or a replacement
+        # send_draft that popped it first wins, and we never seal twice.
+        self._active_streams.pop(key, None)
+        sealed = await self._seal_stream(chat_id, stream)
+        return SendResult(success=sealed, message_id=stream.get("ts"),
+                          error=None if sealed else "abandon seal failed")
+
     async def _seal_stream(
         self, chat_id: str, stream: Dict[str, Any], delta: Optional[str] = None) -> bool:
         """Best-effort chat.stopStream for an open stream. ``delta`` is the exact unsent tail of
@@ -2681,6 +2703,10 @@ class SlackAdapter(BasePlatformAdapter):
         text = self._strip_stream_cursor(content)
         kind, delta = self._stream_relation(stream.get("sent", ""), text)
         if kind == "unrelated":
+            logger.info(
+                "[Slack] Native stream %s/%s: final unrelated to stream (sent=%d chars, "
+                "final=%d chars, notify=%s)", chat_id, stream.get("ts"),
+                len(stream.get("sent", "")), len(text), bool(md.get("notify")))
             if md.get("notify"):
                 # A turn-final that does not continue the stream (the model rewrote its answer,
                 # or the final differs from the last streamed segment): the streamed bubble is

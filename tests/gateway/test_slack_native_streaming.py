@@ -489,6 +489,64 @@ class TestSendFinalization:
         assert not _open_streams(adapter)
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("reply", [
+        "Status: running, 3 tools",            # unrelated to the stream
+        "Streaming the real answer and more",  # extends the stream text
+    ])
+    async def test_inline_reply_mid_turn_leaves_stream_open_and_posts_fresh(self, reply):
+        """An inline reply (notify + _interim_send, from _dispatch_inline_reply) never seals
+        the live stream or lands in the streamed bubble — whether its text is unrelated to
+        the stream or happens to extend it."""
+        adapter, client = _make_adapter()
+        await adapter.send_draft("D1", 7, "Streaming the real answer", metadata=META)
+        result = await adapter.send(
+            "D1", reply, metadata=dict(META, notify=True, _interim_send=True))
+        assert result.success
+        client.chat_stopStream.assert_not_awaited()
+        client.chat_update.assert_not_awaited()
+        client.chat_postMessage.assert_awaited_once()
+        assert _open_streams(adapter)
+
+    @pytest.mark.asyncio
+    async def test_abandon_open_draft_seals_the_threads_stream_on_what_is_visible(self):
+        """/stop, /new or a superseded turn: the consumer abandons its stream; the adapter
+        seals it without appending anything and forgets it."""
+        adapter, client = _make_adapter()
+        await adapter.send_draft("D1", 7, "Half an answer", metadata=META)
+        result = await adapter.abandon_open_draft("D1", "Half an answer", metadata=META)
+        assert result.success and result.message_id == "123.456"
+        client.chat_stopStream.assert_awaited_once()
+        assert "markdown_text" not in client.chat_stopStream.await_args.kwargs
+        client.chat_postMessage.assert_not_awaited()
+        assert not _open_streams(adapter)
+
+    @pytest.mark.asyncio
+    async def test_abandon_never_seals_a_replacement_turns_stream(self):
+        """A superseded turn's consumer wakes up after the replacement turn opened its own
+        stream in the same thread: its abandon must leave the replacement's stream alone."""
+        adapter, client = _make_adapter()
+        await adapter.send_draft("D1", 9, "The replacement turn's answer", metadata=META)
+        result = await adapter.abandon_open_draft("D1", "The old turn's half answer", metadata=META)
+        assert result.success
+        client.chat_stopStream.assert_not_awaited()
+        assert _open_streams(adapter)
+
+    @pytest.mark.asyncio
+    async def test_abandon_open_draft_without_a_stream_is_a_noop(self):
+        adapter, client = _make_adapter()
+        result = await adapter.abandon_open_draft("D1", "x", metadata=META)
+        assert result.success
+        client.chat_stopStream.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_abandon_open_draft_only_seals_its_own_thread(self):
+        adapter, client = _make_adapter()
+        await adapter.send_draft("D1", 7, "Thread A answer", metadata=META)
+        await adapter.send_draft("D1", 8, "Thread B answer", metadata=META_B)
+        await adapter.abandon_open_draft("D1", "Thread A answer", metadata=META)
+        assert len(_open_streams(adapter)) == 1
+
+    @pytest.mark.asyncio
     async def test_explicit_team_metadata_fills_recipient_team(self):
         adapter, client = _make_adapter()
         await adapter.send_draft("C1", 7, "Hello", metadata=dict(META, slack_team_id="T999"))

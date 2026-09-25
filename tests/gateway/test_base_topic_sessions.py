@@ -200,3 +200,22 @@ class TestTelegramAutoTtsCaptionDelivery:
             }
         ]
 
+
+
+@pytest.mark.asyncio
+async def test_inline_reply_is_marked_interim_never_the_turn_final():
+    """/status, /approve and clarify replies are dispatched inline while a turn may still be
+    streaming. They carry _interim_send (gateway/AGENTS.md: every mid-turn send does), so a
+    stream-is-the-message adapter never seals the live stream with them or commits them into
+    the streamed bubble."""
+    adapter = DummyTelegramAdapter()
+
+    async def handler(_event):
+        return "Status: running, 3 tools"
+
+    adapter.set_message_handler(handler)
+    await adapter._dispatch_inline_reply(_make_event("-1001", "17585"))
+    assert len(adapter.sent) == 1
+    md = adapter.sent[0]["metadata"]
+    assert md["_interim_send"] is True and md["notify"] is True
+    assert md["thread_id"] == "17585"
