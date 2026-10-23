@@ -1031,6 +1031,15 @@ def _run_route_delegate(name: str):
     return _handler
 
 
+def _skip_context_files(user_config: Any) -> bool:
+    """gateway.platforms.api_server.skip_context_files; a non-dict ``gateway.platforms`` (the
+    list ``hermes gateway setup`` writes) means no per-platform override."""
+    platforms_cfg = ((user_config or {}).get("gateway") or {}).get("platforms") or {}
+    if not isinstance(platforms_cfg, dict):
+        return False
+    return bool((platforms_cfg.get("api_server") or {}).get("skip_context_files"))
+
+
 class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
     """aiohttp server routing OpenAI-format requests through hermes-agent's AIAgent."""
 
@@ -2247,7 +2256,12 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             "gateway_session_key": gateway_session_key,
             # The session's provider from the previous request, so its queued recall reaches this turn
             # (#120116); checked back in by the turn's finally.
-            "memory_manager": self._memory_sessions.checkout(session_id)}
+            "memory_manager": self._memory_sessions.checkout(session_id),
+            # Same opt-out the messaging gateway honours (GatewayTurnRunner._skip_context_files):
+            # gateway.platforms.api_server.skip_context_files keeps cwd AGENTS.md/CLAUDE.md out of
+            # the prompt; the persona (SOUL.md) still loads.
+            "skip_context_files": _skip_context_files(user_config),
+            "load_soul_identity": True}
         if request_service_tier is not _REQUEST_OPTION_MISSING:
             agent_kwargs["service_tier"] = request_service_tier
         agent = AIAgent(**agent_kwargs)
