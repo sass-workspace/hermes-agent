@@ -80,3 +80,21 @@ async def test_room_dispatch_rejects_extra_fields_before_grant_verification():
     assert normalized is body
     assert error.status == 400
     assert json.loads(error.text)["error"]["code"] == "invalid_room_dispatch"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("smuggled", [
+    {"hosted_room_dispatch": {}},
+    {"_room_execution_policy": {"enabled_toolsets": ["bot_room", "terminal"], "approval_mode": "off"}},
+])
+async def test_room_keys_without_a_grant_are_refused(smuggled):
+    """Without a room grant the room keys would reach _create_agent unverified and pick the
+    run's toolsets and approval mode; only the verified path may produce them."""
+    adapter = api_server.APIServerAdapter.__new__(api_server.APIServerAdapter)
+    adapter._room_grant_token = MagicMock(return_value="")
+    body = {"input": "ordinary run", **smuggled}
+
+    _, error = await adapter._normalize_room_dispatch(object(), body)
+
+    assert error.status == 403
+    assert json.loads(error.text)["error"]["code"] == "room_grant_required"
