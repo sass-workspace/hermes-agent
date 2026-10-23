@@ -1149,6 +1149,15 @@ def _run_route_delegate(name: str):
     return _handler
 
 
+def _skip_context_files(user_config: Any) -> bool:
+    """gateway.platforms.api_server.skip_context_files; a non-dict ``gateway.platforms`` (the
+    list ``hermes gateway setup`` writes) means no per-platform override."""
+    platforms_cfg = ((user_config or {}).get("gateway") or {}).get("platforms") or {}
+    if not isinstance(platforms_cfg, dict):
+        return False
+    return bool((platforms_cfg.get("api_server") or {}).get("skip_context_files"))
+
+
 class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
     """aiohttp server routing OpenAI-format requests through hermes-agent's AIAgent."""
 
@@ -2236,7 +2245,12 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             # Same fallback provider chain as Telegram/Discord/Slack.
             "fallback_model": None if confirmed_runtime_lock else GatewayRunner._load_fallback_model(),
             "reasoning_config": request_reasoning_config,
-            "gateway_session_key": gateway_session_key}
+            "gateway_session_key": gateway_session_key,
+            # Same opt-out the messaging gateway honours (GatewayTurnRunner._skip_context_files):
+            # gateway.platforms.api_server.skip_context_files keeps cwd AGENTS.md/CLAUDE.md out of
+            # the prompt; the persona (SOUL.md) still loads.
+            "skip_context_files": _skip_context_files(user_config),
+            "load_soul_identity": True}
         if request_service_tier is not _REQUEST_OPTION_MISSING:
             agent_kwargs["service_tier"] = request_service_tier
         agent = AIAgent(**agent_kwargs)
