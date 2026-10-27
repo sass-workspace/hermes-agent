@@ -175,6 +175,7 @@ def test_roomlink_and_run_route_tuples_are_shard_owned():
         ("GET", "/v1/runs/{run_id}"),
         ("GET", "/v1/runs/{run_id}/events"),
         ("POST", "/v1/runs/{run_id}/approval"),
+        ("POST", "/v1/runs/{run_id}/clarify"),
         ("POST", "/v1/runs/{run_id}/steer"),
         ("POST", "/v1/runs/{run_id}/stop"),
     ]
