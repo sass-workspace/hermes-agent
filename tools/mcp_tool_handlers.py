@@ -58,9 +58,26 @@ def _tool_is_read_only(server_name: str, tool_name: str) -> bool:
     return _core._tool_read_only_hints.get(_resolve_server_key(server_name), {}).get(tool_name) is True
 
 
-def _trust_gate_check(server_name: str, tool_name: str) -> Optional[str]:
+_GATE_ARGS_MAX = 3000
+
+
+def _gate_arguments(args: Optional[dict]) -> str:
+    """The call's arguments as the approver sees them: exactly what runs once approved (cut long)."""
+    if not args:
+        return ""
+    try:
+        text = json.dumps(args, ensure_ascii=False, indent=1, sort_keys=True, default=str)
+    except (TypeError, ValueError):
+        text = repr(args)
+    if len(text) > _GATE_ARGS_MAX:
+        text = text[:_GATE_ARGS_MAX] + "\n… (cut; the full arguments run)"
+    return "\n\nArguments:\n" + text
+
+
+def _trust_gate_check(server_name: str, tool_name: str, args: Optional[dict] = None) -> Optional[str]:
     """Approval gate for write-capable tools on ``trust: untrusted`` servers. None to proceed,
-    else a ``tool_error``. Fail-closed: approval-system errors block."""
+    else a ``tool_error``. Fail-closed: approval-system errors block. The prompt carries the call's
+    arguments, so the approver sees what will change (Iris fork)."""
     from tools.mcp_tool_scope import _server_key
     # Trust is the calling profile's own policy (an adopter of a shared connection keeps its own tier).
     trust = _core._server_trust_levels.get(_server_key(server_name), _core._TRUST_FULL)
@@ -70,7 +87,7 @@ def _trust_gate_check(server_name: str, tool_name: str) -> Optional[str]:
         from tools.approval_prompt import request_elicitation_consent
         answer = request_elicitation_consent(
             f"MCP tool '{tool_name}' on UNTRUSTED server '{server_name}' wants to run. This tool is write-capable "
-            f"(no readOnlyHint=true annotation) and may modify external state.",
+            f"(no readOnlyHint=true annotation) and may modify external state.{_gate_arguments(args)}",
             f"Server '{server_name}' is configured 'trust: untrusted'. "
             f"Approve to run '{tool_name}' once, or deny to block it.",
             surface=f"mcp-trust/{server_name}", title=f"MCP server '{server_name}' is asking")
@@ -565,7 +582,7 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
 
     def _handler(args: dict, **kwargs) -> str:
         # Security boundary: untrusted-server write tools need approval before ANY transport work (incl. lazy spawn).
-        error = _trust_gate_check(server_name, tool_name) or _check_circuit_breaker(server_name)
+        error = _trust_gate_check(server_name, tool_name, args) or _check_circuit_breaker(server_name)
         if error is not None:
             return error
         server, error = _acquire_call_server(server_name, tool_timeout)
