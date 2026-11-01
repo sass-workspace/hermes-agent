@@ -134,6 +134,23 @@ _RE_OTP = re.compile(
 )
 
 
+# A field that says only "code"/"PIN" (Cloudflare Access: name/id "code", label "Code"), or a German
+# word for a sign-in code. "Promo code", "postal code" or "discount code" never count.
+_PLAIN_CODE_WORDS = {"code", "pin", "enter", "your", "the", "verify", "entry", "eingeben", "ihr", "dein"}
+_RE_OTP_DE = re.compile(r"\b(?:bestatigungs|sicherheits|einmal|anmelde|verifizierungs|zugangs|login)code\b")
+
+
+def _folded(value: str) -> str:
+    """Like _normalize_text, but accents are dropped instead of splitting the word (Bestätigungscode)."""
+    value = "".join(ch for ch in unicodedata.normalize("NFKD", value) if not unicodedata.combining(ch)).lower()
+    return re.sub(r"[^a-z0-9]+", " ", value).strip()
+
+
+def _says_only_code(text: str) -> bool:
+    words = {w for w in text.split() if not w.isdigit()}  # a placeholder like "000000" says nothing
+    return bool(words) and words <= _PLAIN_CODE_WORDS and bool(words & {"code", "pin"})
+
+
 def classify_otp_controls(controls: List[LoginControl]) -> List[ClassifiedLoginControl]:
     """The controls that take a second-factor code. ``autocomplete=one-time-code`` is authoritative;
     otherwise a text/tel/number input whose name/label says code/OTP/2FA/verification. Some sites split
@@ -147,8 +164,11 @@ def classify_otp_controls(controls: List[LoginControl]) -> List[ClassifiedLoginC
             continue
         if c.type not in ("text", "tel", "number", "password", ""):
             continue
-        if _RE_OTP.search(_normalize_text(" ".join(p for p in (c.name, c.label) if p))):
+        text = _normalize_text(" ".join(p for p in (c.name, c.label) if p))
+        if _RE_OTP.search(text) or _RE_OTP_DE.search(_folded(" ".join(p for p in (c.name, c.label) if p))):
             out.append(ClassifiedLoginControl(c, 70, "one-time-code"))
+        elif _says_only_code(_normalize_text(c.name)) and (not c.label or _says_only_code(_normalize_text(c.label))):
+            out.append(ClassifiedLoginControl(c, 60, "one-time-code"))
     return out
 
 
