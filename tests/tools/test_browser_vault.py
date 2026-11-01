@@ -778,6 +778,55 @@ class TestTwoFactor:
         code = re.search(r'"value": "(\d{6})"', seen["expr"]).group(1)
         assert code not in raw  # the code went to the page, not to the model
 
+    def _mail_case(self, store, monkeypatch, tmp_path, page="https://billflow.test/verify", output="482913", origin="https://billflow.test"):
+        """A headless run (no prompt), a login without a TOTP seed, the host's mail command configured."""
+        from tools import browser_vault_tool
+
+        meta = store.add_item("login", "billflow", {"identifier_type": "email", "identifier": "ms@example.com", "password": "pw"},
+                              origin=origin)
+        script = tmp_path / "mail-code"
+        script.write_text("#!/bin/sh\necho \"$@\" > " + str(tmp_path / "args") + "\necho " + output + "\n")
+        script.chmod(0o700)
+        monkeypatch.setenv("HERMES_VAULT_MAIL_CODE_COMMAND", str(script))
+        controls = [{"index": 0, "type": "text", "name": "code", "label": "Security code", "autocomplete": "one-time-code"}]
+        seen = {}
+
+        def fake_secret(task_id, expr):
+            seen["expr"] = expr
+            return {"success": True, "result": json.dumps({"filled": 1})}
+
+        with patch("agent.vault_store.get_vault_store", return_value=store), \
+             patch.object(browser_vault_tool, "_focus_bound_origin", lambda *a, **k: None), \
+             patch.object(browser_vault_tool, "_eval_js",
+                          side_effect=lambda t, e: {"success": True, "result": json.dumps(controls) if "querySelectorAll" in e else page}), \
+             patch.object(browser_vault_tool, "_eval_js_secret", side_effect=fake_secret):
+            raw = browser_vault_tool.browser_vault_enter_code(meta.id, task_id="t")
+        args = (tmp_path / "args").read_text().split() if (tmp_path / "args").exists() else []
+        return json.loads(raw), raw, seen, args
+
+    def test_a_mailed_code_is_fetched_by_the_host_command_and_never_shown(self, store, monkeypatch, tmp_path):
+        out, raw, seen, args = self._mail_case(store, monkeypatch, tmp_path)
+        assert out["success"] and out["source"] == "mail"
+        assert '"value": "482913"' in seen["expr"] and "482913" not in raw
+        assert args[:4] == ["--origin", "https://billflow.test", "--to", "ms@example.com"] and args[4] == "--since"
+
+    def test_no_mail_code_for_a_page_the_login_isnt_bound_to(self, store, monkeypatch, tmp_path):
+        out, raw, seen, args = self._mail_case(store, monkeypatch, tmp_path, page="https://evil.test/verify")
+        # Upstream now refuses a saved login's code on a foreign page before any code source runs.
+        assert not out["success"] and out["error_type"] == "origin_mismatch"
+        assert args == [] and "expr" not in seen  # the command was never asked
+
+    def test_command_output_that_isnt_a_code_is_ignored(self, store, monkeypatch, tmp_path):
+        out, raw, seen, args = self._mail_case(store, monkeypatch, tmp_path, output="'not a code; rm -rf'")
+        assert not out["success"] and "expr" not in seen
+
+    def test_without_the_command_nothing_changes(self, store, monkeypatch, tmp_path):
+        from tools import browser_vault_tool
+        monkeypatch.delenv("HERMES_VAULT_MAIL_CODE_COMMAND", raising=False)
+        meta = store.add_item("login", "x", {"identifier_type": "email", "identifier": "a@b.c", "password": "pw"},
+                              origin="https://billflow.test")
+        assert browser_vault_tool._mail_code(meta.id, store.get_meta(meta.id), "https://billflow.test", "t") is None
+
     def test_without_a_key_the_user_is_asked_and_split_boxes_get_one_digit_each(self, store):
         from agent.vault_backends import unlock as unlock_mod
         from tools import browser_vault_tool
