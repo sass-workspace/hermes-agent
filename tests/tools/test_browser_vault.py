@@ -820,6 +820,7 @@ class TestTwoFactor:
     def test_command_output_that_isnt_a_code_is_ignored(self, store, monkeypatch, tmp_path):
         out, raw, seen, args = self._mail_case(store, monkeypatch, tmp_path, output="'not a code; rm -rf'")
         assert not out["success"] and "expr" not in seen
+        assert out["error_type"] == "no_mail_code" and "Resend" in out["error"]
 
     def test_a_code_only_login_needs_the_flag_and_has_no_password(self, store):
         with pytest.raises(VaultError):
