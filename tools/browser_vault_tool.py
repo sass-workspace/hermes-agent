@@ -331,6 +331,8 @@ _TAB_PROBES["otp"] = ("!!document.querySelector('input[autocomplete=one-time-cod
 # When a login was last filled, per task and handle: a mailed code must have arrived after it.
 _LAST_FILL: Dict[Tuple[str, str], float] = {}
 _MAIL_CODE = re.compile(r"[A-Za-z0-9]{4,10}")
+# The host's mail command answered without a code for this task and handle (no new mail).
+_MAIL_MISSED: set = set()
 
 
 def _mail_code(handle: str, meta: Any, origin: str, task_id: str) -> Optional[str]:
@@ -359,7 +361,9 @@ def _mail_code(handle: str, meta: Any, origin: str, task_id: str) -> Optional[st
         return None
     code = (done.stdout or "").strip()
     if done.returncode != 0 or not _MAIL_CODE.fullmatch(code):
+        _MAIL_MISSED.add((task_id, handle))
         return None
+    _MAIL_MISSED.discard((task_id, handle))
     return code
 
 
@@ -409,6 +413,11 @@ def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None) ->
             code = _mail_code(handle, meta, origin, effective_task_id)
             if code:
                 source = "mail"
+    if not code and (effective_task_id, handle) in _MAIL_MISSED and not can_prompt_here():
+        return json.dumps({"success": False, "error_type": "no_mail_code",
+                           "error": (f"No new code mail from {site} arrived within 2 minutes of this sign-in. If the page "
+                                     "offers to send the code again (Resend), press it once, then call "
+                                     "browser_vault_enter_code again with the same handle. Don't retry more than twice.")})
     if not code:
         prompt = get_code_prompt_callback()
         if prompt is None or not can_prompt_here():
