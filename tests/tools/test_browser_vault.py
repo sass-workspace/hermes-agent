@@ -845,6 +845,20 @@ class TestTwoFactor:
         assert ("t9", meta.id) in browser_vault_tool._LAST_FILL
         assert any(i.get("sign_in", "").startswith("code") for i in listed["items"])
 
+    def test_a_field_that_says_only_code_is_a_code_field_but_promo_and_postal_are_not(self):
+        from agent.vault_login_classifier import LoginControl, classify_otp_controls
+
+        def is_code(**kw):
+            base = {"index": 0, "type": "text", "name": "", "label": "", "autocomplete": ""}
+            return bool(classify_otp_controls([LoginControl.from_dict({**base, **kw})]))
+        assert is_code(name="code code", label="Code   000000 ", autocomplete="off")  # Cloudflare Access (label + placeholder)
+        assert is_code(name="x", label="Bestätigungscode")
+        assert is_code(name="pin", label="")
+        assert not is_code(name="promo_code", label="Promo code")
+        assert not is_code(name="postal_code", label="Postal code")
+        assert not is_code(name="code", label="Discount code")
+        assert not is_code(name="code", label="Code", type="email")
+
     def test_without_the_command_nothing_changes(self, store, monkeypatch, tmp_path):
         from tools import browser_vault_tool
         monkeypatch.delenv("HERMES_VAULT_MAIL_CODE_COMMAND", raising=False)
