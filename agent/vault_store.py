@@ -182,6 +182,7 @@ class VaultItemMeta:
     identifier_type: Optional[str] = None
     identifier: Optional[str] = None
     has_otp: bool = False  # a TOTP seed is stored: 2FA codes can be minted without asking the user
+    code_only: bool = False  # no password: the site signs in with the identifier plus a one-time code
     # Every origin the password manager bound to this item (manager backends only;
     # ``origin`` is the first/primary one). Fill matching stays exact-origin against
     # this list — no wildcard or subdomain inference is ever derived from it.
@@ -200,6 +201,8 @@ class VaultItemMeta:
             out["identifier_type"] = self.identifier_type
         if self.has_otp:
             out["has_otp"] = True
+        if self.code_only:
+            out["code_only"] = True
         if len(self.allowed_origins) > 1:
             out["allowed_origins"] = list(self.allowed_origins)
         return out
@@ -579,13 +582,15 @@ class VaultStore:
                     f"identifier_type must be one of {LOGIN_IDENTIFIER_TYPES}"
                 )
             identifier = str(secret.pop("identifier", "") or "").strip()
-            if not identifier or not secret.get("password"):
-                raise VaultError("login items require identifier and password")
+            code_only = secret.pop("code_only", False) is True and not secret.get("password")
+            if not identifier or not (secret.get("password") or code_only):
+                raise VaultError("login items require identifier and password (or code_only for code sign-ins)")
             identifier_type = str(id_type)
             # Login secret payload is password (+ optional TOTP seed); identifier lives in
             # metadata and any stray origin echo is dropped.
             otp_secret = normalize_otp_secret(str(secret.get("otp_secret") or ""))
-            secret = {"password": secret["password"], **({"otp_secret": otp_secret} if otp_secret else {})}
+            secret = ({"code_only": True} if code_only else {"password": secret["password"]}) \
+                | ({"otp_secret": otp_secret} if otp_secret else {})
         else:
             allowed = PAYMENT_FIELDS if kind == "payment" else ADDRESS_FIELDS
             secret = {k: str(v) for k, v in secret.items() if k in allowed and str(v or "").strip()}
@@ -664,6 +669,7 @@ class VaultStore:
             identifier_type=rec.get("identifier_type") if identifier else None,
             identifier=identifier or None,
             has_otp=bool((rec.get("secret") or {}).get("otp_secret")),
+            code_only=bool((rec.get("secret") or {}).get("code_only")),
         )
 
 

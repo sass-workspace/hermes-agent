@@ -809,6 +809,7 @@ class TestTwoFactor:
         assert out["success"] and out["source"] == "mail"
         assert '"value": "482913"' in seen["expr"] and "482913" not in raw
         assert args[:4] == ["--origin", "https://billflow.test", "--to", "ms@example.com"] and args[4] == "--since"
+        assert args[6] == "--profile"  # the host decides per bot whether it may get emailed codes
 
     def test_no_mail_code_for_a_page_the_login_isnt_bound_to(self, store, monkeypatch, tmp_path):
         out, raw, seen, args = self._mail_case(store, monkeypatch, tmp_path, page="https://evil.test/verify")
@@ -819,6 +820,30 @@ class TestTwoFactor:
     def test_command_output_that_isnt_a_code_is_ignored(self, store, monkeypatch, tmp_path):
         out, raw, seen, args = self._mail_case(store, monkeypatch, tmp_path, output="'not a code; rm -rf'")
         assert not out["success"] and "expr" not in seen
+
+    def test_a_code_only_login_needs_the_flag_and_has_no_password(self, store):
+        with pytest.raises(VaultError):
+            store.add_item("login", "x", {"identifier_type": "email", "identifier": "a@b.c"}, origin="https://a.test")
+        meta = store.add_item("login", "access", {"identifier_type": "email", "identifier": "ms@example.com", "code_only": True},
+                              origin="https://team.cloudflareaccess.com")
+        assert store.get_meta(meta.id).code_only and store.get_meta(meta.id).to_dict()["code_only"] is True
+        assert "password" not in store.resolve_secret(meta.id)
+        both = store.add_item("login", "pw", {"identifier_type": "email", "identifier": "a@b.c", "password": "pw",
+                                              "code_only": True}, origin="https://a.test")
+        assert not store.get_meta(both.id).code_only, "a password wins"
+
+    def test_filling_a_code_only_login_says_what_to_do_and_starts_the_mail_window(self, store):
+        from tools import browser_vault_tool
+        meta = store.add_item("login", "access", {"identifier_type": "email", "identifier": "ms@example.com", "code_only": True},
+                              origin="https://team.cloudflareaccess.com")
+        with patch("agent.vault_store.get_vault_store", return_value=store), \
+             patch.object(browser_vault_tool, "_focus_bound_origin", lambda *a, **k: "https://team.cloudflareaccess.com"), \
+             patch.object(browser_vault_tool, "_eval_js_secret", side_effect=AssertionError("nothing may be filled")):
+            out = json.loads(browser_vault_tool.browser_vault_fill(meta.id, task_id="t9"))
+            listed = json.loads(browser_vault_tool.browser_vault_list())
+        assert out["success"] and out["code_only"] and "action=enter_code" in out["next"]
+        assert ("t9", meta.id) in browser_vault_tool._LAST_FILL
+        assert any(i.get("sign_in", "").startswith("code") for i in listed["items"])
 
     def test_without_the_command_nothing_changes(self, store, monkeypatch, tmp_path):
         from tools import browser_vault_tool

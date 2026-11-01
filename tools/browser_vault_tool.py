@@ -297,6 +297,9 @@ def browser_vault_list() -> str:
             if meta.identifier:
                 entry["identifier"] = meta.identifier
                 entry["identifier_type"] = meta.identifier_type
+            if getattr(meta, "code_only", False):
+                entry["sign_in"] = ("code: no password. Type the identifier, ask the site to send a code, then call "
+                                    "browser_vault action=enter_code with this handle")
             items.append(entry)
     out: dict[str, Any] = {"success": True, "items": items}
     if not items:
@@ -411,7 +414,13 @@ def _mail_code(handle: str, meta: Any, origin: str, task_id: str) -> Optional[st
         return None
     since = _LAST_FILL.get((task_id, handle), time.time() - 600) - 30
     try:
-        done = subprocess.run([command, "--origin", origin, "--to", str(meta.identifier or ""), "--since", str(int(since))],
+        from hermes_cli.profiles import get_active_profile_name
+        profile = get_active_profile_name()
+    except Exception:
+        profile = ""
+    try:
+        done = subprocess.run([command, "--origin", origin, "--to", str(meta.identifier or ""), "--since", str(int(since)),
+                               "--profile", profile],
                               capture_output=True, text=True, timeout=150, stdin=subprocess.DEVNULL)
     except (OSError, subprocess.TimeoutExpired):
         logger.warning("vault: the mail code command didn't answer")
@@ -578,6 +587,14 @@ def _fill_bound_page(backend: Any, handle: str, meta: Any, page_origin: str, eff
     )
     from agent.vault_backends import UnlockRequired
     from agent.vault_store import ADDRESS_FIELDS, PAYMENT_FIELDS, scrub_secret_from_text
+
+    if meta.kind == "login" and getattr(meta, "code_only", False):
+        # Nothing to fill: the site signs in with a code. Mail that arrives from now on counts.
+        _LAST_FILL[(effective_task_id, handle)] = time.time()
+        return json.dumps({"success": True, "filled_fields": 0, "backend": backend.name, "kind": "login",
+                           "origin": page_origin, "code_only": True,
+                           "next": (f"This login has no password. Type {meta.identifier!r} into the email field yourself, "
+                                    "press the button that sends a code, then call browser_vault action=enter_code with this handle.")})
 
     # ── Inspect + classify page controls ────────────────────────────────────
     nonce = secrets.token_hex(8)  # binds this fill to THIS inspection's stamps
