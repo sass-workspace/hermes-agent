@@ -27,9 +27,13 @@ autofill (kernel-login-autofill.ts / fill_from_vault.ts).
 from __future__ import annotations
 
 import json
+import os
+import re
 import secrets
 import logging
-from typing import Any, Dict, Optional
+import subprocess
+import time
+from typing import Any, Dict, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -321,6 +325,35 @@ _TAB_PROBES["otp"] = ("!!document.querySelector('input[autocomplete=one-time-cod
                       "input[id*=otp i], input[id*=code i], input[name*=totp i], input[aria-label*=code i]')")
 
 
+# When a login was last filled, per task and handle: a mailed code must have arrived after it.
+_LAST_FILL: Dict[Tuple[str, str], float] = {}
+_MAIL_CODE = re.compile(r"[A-Za-z0-9]{4,10}")
+
+
+def _mail_code(handle: str, meta: Any, origin: str, task_id: str) -> Optional[str]:
+    """A code the site emailed, fetched by the host's own command (``HERMES_VAULT_MAIL_CODE_COMMAND``,
+    e.g. Iris' ``iris-mail-code``). Only for a login bound to exactly this origin, only mail that
+    arrived after this login was filled (else the last 10 minutes), only the login's own address.
+    The command runs on the host, not in the agent's terminal; the code never enters the conversation."""
+    command = os.environ.get("HERMES_VAULT_MAIL_CODE_COMMAND", "").strip()
+    if not command or meta is None or getattr(meta, "kind", "") != "login":
+        return None
+    allowed = list(getattr(meta, "allowed_origins", ()) or ()) or ([str(meta.origin)] if meta.origin else [])
+    if origin not in allowed:
+        return None
+    since = _LAST_FILL.get((task_id, handle), time.time() - 600) - 30
+    try:
+        done = subprocess.run([command, "--origin", origin, "--to", str(meta.identifier or ""), "--since", str(int(since))],
+                              capture_output=True, text=True, timeout=150, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.TimeoutExpired):
+        logger.warning("vault: the mail code command didn't answer")
+        return None
+    code = (done.stdout or "").strip()
+    if done.returncode != 0 or not _MAIL_CODE.fullmatch(code):
+        return None
+    return code
+
+
 def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None) -> str:
     """Second factor: fill the one-time code the CURRENT page asks for. If the saved login (``handle``) has an
     authenticator seed, the code is minted server-side and nobody is asked; otherwise the user is prompted on
@@ -359,12 +392,22 @@ def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None) ->
             code = None
         if code:
             source = backend.name
+        if not code:
+            try:
+                meta = backend.get_meta(handle)
+            except Exception:
+                meta = None
+            code = _mail_code(handle, meta, origin, effective_task_id)
+            if code:
+                source = "mail"
     if not code:
         prompt = get_code_prompt_callback()
         if prompt is None or not can_prompt_here():
             return json.dumps({"success": False, "error_type": "prompt_unavailable",
                                "error": (f"{site} asks for a one-time code and this session cannot ask the user (headless/cron/API). "
-                                         "Save an authenticator key for this login so codes can be generated automatically.")})
+                                         "Save an authenticator key for this login so codes can be generated automatically; "
+                                         "a code sent by email is read automatically only when the host is set up for it and "
+                                         "the mail arrived after the login was filled.")})
         code = (prompt(site, "") or "").strip().replace(" ", "").replace("-", "")
         if not code:
             return json.dumps({"success": False, "error_type": "code_declined",
@@ -550,6 +593,8 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
 
     out = {"success": bool(filled), "filled_fields": int(filled), "backend": backend.name,
            "kind": meta.kind, "origin": page_origin}
+    if filled and meta.kind == "login":
+        _LAST_FILL[(effective_task_id, handle)] = time.time()
     if meta.kind == "login":
         out["next"] = ("Submit. If the site then asks for a verification code, call browser_vault_enter_code with this handle"
                        + (" (a code will be generated automatically)." if meta.has_otp else "."))
@@ -654,7 +699,7 @@ BROWSER_VAULT_ENTER_CODE_SCHEMA = {
     "name": "browser_vault_enter_code",
     "description": (
         "The page asks for a one-time / verification / 2FA code after the password: call this. If the saved login "
-        "has an authenticator key the code is generated and entered with no questions; otherwise the user is asked "
+        "has an authenticator key the code is generated and entered with no questions; a code the site emails is read from the mailbox automatically when the host is set up for it; otherwise the user is asked "
         "for the code in their UI (they read it from their phone, email or authenticator app). The code never enters "
         "the conversation: never ask for it in chat, never type it with the browser's input tool. no_code_field means "
         "the site wants a passkey/hardware key/app approval: tell the user to complete it on their device, then wait "
