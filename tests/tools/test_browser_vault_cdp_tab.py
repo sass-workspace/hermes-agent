@@ -15,6 +15,8 @@ from __future__ import annotations
 import json
 import logging
 import re
+import shutil
+import subprocess
 from unittest.mock import patch
 
 import pytest
@@ -45,10 +47,14 @@ class _FakeChrome:
         self.calls: list[tuple[str, str | None]] = []
         self.on_eval = None
         self.raise_on_fill: Exception | None = None
+        self.loggers: list = []
+        self.calls_from_browser_cdp = False
 
-    async def call(self, ws_url, method, params, target_id, timeout):
+    async def call(self, ws_url, method, params, target_id, timeout, ws_logger=None):
         assert ws_url == _ENDPOINT
         self.calls.append((method, target_id))
+        if method in ("Target.getTargets", "Runtime.evaluate") and not self.calls_from_browser_cdp:
+            self.loggers.append(ws_logger)
         if method == "Target.getTargets":
             return {"targetInfos": [{"targetId": tid, "type": "page", "url": tab.url} for tid, tab in self.tabs.items()]
                     + [{"targetId": "sw", "type": "service_worker", "url": "https://bank.example/sw.js"}]}
@@ -166,8 +172,51 @@ class TestTheTab:
             assert last_used_target("t", _ENDPOINT) == "T2"
             assert last_used_target("other-task", _ENDPOINT) is None
             assert last_used_target("t", "ws://127.0.0.1:9333/devtools/browser/other") is None
-            json.loads(browser_cdp("Target.closeTarget", {"targetId": "T2"}, task_id="t"))
-            assert last_used_target("t", _ENDPOINT) is None
+
+    def test_a_closed_last_used_tab_is_refused_not_replaced(self, vault):
+        """The task's tab closed and one web page is left: that page was never chosen, so no fill."""
+        from tools.browser_cdp_tool import browser_cdp
+
+        store, backend = vault
+        meta = _login(store)
+        fake = _FakeChrome(T1=_Tab("https://bank.example/login", _LOGIN_CONTROLS),
+                           T2=_Tab("https://bank.example/login", _LOGIN_CONTROLS))
+        with _chrome(fake), patch("tools.browser_cdp_tool._resolve_cdp_endpoint", return_value=_ENDPOINT):
+            _use("T1")
+            json.loads(browser_cdp("Target.closeTarget", {"targetId": "T1"}, task_id="t"))
+            out, _ = _fill(meta.id)
+        assert out["error_type"] == "tab_ambiguous" and "closed" in out["error"]
+        assert backend.resolved == [] and fake.writes() == {}
+
+    def test_a_record_from_another_browser_is_refused(self, vault):
+        """Chrome restarted (new endpoint): the old record names no tab here, and nothing replaces it."""
+        from tools import browser_cdp_tool
+
+        store, backend = vault
+        meta = _login(store)
+        fake = _FakeChrome(T1=_Tab("https://bank.example/login", _LOGIN_CONTROLS))
+        browser_cdp_tool._note_used_target("t", "ws://127.0.0.1:9222/devtools/browser/before-restart",
+                                           "Runtime.evaluate", {}, "T1", {})
+        with _chrome(fake):
+            out, _ = _fill(meta.id)
+        assert out["error_type"] == "tab_ambiguous" and fake.writes() == {} and backend.resolved == []
+
+    def test_a_supervisor_appearing_mid_action_doesnt_move_the_fill(self, vault):
+        """The action started on the pinned CDP tab; a supervisor started meanwhile isn't used."""
+        from tools.browser_supervisor import SUPERVISOR_REGISTRY
+
+        store, _ = vault
+        meta = _login(store)
+        fake = _FakeChrome(T1=_Tab("https://bank.example/login", _LOGIN_CONTROLS))
+        other = TestBrowserExecPathUnchanged._Supervisor("https://bank.example/login", _LOGIN_CONTROLS)
+        seen = {"n": 0}
+
+        def appears(task_id):
+            seen["n"] += 1
+            return None if seen["n"] == 1 else other
+        with _chrome(fake), patch.object(SUPERVISOR_REGISTRY, "get", side_effect=appears):
+            out, _ = _fill(meta.id)
+        assert out["success"] is True and list(fake.writes()) == ["T1"] and other.writes == []
 
     def test_the_tab_is_picked_once_per_action(self, vault):
         """browser_cdp in a parallel call moving the record mid-fill doesn't move the fill."""
@@ -185,6 +234,27 @@ class TestTheTab:
         assert list(fake.writes()) == ["T1"]
         assert set(fake.evaluated_targets()) == {"T1"}
         assert [m for m, _ in fake.calls].count("Target.getTargets") == 1
+
+
+    def test_a_refusal_holds_even_if_a_supervisor_appears_mid_action(self, vault):
+        """The pick refused (the task's tab closed); a supervisor started meanwhile doesn't get the fill."""
+        from tools import browser_cdp_tool
+        from tools.browser_supervisor import SUPERVISOR_REGISTRY
+
+        store, backend = vault
+        meta = _login(store)
+        fake = _FakeChrome(T2=_Tab("https://bank.example/login", _LOGIN_CONTROLS))
+        browser_cdp_tool._note_used_target("t", _ENDPOINT, "Runtime.evaluate", {}, "T1-closed", {})
+        other = TestBrowserExecPathUnchanged._Supervisor("https://bank.example/login", _LOGIN_CONTROLS)
+        seen = {"n": 0}
+
+        def appears(task_id):
+            seen["n"] += 1
+            return None if seen["n"] == 1 else other
+        with _chrome(fake), patch.object(SUPERVISOR_REGISTRY, "get", side_effect=appears):
+            out, _ = _fill(meta.id)
+        assert out["error_type"] == "tab_ambiguous" and "closed" in out["error"]
+        assert other.writes == [] and fake.writes() == {} and backend.resolved == []
 
 
 class TestOriginBinding:
@@ -284,10 +354,44 @@ class TestNoSecretInOutput:
         assert out["success"] is False and "could not run" in out["error"]
         assert _PASSWORD not in raw and _PASSWORD not in caplog.text
 
+    def test_vault_frames_go_through_a_disabled_logger(self, vault):
+        from tools import browser_vault_tool
+
+        store, _ = vault
+        meta = _login(store)
+        fake = _FakeChrome(T1=_Tab("https://bank.example/login", _LOGIN_CONTROLS))
+        with _chrome(fake):
+            _fill(meta.id)
+        assert fake.loggers and all(lg is browser_vault_tool._WS_LOGGER for lg in fake.loggers)
+        assert browser_vault_tool._WS_LOGGER.disabled and not browser_vault_tool._WS_LOGGER.propagate
+
+    @pytest.mark.skipif(shutil.which("node") is None, reason="needs node to run the fill script")
+    def test_page_code_cannot_read_the_fill_script_through_caller(self, tmp_path):
+        """A page that replaced JSON.stringify / querySelectorAll reads ``fn.caller``: the fill script is
+        strict and its refusal calls nothing, so the source with the value never reaches page code."""
+        from agent.vault_login_classifier import build_fill_js
+
+        js = build_fill_js([{"index": 1, "token": "current-password", "value": _PASSWORD}],
+                           expected_origin="https://bank.example", nonce="n")
+        (tmp_path / "fill.js").write_text(js)
+        (tmp_path / "page.js").write_text(
+            "const src = require('fs').readFileSync(process.argv[2], 'utf8'); let leaked = '';\n"
+            "const spy = function () { try { leaked += String(spy.caller || ''); } catch (e) {} return '{}'; };\n"
+            "globalThis.JSON = { stringify: spy, parse: JSON.parse };\n"
+            "globalThis.window = { location: { origin: process.argv[3] } };\n"
+            "const qsa = function () { try { leaked += String(qsa.caller || ''); } catch (e) {} return []; };\n"
+            "globalThis.document = { querySelectorAll: qsa };\n"
+            "const out = eval(src); process.stdout.write(JSON.parse(out) && leaked);\n")
+        for origin in ("https://evil.example", "https://bank.example"):
+            done = subprocess.run(["node", str(tmp_path / "page.js"), str(tmp_path / "fill.js"), origin],
+                                  capture_output=True, text=True, timeout=30)
+            assert done.returncode == 0, done.stderr[-300:]
+            assert _PASSWORD not in done.stdout
+
     def test_a_page_exception_returns_fixed_text(self, vault):
         from tools import browser_vault_tool
 
-        async def throws(ws_url, method, params, target_id, timeout):
+        async def throws(ws_url, method, params, target_id, timeout, ws_logger=None):
             return {"result": {"type": "object"},
                     "exceptionDetails": {"text": "Uncaught", "exception": {"description": _PASSWORD}}}
         tab = browser_vault_tool._CdpTab(_ENDPOINT, "T1")
