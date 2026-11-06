@@ -2709,9 +2709,14 @@ class SlackAdapter(BasePlatformAdapter):
         if stream is None:
             return SendResult(success=True)  # nothing open — no-op
         # Only the abandoning consumer's OWN stream: a superseded turn's consumer can wake up
-        # after the replacement turn opened a stream in the same thread. The stream is ours
-        # when what it shows is what we sent (``content`` is the consumer's visible text).
-        if self._stream_relation(stream.get("sent", ""), content or "")[0] == "unrelated":
+        # after the replacement turn opened a stream in the same thread. Ownership is the draft id
+        # the consumer opened it with; without one (an older caller) the stream is ours only when
+        # what it shows is what we sent (``content`` is the consumer's visible text).
+        owner = (metadata or {}).get("_abandon_draft_id")
+        if owner is not None:
+            if stream.get("draft_id") != owner:
+                return SendResult(success=True)  # another turn's stream — never touch it
+        elif self._stream_relation(stream.get("sent", ""), content or "")[0] == "unrelated":
             return SendResult(success=True)  # another turn's stream — never touch it
         # get-check-pop without an await in between: finalization or a replacement
         # send_draft that popped it first wins, and we never seal twice.

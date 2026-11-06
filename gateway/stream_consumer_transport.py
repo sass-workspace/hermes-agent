@@ -208,9 +208,11 @@ class StreamTransportMixin:
         if getattr(type(self.adapter), "abandon_open_draft", None) is None:
             return
         try:
+            # ``_abandon_draft_id``: the consumer's own (process-unique) draft id, so an adapter can
+            # seal only a stream it opened, never a replacement turn's (Iris fork).
             await self.adapter.abandon_open_draft(
                 self.chat_id, self._last_sent_text or self._clean_for_display(self._accumulated),
-                metadata=self._draft_metadata())
+                metadata={**(self._draft_metadata() or {}), "_abandon_draft_id": self._draft_id})
         except Exception as e:
             logger.debug("abandon_open_draft failed (best-effort): %s", e)
 
