@@ -1451,25 +1451,23 @@ def _with_clarify_id(prompt: dict[str, Any]) -> dict[str, Any]:
 
 
 def _legacy_approval_body(self, run_id, body):
-    """``{choice}`` or ``{choice, request_id}`` (the fork's /approval body) ->
-    ``{request_id, execution_generation, choice}``. Without a request id it names the run's one
-    pending approval; with none or several pending the body passes on unchanged and the authority
-    refuses it (never a guess between two approvals)."""
-    if not (isinstance(body, dict) and 'choice' in body and set(body) <= {'choice', 'request_id'}):
+    """``{choice, request_id}`` (the fork's /approval body) -> ``{request_id, execution_generation,
+    choice}`` with the run's admission generation (the one ``respond_run`` checks; the authority then
+    checks it against the live execution). An approval WITHOUT a request id is never guessed: a
+    delayed answer to approval A must not approve a later B, so such a body passes on unchanged and
+    is refused. No pending-control projection is read here (its snapshot prunes other generations)."""
+    if not (isinstance(body, dict) and set(body) == {'choice', 'request_id'}):
         return body
-    from gateway.platforms.api_server_authority_runs import run_projection
-    projected = run_projection(self, run_id)
-    if projected is None:
+    request_id = body.get('request_id')
+    if not isinstance(request_id, str) or not request_id:
+        return body
+    from gateway.platforms.api_server_authority_runs import run_admission
+    owned = run_admission(self, run_id)
+    if owned is None:
         return body
     choice = str(body.get('choice') or '').strip().lower()
     choice = _APPROVAL_CHOICE_ALIASES.get(choice, choice)
-    request_id = body.get('request_id')
-    if not request_id:
-        waiting = [p for p in projected['pending_controls'] if p.get('kind') == 'approval']
-        if len(waiting) != 1:
-            return body
-        request_id = waiting[0].get('prompt_id')
-    return {'request_id': request_id, 'execution_generation': projected['execution_generation'], 'choice': choice}
+    return {'request_id': request_id, 'execution_generation': owned[1]['generation'], 'choice': choice}
 
 
 def _legacy_clarify_body(self, run_id, body):
