@@ -86,15 +86,24 @@ def run_projection(adapter, run_id):
             # so polling must not report `completed` for the same receipt.
             from gateway.platforms.api_server_runs import terminal_run_status
             status = terminal_run_status(result)[0]
-    pending = []
+    pending, clarify = [], None
     live = authority.sessions.get(row['target_session_id'])
     if live is not None and row['status'] == 'started':
         pending = list(live.controls.snapshot(row['target_session_id'], row['generation']))
         if any(prompt.get('kind') == 'approval' for prompt in pending):
             status = 'waiting_for_approval'  # the documented run state main's run store reports
+        else:
+            # Downstream (Iris): a run waiting on a question reports the fork's clarify contract —
+            # ``waiting_for_input`` plus the question under ``clarify`` (api_server_runs helpers).
+            asked = next((prompt for prompt in pending if prompt.get('kind') == 'clarify'), None)
+            if asked is not None:
+                status = 'waiting_for_input'
+                clarify = {'clarify_id': asked.get('prompt_id'), 'question': asked.get('question'),
+                           'choices': asked.get('choices') or [], 'multi_select': bool(asked.get('multi_select'))}
     return {'pending_controls': pending, 'run_id': run_id, 'status': status, 'session_id': row['target_session_id'],
             'admission_id': row['admission_id'], 'execution_generation': row['generation'],
-            'output': result.get('final_response', ''), 'usage': saved.get('usage', {}) if saved else {}}
+            'output': result.get('final_response', ''), 'usage': saved.get('usage', {}) if saved else {},
+            **({'clarify': clarify} if clarify is not None else {})}
 
 
 async def send_clarify(adapter, *, chat_id, **kwargs):

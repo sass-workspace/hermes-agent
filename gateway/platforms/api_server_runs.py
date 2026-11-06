@@ -867,6 +867,7 @@ async def _handle_runs(self, request: web.Request, *, _api_server) -> web.Respon
         agent_kwargs=dict(
             ephemeral_system_prompt=instructions, session_id=session_id, gateway_session_key=gateway_session_key,
             route=route, room_dispatch=room_dispatch, room_execution_policy=room_execution_policy,
+            clarify=body.get("clarify") is True and room_dispatch is None,
             **{k: agent_overrides.get(k) for k in ("requested_model", "requested_provider", "model_options")}),
         request_profile=_api_server._api_request_profile.get(),
         turn_author=turn_author, walked_from=walked_from if session_id == stored_session_id else None)
@@ -1112,7 +1113,8 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
                 # Same authority prompt the WS viewer and GET pending_controls expose, on the
                 # run's own stream so a streaming-only client learns it must respond.
                 with suppress(Exception):
-                    loop.call_soon_threadsafe(run.put_event, _run_event(run_id, event_type, **prompt))
+                    loop.call_soon_threadsafe(
+                        run.put_event, _run_event(run_id, event_type, **_with_clarify_id(prompt)))
 
             def _tool_start(call_id, name, args):
                 from agent.display import build_tool_preview
@@ -1426,7 +1428,33 @@ async def _handle_run_clarify(self, request, *, _api_server):
     body, err = await self._read_json_body(request)
     if err is not None:
         return err
+    body = await asyncio.to_thread(_legacy_clarify_body, self, run_id, body)
     return await _respond_authority_run(self, run_id, body, kind='clarify', _api_server=_api_server)
+
+
+# ── Downstream (Iris) wire contract for clarify on /v1/runs ────────────────────────────────────
+# The Iris Mac app and the Iris bot host's task runner speak the contract of the fork's own
+# clarify bridge (2e15020ced/32ee8e9a50): events and run status name the question ``clarify_id``,
+# a waiting run reports ``waiting_for_input`` with a ``clarify`` object, and an answer is
+# ``{clarify_id, answer}``. Upstream now asks through the session authority (``prompt_id``,
+# ``pending_controls``, ``{request_id, execution_generation, answer}``); these helpers map the
+# old shape onto it and change nothing for a client that already speaks upstream's.
+
+def _with_clarify_id(prompt: dict[str, Any]) -> dict[str, Any]:
+    if prompt.get('kind') == 'clarify' and prompt.get('prompt_id') and 'clarify_id' not in prompt:
+        return {**prompt, 'clarify_id': prompt['prompt_id']}
+    return prompt
+
+
+def _legacy_clarify_body(self, run_id, body):
+    """``{clarify_id, answer}`` -> ``{request_id, execution_generation, answer}`` (the run's
+    current generation; a stale id is still refused by the authority as not pending)."""
+    if not (isinstance(body, dict) and set(body) == {'clarify_id', 'answer'}):
+        return body
+    from gateway.platforms.api_server_authority_runs import run_admission
+    owned = run_admission(self, run_id)
+    generation = owned[1]['generation'] if owned is not None else None
+    return {'request_id': body['clarify_id'], 'execution_generation': generation, 'answer': body['answer']}
 
 
 def _steer_refused(_openai_error, run_id):
