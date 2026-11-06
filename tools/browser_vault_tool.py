@@ -29,6 +29,8 @@ autofill (kernel-login-autofill.ts / fill_from_vault.ts).
 
 from __future__ import annotations
 
+import contextvars
+import functools
 import json
 import os
 import re
@@ -119,7 +121,7 @@ def _ensure_supervisor(task_id: str):
 
     cdp_url = str(session_for_task(task_id).get("cdp_url") or "")
     if not cdp_url:
-        return None
+        return _cdp_tab(task_id)  # Iris fork: no browser_exec session; None unless browser.cdp_url is set
     policy, timeout_s = get_dialog_policy_config()
     try:
         return SUPERVISOR_REGISTRY.get_or_start(task_id=task_id, cdp_url=resolve_cdp_override(cdp_url),
@@ -127,6 +129,107 @@ def _ensure_supervisor(task_id: str):
     except Exception as exc:  # health: allow BLE001 -- a failed attach is reported as supervisor_required
         logger.debug("vault fill: supervisor attach to the task's session failed (%s)", exc)
         return None
+
+
+# ---------------------------------------------------------------------------
+# Iris fork: the vault on a browser_cdp tab when no browser_exec session exists
+# ---------------------------------------------------------------------------
+# Bots run with the ``browser-use`` toolset disabled (browser_exec would run model-written Python as the
+# gateway's user), so no browser_exec session or supervisor exists for their tasks; they browse their own
+# Chrome with browser_cdp (the profile's CDP endpoint). Then the vault works on exactly one tab: the one
+# this task last drove through browser_cdp, else the only web page open; anything else is refused.
+# Each vault action pins that tab once (``_PINNED``), so the origin check, the inspection and the write
+# all hit the same target. Evaluation runs over the CDP WebSocket (never argv), and no browser or
+# exception text is returned: the script may carry the secret.
+
+_PINNED: contextvars.ContextVar[Optional[dict]] = contextvars.ContextVar("browser_vault_cdp_tab", default=None)
+_TAB_FAILED = "The vault script could not run in the browser tab"
+
+
+class _CdpTab:
+    """One page target on the profile's CDP endpoint, with the supervisor surface the vault uses."""
+
+    def __init__(self, endpoint: str = "", target_id: str = "", refusal: str = ""):
+        self.endpoint, self.target_id, self.refusal = endpoint, target_id, refusal
+
+    def focus_page(self, origin: str, *, accept: Optional[str] = None, timeout: float = 10.0) -> dict[str, Any]:
+        # Never move to another tab: the pinned one is the only candidate.
+        return {"ok": False, "error": "the vault stays on the tab browser_cdp last used"}
+
+    def evaluate_runtime(self, expression: str, *, timeout: float = 10.0) -> dict[str, Any]:
+        if self.refusal:
+            return {"ok": False, "error": self.refusal}
+        from tools.browser_cdp_tool import _cdp_call, _run_async
+        params = {"expression": expression, "returnByValue": True, "awaitPromise": True, "userGesture": True}
+        try:
+            reply = _run_async(_cdp_call(self.endpoint, "Runtime.evaluate", params, self.target_id, timeout))
+        except Exception as exc:  # health: allow BLE001 -- fixed text: the error may quote the script
+            logger.debug("vault: CDP evaluate on the pinned tab failed (%s)", type(exc).__name__)
+            return {"ok": False, "error": _TAB_FAILED}
+        if not isinstance(reply, dict) or reply.get("exceptionDetails"):
+            return {"ok": False, "error": _TAB_FAILED}
+        value = (reply.get("result") or {}).get("value")
+        return {"ok": True, "result": value}
+
+
+def _pick_cdp_tab(task_id: str) -> Optional[_CdpTab]:
+    """The tab the vault may work on, a refusal when that is ambiguous, or None without a CDP endpoint."""
+    from tools.browser_cdp_tool import _cdp_call, _run_async, last_used_target
+    from tools.browser_session_cdp import get_cdp_override
+
+    endpoint = (get_cdp_override() or "").strip()
+    if not endpoint.startswith(("ws://", "wss://")):
+        return None
+    try:
+        infos = _run_async(_cdp_call(endpoint, "Target.getTargets", {}, None, 5.0)).get("targetInfos") or []
+    except Exception as exc:  # health: allow BLE001 -- an unreadable browser is a refusal
+        logger.debug("vault: reading the CDP targets failed (%s)", type(exc).__name__)
+        return _CdpTab(refusal="Could not read the browser's tabs over CDP; check that the browser is running.")
+    pages = [t for t in infos if t.get("type") == "page"]
+    last = last_used_target(task_id, endpoint)
+    if last and any(t.get("targetId") == last for t in pages):
+        return _CdpTab(endpoint, last)
+    web = [t for t in pages if str(t.get("url") or "").startswith(("http://", "https://"))]
+    if len(web) == 1:
+        return _CdpTab(endpoint, str(web[0]["targetId"]))
+    if not web:
+        return _CdpTab(refusal="No web page is open in the browser. Open the login page with browser_cdp first.")
+    return _CdpTab(refusal=(f"{len(web)} tabs are open and browser_cdp hasn't worked in one of them in this task, "
+                            "so the vault won't pick one. Use browser_cdp with the login tab's target_id (for "
+                            "example Runtime.evaluate of location.href), or close the other tabs, then retry."))
+
+
+def _cdp_tab(task_id: str) -> Optional[_CdpTab]:
+    """The pinned tab of the current vault action (picked on first use), or a fresh pick outside one."""
+    pinned = _PINNED.get()
+    if pinned is None:
+        return _pick_cdp_tab(task_id)
+    if task_id not in pinned:
+        pinned[task_id] = _pick_cdp_tab(task_id)
+    return pinned[task_id]
+
+
+def _pin_cdp_tab(fn):
+    """Pin one tab for the whole vault action (a nested call, save_login → fill, shares the pin)."""
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        if _PINNED.get() is not None:
+            return fn(*args, **kwargs)
+        token = _PINNED.set({})
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            _PINNED.reset(token)
+    return wrapper
+
+
+def _tab_refusal(task_id: str) -> Optional[str]:
+    """Why the vault has no page on the browser_cdp path (ambiguous tabs, nothing open), else None."""
+    from tools.browser_supervisor import SUPERVISOR_REGISTRY
+    if _page_backend(task_id) is not None or SUPERVISOR_REGISTRY.get(task_id) is not None:
+        return None
+    pinned = (_PINNED.get() or {}).get(task_id)
+    return pinned.refusal or None if isinstance(pinned, _CdpTab) else None
 
 
 def _eval_js_secret(task_id: str, expression: str) -> dict[str, Any]:
@@ -253,6 +356,9 @@ def _bound_page_origin(task_id: str, meta: Any, probe_kind: str) -> str | dict[s
     page_origin = next((o for o in (_focus_bound_origin(task_id, c, probe_kind) for c in allowed) if o), None)
     page_origin = page_origin or _current_page_origin(task_id)
     if not page_origin:
+        refusal = _tab_refusal(task_id)
+        if refusal:
+            return {"success": False, "error_type": "tab_ambiguous", "error": refusal}
         return {"success": False,
                 "error": "Could not determine the current page origin. Navigate to the login page first."}
     if page_origin not in allowed:
@@ -341,6 +447,7 @@ def browser_vault_unlock(backend_name: str) -> str:
     return json.dumps({"success": True, "backend": backend.name})
 
 
+@_pin_cdp_tab
 def browser_vault_save_login(label: str = "", task_id: Optional[str] = None) -> str:
     """Ask the user (masked prompt on their surface) for the login of the CURRENT page, store it in the local
     vault bound to that origin, and fill the password at once. The values never enter the conversation."""
@@ -353,6 +460,9 @@ def browser_vault_save_login(label: str = "", task_id: Optional[str] = None) -> 
     _focus_bound_origin(effective_task_id, "", "login")
     origin = _current_page_origin(effective_task_id)
     if not origin:
+        refusal = _tab_refusal(effective_task_id)
+        if refusal:
+            return json.dumps({"success": False, "error_type": "tab_ambiguous", "error": refusal})
         return json.dumps({"success": False, "error": "Open the site's login page first; the login is saved for that page's origin."})
     prompt = get_save_login_prompt_callback()
     if prompt is None or not can_prompt_here():
@@ -462,6 +572,7 @@ def _saved_login(handle: str) -> tuple[Any, Any]:
 
 
 @plugin_errors_as_refusal
+@_pin_cdp_tab
 def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None) -> str:
     """Second factor: fill the one-time code the CURRENT page asks for. If the saved login (``handle``) has an
     authenticator seed, the code is minted server-side and nobody is asked; otherwise the user is prompted on
@@ -485,6 +596,9 @@ def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None) ->
         _focus_bound_origin(effective_task_id, "", "otp")
         origin = _current_page_origin(effective_task_id)
         if not origin:
+            refusal = _tab_refusal(effective_task_id)
+            if refusal:
+                return json.dumps({"success": False, "error_type": "tab_ambiguous", "error": refusal})
             return json.dumps({"success": False, "error": "No page with a code field is open."})
     site = origin.split("://", 1)[-1]
 
@@ -543,6 +657,7 @@ def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None) ->
 
 
 @plugin_errors_as_refusal
+@_pin_cdp_tab
 def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
     """Fill the current page's password field from a vault handle.
 

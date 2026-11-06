@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import threading
 from typing import Any, Callable, Dict, Optional
 
 from tools.registry import registry, tool_error
@@ -108,6 +109,44 @@ except ImportError:
     websockets = None  # type: ignore[assignment]
     WebSocketException = Exception  # type: ignore[assignment,misc]
     _WS_AVAILABLE = False
+
+
+# Iris fork: the tab this task last drove through browser_cdp, per profile home and task:
+# (endpoint, target_id). browser_vault reads it when no browser_exec session exists, so a fill lands in
+# the tab the agent is working in, never in a tab picked from the list (tools/browser_vault_tool.py).
+_LAST_TARGETS: dict[tuple[str, str], tuple[str, str]] = {}
+_LAST_TARGETS_LOCK = threading.Lock()
+
+
+def _last_target_key(task_id: Optional[str]) -> tuple[str, str]:
+    from hermes_constants import hermes_home_key
+    return hermes_home_key(), task_id or "default"
+
+
+def _note_used_target(task_id: Optional[str], endpoint: str, method: str, params: dict[str, Any],
+                      target_id: Optional[str], result: Any) -> None:
+    """Remember the tab a successful call drove: its ``target_id``, the tab ``Target.createTarget``
+    opened or the one ``Target.activateTarget`` brought forward; forget it when it is closed."""
+    used = target_id
+    if method == "Target.createTarget" and isinstance(result, dict):
+        used = str(result.get("targetId") or "") or None
+    elif method == "Target.activateTarget":
+        used = str(params.get("targetId") or "") or None
+    key = _last_target_key(task_id)
+    with _LAST_TARGETS_LOCK:
+        if method == "Target.closeTarget":
+            if _LAST_TARGETS.get(key, ("", ""))[1] == str(params.get("targetId") or ""):
+                _LAST_TARGETS.pop(key, None)
+            return
+        if used:
+            _LAST_TARGETS[key] = (endpoint, used)
+
+
+def last_used_target(task_id: Optional[str], endpoint: str) -> Optional[str]:
+    """The target id this task last drove on ``endpoint`` (another browser's record doesn't count)."""
+    with _LAST_TARGETS_LOCK:
+        recorded = _LAST_TARGETS.get(_last_target_key(task_id))
+    return recorded[1] if recorded and recorded[0] == endpoint else None
 
 
 def _run_async(coro):
@@ -420,6 +459,7 @@ def browser_cdp(method: str, params: Optional[dict[str, Any]] = None, target_id:
         logger.exception("browser_cdp unexpected error")
         return tool_error(f"Unexpected error: {type(exc).__name__}: {exc}", method=method)
 
+    _note_used_target(effective_task_id, endpoint, method, call_params, target_id, result)
     payload: dict[str, Any] = {"success": True, "method": method, "result": _redact_cdp_output(
         result, always_paths=_CDP_ALWAYS_BINARY_PATHS.get(method, ()),
         flagged_paths=_CDP_FLAGGED_BINARY_PATHS.get(method, ()))}
