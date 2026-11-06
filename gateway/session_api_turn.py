@@ -22,7 +22,10 @@ _TOOL_SINKS = {'tool_start_callback', 'tool_complete_callback'}
 _SETTING_KEYS = ('ephemeral_system_prompt', 'requested_model', 'requested_provider',
                  'model_options', 'route', 'session_model', 'confirmed_runtime_lock',
                  'requested_runtime', 'route_source', 'room_dispatch', 'room_execution_policy',
-                 'session_history_delivery')
+                 'session_history_delivery',
+                 # Downstream (Iris): a /v1/runs client that answers questions ({"clarify": true})
+                 # gets the clarify tool for that turn; others keep the api-server toolset.
+                 'clarify')
 _OWNER_SCOPE_RE = re.compile(r'[0-9a-f]{64}')
 
 
@@ -36,6 +39,17 @@ class AdmissionQueued(RuntimeStoreError):
     def __init__(self):
         super().__init__('admission_queued')
         self.args = (self.MESSAGE,)
+
+
+def api_clarify_toolsets(api, enabled_toolsets, disabled_toolsets=None):
+    """Downstream (Iris): an API turn admitted with ``clarify`` (a /v1/runs client that answers
+    questions) gets the clarify toolset; upstream's hermes-api-server composite leaves it out for
+    clients that cannot answer. Unchanged for every other turn, a turn without resolved toolsets,
+    or a profile that disables clarify."""
+    if (api is None or (api.get('settings') or {}).get('clarify') is not True or not enabled_toolsets
+            or 'clarify' in enabled_toolsets or 'clarify' in (disabled_toolsets or ())):
+        return enabled_toolsets
+    return sorted({*enabled_toolsets, 'clarify'})
 
 
 def api_settings(authority, ref):
