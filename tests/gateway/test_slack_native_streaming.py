@@ -273,10 +273,13 @@ class TestSendFinalization:
     @pytest.mark.asyncio
     async def test_mid_turn_notify_reply_leaves_stream_open_and_posts_fresh(self):
         """/status, /approve and clarify answers are notify sends in the SAME thread; they
-        must not overwrite the half-streamed answer in place."""
+        must not overwrite the half-streamed answer in place. Downstream: the inline-reply door
+        marks them ``_interim_send`` (an unmarked notify final that does not continue the stream
+        is this turn's rewritten final and is committed into the bubble — PATCHES.md T11)."""
         adapter, client = _make_adapter()
         await adapter.send_draft("D1", 7, "Partial answer being streamed", metadata=META)
-        result = await adapter.send("D1", "Status: running, 3 tools", metadata={**META, "notify": True})
+        result = await adapter.send(
+            "D1", "Status: running, 3 tools", metadata={**META, "notify": True, "_interim_send": True})
         assert result.message_id == "999.111"
         client.chat_postMessage.assert_awaited_once()
         client.chat_stopStream.assert_not_awaited()
@@ -341,6 +344,110 @@ class TestSendFinalization:
         assert result.success
         client.chat_postMessage.assert_awaited_once()
         assert not _open_streams(adapter)
+
+    @pytest.mark.asyncio
+    async def test_rewritten_turn_final_seals_stale_stream_and_commits_in_place(self):
+        """A turn-final (notify=True) that no longer continues the stream is committed INTO
+        the streamed bubble, never posted beside it (the duplicate-final class seen in
+        #iris-ops on 2026-09-24: the stream with raw directives, then the rendered final as a
+        second bubble)."""
+        adapter, client = _make_adapter()
+        await adapter.send_draft("D1", 7, "Draft answer that got rewritten", metadata=META)
+        result = await adapter.send("D1", "Completely new answer", metadata=dict(META, notify=True))
+        assert result.success and result.message_id == "123.456"
+        client.chat_stopStream.assert_awaited_once()
+        assert "markdown_text" not in client.chat_stopStream.await_args.kwargs
+        client.chat_update.assert_awaited_once()
+        kwargs = client.chat_update.await_args.kwargs
+        assert kwargs["ts"] == "123.456" and "Completely new answer" in kwargs["text"]
+        client.chat_postMessage.assert_not_awaited()
+        assert not _open_streams(adapter)
+
+    @pytest.mark.asyncio
+    async def test_rewritten_final_with_directives_renders_blocks_into_the_stream(self):
+        """The rewritten final carries a :::card — the in-place commit applies the layout
+        (Block Kit on the streamed ts), and no second bubble appears."""
+        adapter, client = _make_adapter({"rich_blocks": True})
+        await adapter.send_draft("D1", 7, "Working on it", metadata=META)
+        final = "JU-1\n\n:::card\ntitle: Zeit gebucht\nsubtitle: JU-1 · 5 Stunden\nBody.\n:::\n\n-# verifiziert"
+        result = await adapter.send("D1", final, metadata=dict(META, notify=True))
+        assert result.success and result.message_id == "123.456"
+        client.chat_update.assert_awaited_once()
+        kwargs = client.chat_update.await_args.kwargs
+        assert kwargs["ts"] == "123.456" and kwargs.get("blocks")
+        assert ":::" not in kwargs["text"]
+        client.chat_postMessage.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_rewritten_final_falls_back_to_fresh_post_when_commit_fails(self):
+        """Only an in-place commit that fails may post the rewritten final beside the stream."""
+        adapter, client = _make_adapter()
+        client.chat_update = AsyncMock(side_effect=Exception("boom"))
+        await adapter.send_draft("D1", 7, "Draft answer that got rewritten", metadata=META)
+        result = await adapter.send("D1", "Completely new answer", metadata=dict(META, notify=True))
+        assert result.success
+        client.chat_stopStream.assert_awaited_once()
+        client.chat_update.assert_awaited_once()
+        client.chat_postMessage.assert_awaited_once()
+        assert not _open_streams(adapter)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("reply", [
+        "Status: running, 3 tools",            # unrelated to the stream
+        "Streaming the real answer and more",  # extends the stream text
+    ])
+    async def test_inline_reply_mid_turn_leaves_stream_open_and_posts_fresh(self, reply):
+        """An inline reply (notify + _interim_send, from _dispatch_inline_reply) never seals
+        the live stream or lands in the streamed bubble — whether its text is unrelated to
+        the stream or happens to extend it."""
+        adapter, client = _make_adapter()
+        await adapter.send_draft("D1", 7, "Streaming the real answer", metadata=META)
+        result = await adapter.send(
+            "D1", reply, metadata=dict(META, notify=True, _interim_send=True))
+        assert result.success
+        client.chat_stopStream.assert_not_awaited()
+        client.chat_update.assert_not_awaited()
+        client.chat_postMessage.assert_awaited_once()
+        assert _open_streams(adapter)
+
+    @pytest.mark.asyncio
+    async def test_abandon_open_draft_seals_the_threads_stream_on_what_is_visible(self):
+        """/stop, /new or a superseded turn: the consumer abandons its stream; the adapter
+        seals it without appending anything and forgets it."""
+        adapter, client = _make_adapter()
+        await adapter.send_draft("D1", 7, "Half an answer", metadata=META)
+        result = await adapter.abandon_open_draft("D1", "Half an answer", metadata=META)
+        assert result.success and result.message_id == "123.456"
+        client.chat_stopStream.assert_awaited_once()
+        assert "markdown_text" not in client.chat_stopStream.await_args.kwargs
+        client.chat_postMessage.assert_not_awaited()
+        assert not _open_streams(adapter)
+
+    @pytest.mark.asyncio
+    async def test_abandon_never_seals_a_replacement_turns_stream(self):
+        """A superseded turn's consumer wakes up after the replacement turn opened its own
+        stream in the same thread: its abandon must leave the replacement's stream alone."""
+        adapter, client = _make_adapter()
+        await adapter.send_draft("D1", 9, "The replacement turn's answer", metadata=META)
+        result = await adapter.abandon_open_draft("D1", "The old turn's half answer", metadata=META)
+        assert result.success
+        client.chat_stopStream.assert_not_awaited()
+        assert _open_streams(adapter)
+
+    @pytest.mark.asyncio
+    async def test_abandon_open_draft_without_a_stream_is_a_noop(self):
+        adapter, client = _make_adapter()
+        result = await adapter.abandon_open_draft("D1", "x", metadata=META)
+        assert result.success
+        client.chat_stopStream.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_abandon_open_draft_only_seals_its_own_thread(self):
+        adapter, client = _make_adapter()
+        await adapter.send_draft("D1", 7, "Thread A answer", metadata=META)
+        await adapter.send_draft("D1", 8, "Thread B answer", metadata=META_B)
+        await adapter.abandon_open_draft("D1", "Thread A answer", metadata=META)
+        assert len(_open_streams(adapter)) == 1
 
 
 RICH_MD = "# Title\n\nbody text with **bold**\n\n| a | b |\n|---|---|\n| 1 | 2 |"
