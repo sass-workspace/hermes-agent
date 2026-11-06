@@ -479,3 +479,18 @@ class TestDisconnectCleanup:
         client.chat_stopStream.assert_awaited()
         assert client.chat_stopStream.await_args.kwargs["channel"] == "D1"
         assert not adapter._active_streams
+
+
+@pytest.mark.asyncio
+async def test_abandon_with_a_draft_id_never_seals_a_replacement_with_the_same_opening():
+    """Ownership is the draft id, not the text: a replacement turn that opens with the same words
+    ("I will check that") is not sealed by the old consumer (codex review, 2026-11 catch-up)."""
+    adapter, client = _make_adapter()
+    await adapter.send_draft("D1", 22, "I will check that", metadata=META)
+    result = await adapter.abandon_open_draft(
+        "D1", "I will check that", metadata=dict(META, _abandon_draft_id=21))
+    assert result.success
+    client.chat_stopStream.assert_not_awaited()
+    assert _open_streams(adapter)
+    await adapter.abandon_open_draft("D1", "I will check that", metadata=dict(META, _abandon_draft_id=22))
+    client.chat_stopStream.assert_awaited_once()
