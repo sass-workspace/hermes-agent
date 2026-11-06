@@ -134,12 +134,16 @@ def test_a_pending_approval_reads_and_answers_in_the_fork_shape(api, owner):
     assert projected['status'] == 'waiting_for_approval'
     assert projected['approval']['request_id'] == 'approve-me'
     assert projected['approval']['command'] == 'rm -rf build'
-    mapped = _legacy_approval_body(api, 'run_appr', {'choice': 'approve'})
+    mapped = _legacy_approval_body(api, 'run_appr', {'choice': 'approve', 'request_id': 'approve-me'})
     assert mapped == {'request_id': 'approve-me', 'execution_generation': row['generation'], 'choice': 'once'}
     assert _legacy_approval_body(api, 'run_appr', {'choice': 'deny', 'request_id': 'approve-me'})['choice'] == 'deny'
+    # Never guessed: a delayed id-less answer to one approval must not approve the next.
+    assert _legacy_approval_body(api, 'run_appr', {'choice': 'once'}) == {'choice': 'once'}
+    # The mapping never prunes pending controls (it reads no projection).
+    assert [p['prompt_id'] for p in live.controls.snapshot(ref.session_id, row['generation'])] == ['approve-me']
     exact = {'request_id': 'approve-me', 'execution_generation': row['generation'], 'choice': 'once'}
     assert _legacy_approval_body(api, 'run_appr', exact) is exact
-    assert _legacy_approval_body(api, 'run_unknown', {'choice': 'once'}) == {'choice': 'once'}
+    assert _legacy_approval_body(api, 'run_unknown', {'choice': 'once', 'request_id': 'x'}) == {'choice': 'once', 'request_id': 'x'}
 
 
 def test_approval_events_carry_the_request_id_alias():
