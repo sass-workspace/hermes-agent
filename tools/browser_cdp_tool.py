@@ -126,26 +126,26 @@ def _last_target_key(task_id: Optional[str]) -> tuple[str, str]:
 def _note_used_target(task_id: Optional[str], endpoint: str, method: str, params: dict[str, Any],
                       target_id: Optional[str], result: Any) -> None:
     """Remember the tab a successful call drove: its ``target_id``, the tab ``Target.createTarget``
-    opened or the one ``Target.activateTarget`` brought forward; forget it when it is closed."""
+    opened or the one ``Target.activateTarget`` brought forward."""
     used = target_id
     if method == "Target.createTarget" and isinstance(result, dict):
         used = str(result.get("targetId") or "") or None
     elif method == "Target.activateTarget":
         used = str(params.get("targetId") or "") or None
-    key = _last_target_key(task_id)
+    if used:  # a closed tab stays recorded: the vault then refuses instead of choosing another tab
+        with _LAST_TARGETS_LOCK:
+            _LAST_TARGETS[_last_target_key(task_id)] = (endpoint, used)
+
+
+def last_used_record(task_id: Optional[str]) -> Optional[tuple[str, str]]:
+    """``(endpoint, target_id)`` this task last drove, on whichever endpoint, or None."""
     with _LAST_TARGETS_LOCK:
-        if method == "Target.closeTarget":
-            if _LAST_TARGETS.get(key, ("", ""))[1] == str(params.get("targetId") or ""):
-                _LAST_TARGETS.pop(key, None)
-            return
-        if used:
-            _LAST_TARGETS[key] = (endpoint, used)
+        return _LAST_TARGETS.get(_last_target_key(task_id))
 
 
 def last_used_target(task_id: Optional[str], endpoint: str) -> Optional[str]:
     """The target id this task last drove on ``endpoint`` (another browser's record doesn't count)."""
-    with _LAST_TARGETS_LOCK:
-        recorded = _LAST_TARGETS.get(_last_target_key(task_id))
+    recorded = last_used_record(task_id)
     return recorded[1] if recorded and recorded[0] == endpoint else None
 
 
@@ -311,15 +311,18 @@ def _browser_cdp_private_guard(*, method: str, params: dict[str, Any], endpoint:
 
 
 async def _cdp_call(ws_url: str, method: str, params: dict[str, Any], target_id: Optional[str],
-                    timeout: float) -> dict[str, Any]:
+                    timeout: float, *, ws_logger: Optional[logging.Logger] = None) -> dict[str, Any]:
     """Make a single CDP call. With ``target_id``, ``Target.attachToTarget(flatten=True)`` multiplexes a
     page-level session over the browser-level WebSocket; without it ``method`` runs at browser level."""
     assert websockets is not None  # guarded by _WS_AVAILABLE at call-site
     from agent.proxy_bypass import loopback_connect_kwargs
     # max_size=None: CDP responses (e.g. DOM.getDocument) can be large; ping_interval=None: CDP
     # servers don't expect pings.
+    # ws_logger: a caller whose frames carry secrets (browser_vault) passes a disabled logger, so the
+    # library's frame logging can't write them even at DEBUG.
+    extra = {"logger": ws_logger} if ws_logger is not None else {}
     async with websockets.connect(ws_url, max_size=None, open_timeout=timeout, close_timeout=5,
-                                  ping_interval=None, **loopback_connect_kwargs(ws_url)) as ws:
+                                  ping_interval=None, **loopback_connect_kwargs(ws_url), **extra) as ws:
         next_id = 1
 
         async def _send(req: dict[str, Any], what: str) -> dict[str, Any]:
