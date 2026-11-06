@@ -2655,6 +2655,28 @@ class SlackAdapter(BasePlatformAdapter):
             return ("extends" if delta.strip() else "equal"), delta
         return "unrelated", ""
 
+    async def abandon_open_draft(
+        self, chat_id: str, content: str, metadata: Optional[dict[str, Any]] = None,
+    ) -> SendResult:
+        """Seal this thread's native stream when its turn dies (/stop, /new, supersede) on
+        what is already visible — the seal adds and claims nothing; otherwise the live
+        indicator stays until Slack expires it. Failure is reported, never raised."""
+        key = self._stream_key(chat_id, metadata or {})
+        stream = self._active_streams.get(key) if key else None
+        if stream is None:
+            return SendResult(success=True)  # nothing open — no-op
+        # Only the abandoning consumer's OWN stream: a superseded turn's consumer can wake up
+        # after the replacement turn opened a stream in the same thread. The stream is ours
+        # when what it shows is what we sent (``content`` is the consumer's visible text).
+        if self._stream_relation(stream.get("sent", ""), content or "")[0] == "unrelated":
+            return SendResult(success=True)  # another turn's stream — never touch it
+        # get-check-pop without an await in between: finalization or a replacement
+        # send_draft that popped it first wins, and we never seal twice.
+        self._active_streams.pop(key, None)
+        sealed = await self._seal_stream(key, stream)
+        return SendResult(success=sealed, message_id=stream.get("ts"),
+                          error=None if sealed else "abandon seal failed")
+
     async def _seal_stream(
         self, key: tuple[str, str, str], stream: dict[str, Any], delta: Optional[str] = None
     ) -> bool:
@@ -2696,13 +2718,20 @@ class SlackAdapter(BasePlatformAdapter):
         sent = stream.get("sent", "")
         kind, delta = self._stream_relation(sent, text)
         if kind == "unrelated":
-            # A turn-final that only restyled the streamed answer (mrkdwn conversion turned
-            # ``*Done:*`` into ``_Done:_``) replaces it in place so the thread holds ONE answer.
-            # Anything else — including mid-turn notify replies (/status, /approve, clarify
-            # answers) that share the thread key — is not this stream's final: leave the stream
-            # open and let send() post it fresh.
-            if not (md.get("notify") and text.strip() and sent.strip()
-                    and self._mrkdwn_insensitive(text) == self._mrkdwn_insensitive(sent)):
+            logger.info(
+                "[Slack] Native stream %s/%s: final unrelated to stream (sent=%d chars, "
+                "final=%d chars, notify=%s)", chat_id, stream.get("ts"), len(sent), len(text),
+                bool(md.get("notify")))
+            # A turn-final (notify) that does not continue the stream — restyled by the mrkdwn
+            # conversion (``*Done:*`` → ``_Done:_``), or rewritten by the model, or differing
+            # from the last streamed segment: the streamed bubble is still THIS turn's bubble.
+            # Seal it on what is visible and commit the real final into it in place — a fresh
+            # post beside the stale stream is the duplicate-final class (two bubbles of one
+            # answer, the first showing raw directives, 2026-09-24 #iris-ops). Mid-turn notify
+            # replies (/status, /approve, clarify answers) never reach here: the inline-reply
+            # door marks them ``_interim_send`` (gateway/platforms/base.py) and returned above.
+            # Non-notify content (interim commentary) leaves the stream open and posts fresh.
+            if not (md.get("notify") and text.strip()):
                 return None
             return await self._commit_stream(key, stream, text, metadata, replace=True)
         if kind == "extends" and len(delta) > self.MAX_MESSAGE_LENGTH:
