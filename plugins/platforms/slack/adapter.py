@@ -7267,8 +7267,14 @@ async def _standalone_send(
                     data = await _slack_json_post(session, tok, "chat.postMessage", flat_payload, _req_kw)
                 if data.get("ok"):
                     if tok_groups and len(tok_groups) > 1:
-                        await _standalone_post_block_followups(
-                            session, tok, chat_id, tok_groups, thread_id, _req_kw, unfurl_kwargs)
+                        try:
+                            await _standalone_post_block_followups(
+                                session, tok, chat_id, tok_groups, thread_id, _req_kw, unfurl_kwargs)
+                        except Exception as exc:  # the first post landed: never report it failed
+                            logger.warning("[Slack] _standalone_send: overflow follow-ups failed after "
+                                           "the first post (%s); partial delivery", exc)
+                            return {"success": True, "platform": "slack", "chat_id": chat_id,
+                                    "message_id": data.get("ts"), "partial": True}
                     return {
                         "success": True, "platform": "slack", "chat_id": chat_id,
                         "message_id": data.get("ts")}
