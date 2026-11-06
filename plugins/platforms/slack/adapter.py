@@ -6420,7 +6420,8 @@ class SlackAdapter(BasePlatformAdapter):
             cached = self._thread_context_cache.get(
                 self._thread_cache_key(channel_id, thread_ts, team_id))
             root = self._thread_root_message(cached.messages, thread_ts) if cached else None
-            files = root.get("files") if root else None
+            # Forwarded screenshots ride in attachments[].files of the root (T2): same helper as live ingest.
+            files = self._inbound_files(root) if isinstance(root, dict) else None
             if not isinstance(files, list):
                 return media_urls, media_types
             for f in files:

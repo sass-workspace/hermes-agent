@@ -426,3 +426,18 @@ def test_thread_history_keeps_a_forwarded_message_and_still_skips_permalink_echo
     out = _extract_text_from_slack_attachments([share, echo])
     assert "Bitte Versandkosten prüfen" in out
     assert "already read elsewhere" not in out
+
+
+@pytest.mark.asyncio
+async def test_a_forwarded_screenshot_in_the_thread_root_is_recovered(adapter):
+    """A forwarded screenshot as the thread ROOT, the bot first mentioned in a reply: the root's
+    attachments[].files are recovered like live ingestion's (codex review of the 2026-11 catch-up)."""
+    from plugins.platforms.slack.adapter import _ThreadContextCache
+    shot = {"id": "F1", "mimetype": "image/png", "url_private_download": "https://files.slack.com/F1.png"}
+    root = {"ts": "100.000", "text": "", "attachments": [{"is_share": True, "is_msg_unfurl": True,
+                                                         "text": "see this", "files": [shot]}]}
+    adapter._thread_context_cache[adapter._thread_cache_key("C1", "100.000", "")] = _ThreadContextCache(
+        content="", messages=[root])
+    adapter._cache_slack_file = AsyncMock(return_value=("/tmp/F1.png", "image/png", None))
+    urls, types = await adapter._collect_thread_root_images("C1", "100.000", "")
+    assert urls == ["/tmp/F1.png"] and types == ["image/png"]
