@@ -332,9 +332,13 @@ def build_fill_js(fills: list[dict[str, Any]], expected_origin: str, nonce: str 
 
 
 _FILL_JS_TEMPLATE = """(() => {
+  "use strict";
+  // Strict, and no page-replaceable call (JSON.stringify, prototypes) before the origin check or in its
+  // refusal: a non-strict caller is readable as ``fn.caller`` from page code, and its source holds the
+  // values (Iris fork, Codex 2026-11-07).
   const expectedOrigin = __EXPECTED_ORIGIN__;
   if (window.location.origin !== expectedOrigin) {
-    return JSON.stringify({ refused: "origin_changed", found: window.location.origin });
+    return '{"refused": "origin_changed"}';
   }
   const fills = __FILLS__;
   const nonce = __NONCE__;
@@ -369,5 +373,5 @@ _FILL_JS_TEMPLATE = """(() => {
     } catch (e) { /* skip */ }
   }
   find("[data-hermes-vault-slot]").forEach((n) => n.removeAttribute("data-hermes-vault-slot"));
-  return JSON.stringify({ filled });
+  return '{"filled": ' + filled + '}';
 })()"""

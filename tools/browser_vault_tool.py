@@ -70,6 +70,8 @@ _PAGE_FILL_FAILED = {"hermes_vault_eval_failed": True}
 
 def _page_backend(task_id: str):
     """The plugin browser holding this task's live page (e.g. Camofox), or None for the CDP session."""
+    if _pinned_tab(task_id) is not None:  # Iris fork: this action runs on its pinned CDP tab
+        return None
     from agent.browser_page_registry import backend_for_task
     return backend_for_task(task_id)
 
@@ -113,6 +115,9 @@ def _ensure_supervisor(task_id: str):
     refuses rather than touching argv."""
     from tools.browser_supervisor import SUPERVISOR_REGISTRY
 
+    pinned = _pinned_tab(task_id)  # Iris fork: an action that started on a CDP tab stays there
+    if pinned is not None:
+        return pinned
     supervisor = SUPERVISOR_REGISTRY.get(task_id)
     if supervisor is not None:
         return supervisor
@@ -144,6 +149,17 @@ def _ensure_supervisor(task_id: str):
 
 _PINNED: contextvars.ContextVar[Optional[dict]] = contextvars.ContextVar("browser_vault_cdp_tab", default=None)
 _TAB_FAILED = "The vault script could not run in the browser tab"
+# The WebSocket library logs frames at DEBUG; these frames carry the secret. Never logged, at any level.
+_WS_LOGGER = logging.getLogger("tools.browser_vault.cdp_ws")
+_WS_LOGGER.propagate = False
+_WS_LOGGER.disabled = True
+
+
+def _pinned_tab(task_id: str) -> Optional["_CdpTab"]:
+    """The CDP tab this vault action already works on: it stays the backend for the whole action, even
+    if a supervisor or a plugin page appears for the task meanwhile."""
+    pinned = (_PINNED.get() or {}).get(task_id)
+    return pinned if isinstance(pinned, _CdpTab) else None  # a refusal stays the answer too
 
 
 class _CdpTab:
@@ -162,7 +178,8 @@ class _CdpTab:
         from tools.browser_cdp_tool import _cdp_call, _run_async
         params = {"expression": expression, "returnByValue": True, "awaitPromise": True, "userGesture": True}
         try:
-            reply = _run_async(_cdp_call(self.endpoint, "Runtime.evaluate", params, self.target_id, timeout))
+            reply = _run_async(_cdp_call(self.endpoint, "Runtime.evaluate", params, self.target_id, timeout,
+                                         ws_logger=_WS_LOGGER))
         except Exception as exc:  # health: allow BLE001 -- fixed text: the error may quote the script
             logger.debug("vault: CDP evaluate on the pinned tab failed (%s)", type(exc).__name__)
             return {"ok": False, "error": _TAB_FAILED}
@@ -174,27 +191,31 @@ class _CdpTab:
 
 def _pick_cdp_tab(task_id: str) -> Optional[_CdpTab]:
     """The tab the vault may work on, a refusal when that is ambiguous, or None without a CDP endpoint."""
-    from tools.browser_cdp_tool import _cdp_call, _run_async, last_used_target
+    from tools.browser_cdp_tool import _cdp_call, _run_async, last_used_record
     from tools.browser_session_cdp import get_cdp_override
 
     endpoint = (get_cdp_override() or "").strip()
     if not endpoint.startswith(("ws://", "wss://")):
         return None
     try:
-        infos = _run_async(_cdp_call(endpoint, "Target.getTargets", {}, None, 5.0)).get("targetInfos") or []
+        infos = _run_async(_cdp_call(endpoint, "Target.getTargets", {}, None, 5.0,
+                                     ws_logger=_WS_LOGGER)).get("targetInfos") or []
     except Exception as exc:  # health: allow BLE001 -- an unreadable browser is a refusal
         logger.debug("vault: reading the CDP targets failed (%s)", type(exc).__name__)
         return _CdpTab(refusal="Could not read the browser's tabs over CDP; check that the browser is running.")
     pages = [t for t in infos if t.get("type") == "page"]
-    last = last_used_target(task_id, endpoint)
-    if last and any(t.get("targetId") == last for t in pages):
-        return _CdpTab(endpoint, last)
+    recorded = last_used_record(task_id)
+    if recorded:  # the task chose a tab: that one or nothing, never another one in its place
+        if recorded[0] == endpoint and any(t.get("targetId") == recorded[1] for t in pages):
+            return _CdpTab(endpoint, recorded[1])
+        return _CdpTab(refusal=("The tab browser_cdp last used in this task is closed, or the browser restarted. "
+                                "Use browser_cdp with the login tab's target_id, then retry."))
     web = [t for t in pages if str(t.get("url") or "").startswith(("http://", "https://"))]
     if len(web) == 1:
         return _CdpTab(endpoint, str(web[0]["targetId"]))
     if not web:
         return _CdpTab(refusal="No web page is open in the browser. Open the login page with browser_cdp first.")
-    return _CdpTab(refusal=(f"{len(web)} tabs are open and browser_cdp hasn't worked in one of them in this task, "
+    return _CdpTab(refusal=(f"{len(web)} tabs are open and browser_cdp hasn't worked in any of them in this task, "
                             "so the vault won't pick one. Use browser_cdp with the login tab's target_id (for "
                             "example Runtime.evaluate of location.href), or close the other tabs, then retry."))
 
@@ -225,11 +246,8 @@ def _pin_cdp_tab(fn):
 
 def _tab_refusal(task_id: str) -> Optional[str]:
     """Why the vault has no page on the browser_cdp path (ambiguous tabs, nothing open), else None."""
-    from tools.browser_supervisor import SUPERVISOR_REGISTRY
-    if _page_backend(task_id) is not None or SUPERVISOR_REGISTRY.get(task_id) is not None:
-        return None
-    pinned = (_PINNED.get() or {}).get(task_id)
-    return pinned.refusal or None if isinstance(pinned, _CdpTab) else None
+    pinned = _pinned_tab(task_id)
+    return (pinned.refusal or None) if pinned is not None else None
 
 
 def _eval_js_secret(task_id: str, expression: str) -> dict[str, Any]:
