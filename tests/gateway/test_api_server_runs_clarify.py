@@ -115,3 +115,33 @@ def test_only_an_opted_in_api_turn_gains_the_clarify_toolset():
     assert api_clarify_toolsets(None, base) is base, "not an API turn"
     assert api_clarify_toolsets({'settings': {'clarify': True}}, base, ['clarify']) is base, "profile disabled it"
     assert api_clarify_toolsets({'settings': {'clarify': True}}, None) is None, "no resolved toolsets"
+
+
+def test_a_pending_approval_reads_and_answers_in_the_fork_shape(api, owner):
+    """GET /v1/runs/{id} carries the pending approval under ``approval`` with its ``request_id``, and
+    ``{choice}`` / ``{choice, request_id}`` map onto upstream's exact answer body."""
+    from gateway.platforms.api_server_authority_runs import run_projection
+    from gateway.platforms.api_server_runs import _legacy_approval_body
+    from hermes_state_runtime import claim_session_input
+    _, ref, _ = admit_api_turn(api, session_id='iris-approval', request_id='run_appr', user_message='hello',
+                               conversation_history=[])
+    row = claim_session_input(owner.db, epoch=owner.epoch, session_id=ref.session_id)
+    live = owner.sessions[ref.session_id]
+    owner.register_approval(ref.session_id, row['generation'], live.route,
+                            {'request_id': 'approve-me', 'command': 'rm -rf build', 'description': 'delete'})
+    live.controls.remote_responders['approve-me'] = lambda *answer: None
+    projected = run_projection(api, 'run_appr')
+    assert projected['status'] == 'waiting_for_approval'
+    assert projected['approval']['request_id'] == 'approve-me'
+    assert projected['approval']['command'] == 'rm -rf build'
+    mapped = _legacy_approval_body(api, 'run_appr', {'choice': 'approve'})
+    assert mapped == {'request_id': 'approve-me', 'execution_generation': row['generation'], 'choice': 'once'}
+    assert _legacy_approval_body(api, 'run_appr', {'choice': 'deny', 'request_id': 'approve-me'})['choice'] == 'deny'
+    exact = {'request_id': 'approve-me', 'execution_generation': row['generation'], 'choice': 'once'}
+    assert _legacy_approval_body(api, 'run_appr', exact) is exact
+    assert _legacy_approval_body(api, 'run_unknown', {'choice': 'once'}) == {'choice': 'once'}
+
+
+def test_approval_events_carry_the_request_id_alias():
+    event = _with_clarify_id({'kind': 'approval', 'prompt_id': 'a1', 'command': 'x'})
+    assert event['request_id'] == 'a1' and event['prompt_id'] == 'a1'
