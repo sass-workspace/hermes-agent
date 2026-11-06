@@ -1367,6 +1367,7 @@ async def _handle_run_approval(self, request: web.Request, *, _api_server) -> we
     except Exception:
         return _json_error(_openai_error, "Invalid JSON", status=400)
     if getattr(self.gateway_runner, 'session_authority', None) is not None:
+        body = await asyncio.to_thread(_legacy_approval_body, self, run_id, body)
         if self._room_grant_token(request) and body.get('choice') not in {'once', 'deny'}:
             return _json_error(_openai_error, 'Room approvals require once or deny', status=400)
         return await _respond_authority_run(self, run_id, body, kind='approval', _api_server=_api_server)
@@ -1441,9 +1442,34 @@ async def _handle_run_clarify(self, request, *, _api_server):
 # old shape onto it and change nothing for a client that already speaks upstream's.
 
 def _with_clarify_id(prompt: dict[str, Any]) -> dict[str, Any]:
-    if prompt.get('kind') == 'clarify' and prompt.get('prompt_id') and 'clarify_id' not in prompt:
-        return {**prompt, 'clarify_id': prompt['prompt_id']}
+    """A control event as the fork's clients read it: ``clarify_id`` on a question,
+    ``request_id`` on an approval (both = upstream's ``prompt_id``)."""
+    alias = {'clarify': 'clarify_id', 'approval': 'request_id'}.get(prompt.get('kind'))
+    if alias and prompt.get('prompt_id') and alias not in prompt:
+        return {**prompt, alias: prompt['prompt_id']}
     return prompt
+
+
+def _legacy_approval_body(self, run_id, body):
+    """``{choice}`` or ``{choice, request_id}`` (the fork's /approval body) ->
+    ``{request_id, execution_generation, choice}``. Without a request id it names the run's one
+    pending approval; with none or several pending the body passes on unchanged and the authority
+    refuses it (never a guess between two approvals)."""
+    if not (isinstance(body, dict) and 'choice' in body and set(body) <= {'choice', 'request_id'}):
+        return body
+    from gateway.platforms.api_server_authority_runs import run_projection
+    projected = run_projection(self, run_id)
+    if projected is None:
+        return body
+    choice = str(body.get('choice') or '').strip().lower()
+    choice = _APPROVAL_CHOICE_ALIASES.get(choice, choice)
+    request_id = body.get('request_id')
+    if not request_id:
+        waiting = [p for p in projected['pending_controls'] if p.get('kind') == 'approval']
+        if len(waiting) != 1:
+            return body
+        request_id = waiting[0].get('prompt_id')
+    return {'request_id': request_id, 'execution_generation': projected['execution_generation'], 'choice': choice}
 
 
 def _legacy_clarify_body(self, run_id, body):

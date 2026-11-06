@@ -86,12 +86,17 @@ def run_projection(adapter, run_id):
             # so polling must not report `completed` for the same receipt.
             from gateway.platforms.api_server_runs import terminal_run_status
             status = terminal_run_status(result)[0]
-    pending, clarify = [], None
+    pending, clarify, approval = [], None, None
     live = authority.sessions.get(row['target_session_id'])
     if live is not None and row['status'] == 'started':
         pending = list(live.controls.snapshot(row['target_session_id'], row['generation']))
-        if any(prompt.get('kind') == 'approval' for prompt in pending):
+        waiting = next((prompt for prompt in pending if prompt.get('kind') == 'approval'), None)
+        if waiting is not None:
             status = 'waiting_for_approval'  # the documented run state main's run store reports
+            # Downstream (Iris): the pending approval under ``approval`` with its ``request_id``,
+            # the shape the fork's clients read (api_server_runs ``_with_request_aliases``).
+            approval = {key: waiting[key] for key in ('command', 'description', 'choices') if key in waiting}
+            approval['request_id'] = waiting.get('prompt_id')
         else:
             # Downstream (Iris): a run waiting on a question reports the fork's clarify contract —
             # ``waiting_for_input`` plus the question under ``clarify`` (api_server_runs helpers).
@@ -103,7 +108,8 @@ def run_projection(adapter, run_id):
     return {'pending_controls': pending, 'run_id': run_id, 'status': status, 'session_id': row['target_session_id'],
             'admission_id': row['admission_id'], 'execution_generation': row['generation'],
             'output': result.get('final_response', ''), 'usage': saved.get('usage', {}) if saved else {},
-            **({'clarify': clarify} if clarify is not None else {})}
+            **({'clarify': clarify} if clarify is not None else {}),
+            **({'approval': approval} if approval is not None else {})}
 
 
 async def send_clarify(adapter, *, chat_id, **kwargs):
