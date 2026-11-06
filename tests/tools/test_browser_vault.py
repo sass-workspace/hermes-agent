@@ -804,6 +804,34 @@ class TestTwoFactor:
         args = (tmp_path / "args").read_text().split() if (tmp_path / "args").exists() else []
         return json.loads(raw), raw, seen, args
 
+    def test_a_routed_profile_never_gets_the_launch_profiles_mail_command(self, monkeypatch):
+        from agent import secret_scope
+        from tools import browser_vault_tool
+        monkeypatch.setenv("HERMES_VAULT_MAIL_CODE_COMMAND", "/launch/helper")
+        monkeypatch.setattr(secret_scope, "get_secret", lambda name, default=None: default)  # routed miss
+        assert browser_vault_tool._mail_code_command() == ""
+
+        def unscoped(name, default=None):
+            raise RuntimeError("unscoped under multiplexing")
+        monkeypatch.setattr(secret_scope, "get_secret", unscoped)
+        assert browser_vault_tool._mail_code_command() == "", "an unscoped read fails closed"
+
+    def test_the_helper_gets_a_minimal_environment(self, monkeypatch):
+        from tools import browser_vault_tool
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-leak")
+        env = browser_vault_tool._mail_code_env()
+        assert "OPENAI_API_KEY" not in env and env.get("PATH")
+
+    def test_a_helper_timeout_gives_the_resend_guidance(self, store, monkeypatch, tmp_path):
+        import subprocess as _sp
+        from tools import browser_vault_tool
+
+        def timeout(*a, **k):
+            raise _sp.TimeoutExpired("helper", 150)
+        monkeypatch.setattr(browser_vault_tool.subprocess, "run", timeout)
+        out, raw, seen, args = self._mail_case(store, monkeypatch, tmp_path)
+        assert not out["success"] and out["error_type"] == "no_mail_code"
+
     def test_a_mailed_code_is_fetched_by_the_host_command_and_never_shown(self, store, monkeypatch, tmp_path):
         out, raw, seen, args = self._mail_case(store, monkeypatch, tmp_path)
         assert out["success"] and out["source"] == "mail"

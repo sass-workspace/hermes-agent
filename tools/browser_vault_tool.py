@@ -393,14 +393,20 @@ _MAIL_MISSED: set = set()
 
 
 def _mail_code_command() -> str:
-    """The host's mail-code command: the profile's own secret scope first (upstream loads a profile's
-    ``.env`` there, and under multiplexing never into ``os.environ``), else the process env."""
+    """The host's mail-code command, read through the calling profile's secret scope only: under
+    multiplexing a routed profile without its own ``HERMES_VAULT_MAIL_CODE_COMMAND`` gets none (never
+    the launch profile's), and an unscoped read fails closed. Each profile opts in in its own ``.env``."""
     try:
         from agent.secret_scope import get_secret
-        scoped = get_secret("HERMES_VAULT_MAIL_CODE_COMMAND", "")
-    except Exception:  # an unscoped read under multiplexing raises; the process env still decides
-        scoped = ""
-    return str(scoped or os.environ.get("HERMES_VAULT_MAIL_CODE_COMMAND", "") or "").strip()
+        return str(get_secret("HERMES_VAULT_MAIL_CODE_COMMAND", "") or "").strip()
+    except Exception:  # unscoped under multiplexing: no mail codes rather than another profile's helper
+        return ""
+
+
+def _mail_code_env() -> dict:
+    """A minimal environment for the host helper: never the gateway's (provider keys, other profiles'
+    values under multiplexing). The helper reads its own mailbox credentials from its own files."""
+    return {k: v for k, v in os.environ.items() if k in ("PATH", "HOME", "LANG", "LC_ALL", "TZ", "USER", "LOGNAME")}
 
 
 def _mail_code(handle: str, meta: Any, origin: str, task_id: str) -> Optional[str]:
@@ -423,9 +429,15 @@ def _mail_code(handle: str, meta: Any, origin: str, task_id: str) -> Optional[st
     try:
         done = subprocess.run([command, "--origin", origin, "--to", str(meta.identifier or ""), "--since", str(int(since)),
                                "--profile", profile],
-                              capture_output=True, text=True, timeout=150, stdin=subprocess.DEVNULL)
-    except (OSError, subprocess.TimeoutExpired):
-        logger.warning("vault: the mail code command didn't answer")
+                              capture_output=True, text=True, timeout=150, stdin=subprocess.DEVNULL,
+                              env=_mail_code_env())
+    except subprocess.TimeoutExpired:
+        # The helper waited and no code mail came: the same Resend guidance as an empty answer.
+        logger.warning("vault: the mail code command didn't answer in time")
+        _MAIL_MISSED.add((task_id, handle))
+        return None
+    except OSError:
+        logger.warning("vault: the mail code command could not run")
         return None
     code = (done.stdout or "").strip()
     if done.returncode != 0 or not _MAIL_CODE.fullmatch(code):
