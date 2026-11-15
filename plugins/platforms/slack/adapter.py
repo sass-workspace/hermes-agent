@@ -5880,7 +5880,9 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, BasePlatformA
             payload = _slack_response_payload(resp)
             if not payload.get("ok"):
                 return None
-            found = bool((payload.get("channel") or {}).get("is_mpim"))
+            found = (payload.get("channel") or {}).get("is_mpim")
+            if not isinstance(found, bool):  # Slack did not say: unknown, not "no" (and not cached)
+                return None
         except Exception as exc:
             logger.debug("[Slack] conversations.info failed for clicked card in %s: %s", channel_id, exc)
             return None

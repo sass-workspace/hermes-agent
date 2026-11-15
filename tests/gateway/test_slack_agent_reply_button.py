@@ -307,3 +307,15 @@ class TestAgentReplyButtonGates:
         body, action = _click_body()
         await adapter._handle_agent_reply_action(AsyncMock(), body, action)
         adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_an_answer_without_is_mpim_is_unknown_and_not_cached():
+    adapter, client = _make_adapter()
+    client.conversations_info = AsyncMock(return_value={"ok": True, "channel": {}})
+    body, action = _click_body()
+    await adapter._handle_agent_reply_action(AsyncMock(), body, action)
+    adapter.handle_message.assert_not_awaited()
+    client.conversations_info = AsyncMock(return_value={"ok": True, "channel": {"is_mpim": False}})
+    await adapter._handle_agent_reply_action(AsyncMock(), *_click_body(value="nochmal"))
+    adapter.handle_message.assert_awaited_once()
