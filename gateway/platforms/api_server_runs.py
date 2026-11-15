@@ -1469,8 +1469,8 @@ def _legacy_approval_body(self, run_id, body):
     owned = run_admission(self, run_id)
     if owned is None:
         return body
-    choice = str(body.get('choice') or '').strip().lower()
-    choice = _APPROVAL_CHOICE_ALIASES.get(choice, choice)
+    from tools.approval import canonical_approval_choice  # the one alias map (lazy, as above)
+    choice = canonical_approval_choice(body.get('choice') or '')
     return {'request_id': request_id, 'execution_generation': owned[1]['generation'], 'choice': choice}
 
 
