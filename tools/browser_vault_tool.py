@@ -659,12 +659,14 @@ def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None) ->
         mailed = _mail_code(handle, meta, origin, effective_task_id)
         if mailed:
             return write(mailed, "mail")
-    if (effective_task_id, handle) in _MAIL_MISSED and not can_prompt_here():
+    prompt = get_code_prompt_callback()
+    # Upstream keys can_prompt_here on the callback about to be used: a chat surface installs only
+    # the code prompt, so the bare call (the unlock prompt) would read "nobody can answer" there.
+    if (effective_task_id, handle) in _MAIL_MISSED and (prompt is None or not can_prompt_here(prompt)):
         return json.dumps({"success": False, "error_type": "no_mail_code",
                            "error": (f"No new code mail from {site} arrived within 2 minutes of this sign-in. If the page "
                                      "offers to send the code again (Resend), press it once, then call "
                                      "browser_vault action=enter_code again with the same handle. Don't retry more than twice.")})
-    prompt = get_code_prompt_callback()
     if prompt is None or not can_prompt_here(prompt):
         return json.dumps({"success": False, "error_type": "prompt_unavailable",
                            "error": (f"{site} asks for a one-time code and this session cannot ask the user (headless/cron/API). "

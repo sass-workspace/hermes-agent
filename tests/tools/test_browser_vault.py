@@ -850,6 +850,22 @@ class TestTwoFactor:
         assert not out["success"] and "expr" not in seen
         assert out["error_type"] == "no_mail_code" and "Resend" in out["error"]
 
+    def test_a_mail_miss_on_a_chat_surface_asks_the_user_for_the_code(self, store, monkeypatch, tmp_path):
+        """Slack installs only the code prompt (no unlock prompt): after a mail miss the user is
+        asked, not told to press Resend (upstream keyed can_prompt_here on the callback, M8)."""
+        from agent.vault_backends import unlock
+        from tools import approval_context
+        asked = []
+        monkeypatch.setattr(approval_context, "_no_user_can_answer", lambda: False)
+        unlock.set_unlock_prompt_callback(None) if hasattr(unlock, "set_unlock_prompt_callback") else None
+        unlock.set_code_prompt_callback(lambda site, hint: asked.append(site) or "135790")
+        try:
+            out, raw, seen, args = self._mail_case(store, monkeypatch, tmp_path, output="'no code'")
+        finally:
+            unlock.set_code_prompt_callback(None)
+        assert asked, "the code prompt was never offered"
+        assert out["success"] and out["source"] == "user" and "135790" not in raw
+
     def test_a_code_only_login_needs_the_flag_and_has_no_password(self, store):
         with pytest.raises(VaultError):
             store.add_item("login", "x", {"identifier_type": "email", "identifier": "a@b.c"}, origin="https://a.test")
