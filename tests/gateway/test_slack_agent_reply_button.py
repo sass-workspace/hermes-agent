@@ -81,6 +81,10 @@ class TestAgentReplyButton:
         assert event.source.user_id == "U_MAT"
         # The dispatched event carries the RESOLVED display name, not the login.
         assert event.source.user_name == "Matien"
+        # No metadata: native admission refuses a Slack event that carries any.
+        assert not event.metadata
+        from gateway.session_envelope import _native_metadata
+        assert _native_metadata(event) == {}
         # The card was updated in place with the actor (display name) before
         # dispatch.
         update_kwargs = client.chat_update.await_args.kwargs

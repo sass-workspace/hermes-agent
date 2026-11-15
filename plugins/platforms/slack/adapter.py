@@ -6024,9 +6024,10 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, BasePlatformA
             await self.handle_message(MessageEvent(
                 text=value, message_type=MessageType.TEXT, source=source, raw_message=body,
                 message_id=str(action.get("action_ts") or msg_ts),
-                reply_to_message_id=thread_ts if thread_ts and thread_ts != msg_ts else None,
-                metadata={"slack_team_id": team_id, "slack_channel_id": channel_id,
-                          "slack_thread_ts": thread_ts or "", "slack_agent_reply_button": label}))
+                # No metadata: native admission refuses any non-WhatsApp event that carries some
+                # ("invalid_params"), so the click never reached the agent. Team, channel and
+                # thread are on ``source`` already.
+                reply_to_message_id=thread_ts if thread_ts and thread_ts != msg_ts else None))
         except Exception:
             logger.error("[Slack] agent-reply action handler failed", exc_info=True)
 
