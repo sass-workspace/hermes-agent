@@ -5807,12 +5807,13 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, BasePlatformA
 
     def _is_interactive_user_authorized(
         self, user_id: str, *, channel_id: str = "", user_name: Optional[str] = None,
-        team_id: str = "") -> bool:
+        team_id: str = "", chat_type: Optional[str] = None) -> bool:
         """Return whether a Slack interactive caller may perform gated actions."""
         normalized_user_id = str(user_id or "").strip()
         if not normalized_user_id:
             return False
-        chat_type = "dm" if str(channel_id or "").startswith("D") else "group"
+        if chat_type not in ("dm", "group"):
+            chat_type = "dm" if str(channel_id or "").startswith("D") else "group"
         # Preferred: the injected profile-bound check (``set_authorization_check``); unlike the
         # ``__self__`` introspection below it works under multiplex (handler is a closure).
         # getattr: object.__new__ test doubles never ran BasePlatformAdapter.__init__.
@@ -5863,6 +5864,18 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, BasePlatformA
             body.get("channel", {}).get("id", ""), body.get("user", {}).get("name", "unknown"),
             body.get("user", {}).get("id", ""))
 
+    @staticmethod
+    def _interaction_is_group_dm(body: dict) -> bool:
+        """A click in a group DM (MPIM): its interaction payload names the conversation
+        ``mpdm-…`` (the id alone does not tell an MPIM from a private channel). Ingestion keys
+        both 1:1 and group DMs as ``dm`` (``channel_type in {"im", "mpim"}``); a click must too."""
+        channel = body.get("channel") or {}
+        return str(channel.get("name") or "").startswith("mpdm-")
+
+    @classmethod
+    def _interaction_chat_type(cls, body: dict, channel_id: str) -> str:
+        return "dm" if str(channel_id or "").startswith("D") or cls._interaction_is_group_dm(body) else "group"
+
     async def _begin_interaction(
         self, ack, body: dict, action: dict, kind: str, *, team_scoped: bool = True
     ) -> Optional[tuple[str, str, str, dict, str, str, str, str]]:
@@ -5873,7 +5886,8 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, BasePlatformA
         team_id = self._event_team_id({}, body, install_set=getattr(self, "_team_clients", None))
         action_id, value, message, msg_ts, channel_id, user_name, user_id = (
             self._interaction_fields(body, action))
-        auth_kwargs: dict[str, Any] = {"channel_id": channel_id, "user_name": user_name}
+        auth_kwargs: dict[str, Any] = {"channel_id": channel_id, "user_name": user_name,
+                                       "chat_type": self._interaction_chat_type(body, channel_id)}
         if team_scoped:
             auth_kwargs["team_id"] = team_id
         if not self._is_interactive_user_authorized(user_id, **auth_kwargs):
@@ -5986,6 +6000,13 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, BasePlatformA
                 value = "" if selected.startswith("url_") else selected
             if not value or not channel_id or not msg_ts:
                 return
+            # The typed message path's channel gates, by id (as for slash commands): ignored
+            # channels, allowed_channels (only a 1:1 DM is exempt), and disable_dms for 1:1 and
+            # group DMs. A card left in a channel that is closed now dispatches nothing.
+            is_dm = self._interaction_chat_type(body, channel_id) == "dm"
+            if self._slash_channel_gated(channel_id) or (is_dm and self._slack_disable_dms()):
+                logger.info("[Slack] Ignoring agent-reply click in a gated channel: %s", channel_id)
+                return
             click_key = (team_id, msg_ts, value)
             if click_key in self._agent_reply_dispatched:
                 logger.debug("[Slack] Duplicate agent-reply click ignored: %s", click_key)
@@ -6015,12 +6036,12 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, BasePlatformA
             # a thread joins that thread's session; a top-level card under ``reply_in_thread:
             # false`` joins the whole-channel session instead of forking one keyed on its own ts
             # (which would also slip past the busy-session queue of the active channel session).
-            is_dm = channel_id.startswith("D")
             thread_ts = self._session_thread_ts({"thread_ts": message.get("thread_ts")}, msg_ts, is_dm, {})
             source = self.build_source(
                 chat_id=channel_id, chat_name=await self._resolve_channel_name(channel_id, team_id=team_id),
                 chat_type="dm" if is_dm else "group", user_id=user_id,
                 user_name=actor, thread_id=thread_ts, scope_id=str(team_id) if team_id else None)
+            source.shared_session = self._interaction_is_group_dm(body)  # as ingestion keys an MPIM
             await self.handle_message(MessageEvent(
                 text=value, message_type=MessageType.TEXT, source=source, raw_message=body,
                 message_id=str(action.get("action_ts") or msg_ts),

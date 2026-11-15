@@ -226,3 +226,56 @@ class TestAgentReplyButton:
         }
         await adapter._handle_agent_reply_action(AsyncMock(), body, action)
         adapter.handle_message.assert_not_awaited()
+
+
+class TestAgentReplyButtonGates:
+    """A click obeys the typed message path's channel gates and DM keying (Codex, M8)."""
+
+    @pytest.mark.asyncio
+    async def test_click_in_an_ignored_channel_dispatches_nothing(self, monkeypatch):
+        adapter, client = _make_adapter()
+        monkeypatch.setattr(adapter, "_slack_ignored_channels", lambda: {"C1"})
+        body, action = _click_body()
+        await adapter._handle_agent_reply_action(AsyncMock(), body, action)
+        adapter.handle_message.assert_not_awaited()
+        client.chat_update.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_click_outside_allowed_channels_dispatches_nothing(self, monkeypatch):
+        adapter, _client = _make_adapter()
+        monkeypatch.setattr(adapter, "_slack_allowed_channels", lambda: {"C9"})
+        body, action = _click_body()
+        await adapter._handle_agent_reply_action(AsyncMock(), body, action)
+        adapter.handle_message.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("channel", [{"id": "D1"}, {"id": "G1", "name": "mpdm-matien--iris-1"}])
+    async def test_click_in_a_dm_with_dms_disabled_dispatches_nothing(self, monkeypatch, channel):
+        adapter, _client = _make_adapter()
+        monkeypatch.setattr(adapter, "_slack_disable_dms", lambda: True)
+        body, action = _click_body()
+        body["channel"] = channel
+        await adapter._handle_agent_reply_action(AsyncMock(), body, action)
+        adapter.handle_message.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_group_dm_click_keys_the_shared_dm_session(self):
+        adapter, _client = _make_adapter()
+        body, action = _click_body()
+        body["channel"] = {"id": "G1", "name": "mpdm-matien--iris-1"}
+        await adapter._handle_agent_reply_action(AsyncMock(), body, action)
+        event = adapter.handle_message.await_args.args[0]
+        assert event.source.chat_type == "dm"
+        assert event.source.shared_session is True
+        assert adapter._is_interactive_user_authorized.call_args.kwargs["chat_type"] == "dm"
+
+    @pytest.mark.asyncio
+    async def test_private_channel_click_stays_a_group(self):
+        adapter, _client = _make_adapter()
+        body, action = _click_body()
+        body["channel"] = {"id": "G2", "name": "kunde-intern"}
+        await adapter._handle_agent_reply_action(AsyncMock(), body, action)
+        event = adapter.handle_message.await_args.args[0]
+        assert event.source.chat_type == "group"
+        assert not event.source.shared_session
+        assert adapter._is_interactive_user_authorized.call_args.kwargs["chat_type"] == "group"
