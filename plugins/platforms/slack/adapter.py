@@ -5864,17 +5864,30 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, BasePlatformA
             body.get("channel", {}).get("id", ""), body.get("user", {}).get("name", "unknown"),
             body.get("user", {}).get("id", ""))
 
-    @staticmethod
-    def _interaction_is_group_dm(body: dict) -> bool:
-        """A click in a group DM (MPIM): its interaction payload names the conversation
-        ``mpdm-…`` (the id alone does not tell an MPIM from a private channel). Ingestion keys
-        both 1:1 and group DMs as ``dm`` (``channel_type in {"im", "mpim"}``); a click must too."""
-        channel = body.get("channel") or {}
-        return str(channel.get("name") or "").startswith("mpdm-")
-
-    @classmethod
-    def _interaction_chat_type(cls, body: dict, channel_id: str) -> str:
-        return "dm" if str(channel_id or "").startswith("D") or cls._interaction_is_group_dm(body) else "group"
+    async def _click_is_group_dm(self, channel_id: str, team_id: str = "") -> Optional[bool]:
+        """Whether a clicked card sits in a group DM (MPIM), from Slack's own ``is_mpim``
+        (conversations.info, cached per channel): an id or a name cannot tell an MPIM from a
+        channel. Ingestion keys 1:1 and group DMs as ``dm``; a click must too. None when Slack
+        could not say (the caller refuses the click)."""
+        if str(channel_id).startswith("D"):
+            return False
+        key = (str(team_id or self._channel_team.get(channel_id, "")), str(channel_id))
+        cache = self.__dict__.setdefault("_click_mpim_cache", {})
+        if key in cache:
+            return cache[key]
+        try:
+            resp = await self._get_client(channel_id, team_id=key[0] or None).conversations_info(channel=channel_id)
+            payload = _slack_response_payload(resp)
+            if not payload.get("ok"):
+                return None
+            found = bool((payload.get("channel") or {}).get("is_mpim"))
+        except Exception as exc:
+            logger.debug("[Slack] conversations.info failed for clicked card in %s: %s", channel_id, exc)
+            return None
+        cache[key] = found
+        if len(cache) > 512:
+            cache.pop(next(iter(cache)))
+        return found
 
     async def _begin_interaction(
         self, ack, body: dict, action: dict, kind: str, *, team_scoped: bool = True
@@ -5886,8 +5899,7 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, BasePlatformA
         team_id = self._event_team_id({}, body, install_set=getattr(self, "_team_clients", None))
         action_id, value, message, msg_ts, channel_id, user_name, user_id = (
             self._interaction_fields(body, action))
-        auth_kwargs: dict[str, Any] = {"channel_id": channel_id, "user_name": user_name,
-                                       "chat_type": self._interaction_chat_type(body, channel_id)}
+        auth_kwargs: dict[str, Any] = {"channel_id": channel_id, "user_name": user_name}
         if team_scoped:
             auth_kwargs["team_id"] = team_id
         if not self._is_interactive_user_authorized(user_id, **auth_kwargs):
@@ -6003,9 +6015,23 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, BasePlatformA
             # The typed message path's channel gates, by id (as for slash commands): ignored
             # channels, allowed_channels (only a 1:1 DM is exempt), and disable_dms for 1:1 and
             # group DMs. A card left in a channel that is closed now dispatches nothing.
-            is_dm = self._interaction_chat_type(body, channel_id) == "dm"
-            if self._slash_channel_gated(channel_id) or (is_dm and self._slack_disable_dms()):
+            if self._slash_channel_gated(channel_id):
                 logger.info("[Slack] Ignoring agent-reply click in a gated channel: %s", channel_id)
+                return
+            group_dm = await self._click_is_group_dm(channel_id, team_id)
+            if group_dm is None:
+                logger.warning("[Slack] Ignoring agent-reply click: conversation type of %s unknown", channel_id)
+                return
+            is_dm = channel_id.startswith("D") or group_dm
+            if is_dm and self._slack_disable_dms():
+                logger.info("[Slack] Ignoring agent-reply click in a DM (DMs disabled): %s", channel_id)
+                return
+            # A group DM is authorized by the DM rules as well (upstream's check above used the
+            # group rules, as the id alone reads "group").
+            if group_dm and not self._is_interactive_user_authorized(
+                    user_id, channel_id=channel_id, user_name=user_name,
+                    team_id=team_id, chat_type="dm"):
+                logger.warning("[Slack] Unauthorized agent-reply click by %s in a group DM - ignoring", user_id)
                 return
             click_key = (team_id, msg_ts, value)
             if click_key in self._agent_reply_dispatched:
@@ -6041,7 +6067,7 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, BasePlatformA
                 chat_id=channel_id, chat_name=await self._resolve_channel_name(channel_id, team_id=team_id),
                 chat_type="dm" if is_dm else "group", user_id=user_id,
                 user_name=actor, thread_id=thread_ts, scope_id=str(team_id) if team_id else None)
-            source.shared_session = self._interaction_is_group_dm(body)  # as ingestion keys an MPIM
+            source.shared_session = group_dm  # as ingestion keys an MPIM
             await self.handle_message(MessageEvent(
                 text=value, message_type=MessageType.TEXT, source=source, raw_message=body,
                 message_id=str(action.get("action_ts") or msg_ts),

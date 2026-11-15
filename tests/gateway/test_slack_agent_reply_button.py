@@ -33,6 +33,8 @@ def _make_adapter(authorized=True):
     adapter._resolve_user_name = AsyncMock(return_value="Matien")
     adapter.handle_message = AsyncMock()
     client = AsyncMock()
+    # conversations.info: an ordinary channel unless a test says otherwise (the click's conversation type).
+    client.conversations_info = AsyncMock(return_value={"ok": True, "channel": {"is_mpim": False}})
 
     # Signature-aware double: the real _get_client REQUIRES a positional
     # chat_id (adapter.py) — a keyword-only call must fail here exactly as it
@@ -229,11 +231,17 @@ class TestAgentReplyButton:
 
 
 class TestAgentReplyButtonGates:
-    """A click obeys the typed message path's channel gates and DM keying (Codex, M8)."""
+    """A click obeys the typed message path's channel gates and DM keying (Codex, M8). The
+    conversation type comes from Slack's ``is_mpim`` (conversations.info), never from a name."""
+
+    @staticmethod
+    def _info(client, *, ok=True, is_mpim=False):
+        client.conversations_info = AsyncMock(return_value={"ok": ok, "channel": {"is_mpim": is_mpim}})
 
     @pytest.mark.asyncio
     async def test_click_in_an_ignored_channel_dispatches_nothing(self, monkeypatch):
         adapter, client = _make_adapter()
+        self._info(client)
         monkeypatch.setattr(adapter, "_slack_ignored_channels", lambda: {"C1"})
         body, action = _click_body()
         await adapter._handle_agent_reply_action(AsyncMock(), body, action)
@@ -242,40 +250,60 @@ class TestAgentReplyButtonGates:
 
     @pytest.mark.asyncio
     async def test_click_outside_allowed_channels_dispatches_nothing(self, monkeypatch):
-        adapter, _client = _make_adapter()
+        adapter, client = _make_adapter()
+        self._info(client)
         monkeypatch.setattr(adapter, "_slack_allowed_channels", lambda: {"C9"})
         body, action = _click_body()
         await adapter._handle_agent_reply_action(AsyncMock(), body, action)
         adapter.handle_message.assert_not_awaited()
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("channel", [{"id": "D1"}, {"id": "G1", "name": "mpdm-matien--iris-1"}])
-    async def test_click_in_a_dm_with_dms_disabled_dispatches_nothing(self, monkeypatch, channel):
-        adapter, _client = _make_adapter()
+    @pytest.mark.parametrize("channel_id, is_mpim", [("D1", False), ("G1", True)])
+    async def test_click_in_a_dm_with_dms_disabled_dispatches_nothing(self, monkeypatch, channel_id, is_mpim):
+        adapter, client = _make_adapter()
+        self._info(client, is_mpim=is_mpim)
         monkeypatch.setattr(adapter, "_slack_disable_dms", lambda: True)
         body, action = _click_body()
-        body["channel"] = channel
+        body["channel"] = {"id": channel_id}
         await adapter._handle_agent_reply_action(AsyncMock(), body, action)
         adapter.handle_message.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_group_dm_click_keys_the_shared_dm_session(self):
-        adapter, _client = _make_adapter()
+    async def test_group_dm_click_keys_the_shared_dm_session_and_checks_dm_rules(self):
+        adapter, client = _make_adapter()
+        self._info(client, is_mpim=True)
         body, action = _click_body()
-        body["channel"] = {"id": "G1", "name": "mpdm-matien--iris-1"}
+        body["channel"] = {"id": "G1"}
         await adapter._handle_agent_reply_action(AsyncMock(), body, action)
         event = adapter.handle_message.await_args.args[0]
-        assert event.source.chat_type == "dm"
-        assert event.source.shared_session is True
+        assert event.source.chat_type == "dm" and event.source.shared_session is True
         assert adapter._is_interactive_user_authorized.call_args.kwargs["chat_type"] == "dm"
 
     @pytest.mark.asyncio
-    async def test_private_channel_click_stays_a_group(self):
-        adapter, _client = _make_adapter()
+    async def test_group_dm_click_refused_by_dm_rules_dispatches_nothing(self):
+        adapter, client = _make_adapter()
+        self._info(client, is_mpim=True)
+        adapter._is_interactive_user_authorized = MagicMock(
+            side_effect=lambda *a, **k: k.get("chat_type") != "dm")
         body, action = _click_body()
-        body["channel"] = {"id": "G2", "name": "kunde-intern"}
+        body["channel"] = {"id": "G1"}
+        await adapter._handle_agent_reply_action(AsyncMock(), body, action)
+        adapter.handle_message.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_channel_named_like_a_group_dm_stays_a_group(self):
+        adapter, client = _make_adapter()
+        self._info(client, is_mpim=False)
+        body, action = _click_body()
+        body["channel"] = {"id": "C7", "name": "mpdm-ops"}
         await adapter._handle_agent_reply_action(AsyncMock(), body, action)
         event = adapter.handle_message.await_args.args[0]
-        assert event.source.chat_type == "group"
-        assert not event.source.shared_session
-        assert adapter._is_interactive_user_authorized.call_args.kwargs["chat_type"] == "group"
+        assert event.source.chat_type == "group" and not event.source.shared_session
+
+    @pytest.mark.asyncio
+    async def test_unknown_conversation_type_dispatches_nothing(self):
+        adapter, client = _make_adapter()
+        self._info(client, ok=False)
+        body, action = _click_body()
+        await adapter._handle_agent_reply_action(AsyncMock(), body, action)
+        adapter.handle_message.assert_not_awaited()
