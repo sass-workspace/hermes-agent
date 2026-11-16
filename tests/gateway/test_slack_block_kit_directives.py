@@ -10,6 +10,7 @@ normal pipeline.
 
 from plugins.platforms.slack.block_kit import (
     AGENT_REPLY_ACTION_ID,
+    AGENT_REPLY_ACTION_RE,
     MAX_CARD_BODY,
     MAX_MARKDOWN_TEXT,
     MARKDOWN_SEGMENT_MAX,
@@ -45,9 +46,27 @@ class TestCardDirective:
         url_btn, reply_btn = card["actions"]
         assert url_btn["url"].startswith("https://elbdev.atlassian.net")
         assert url_btn["style"] == "primary"
-        assert reply_btn["action_id"] == AGENT_REPLY_ACTION_ID
+        assert reply_btn["action_id"] == f"{AGENT_REPLY_ACTION_ID}_1"
         assert reply_btn["value"] == "ja, TUR-445 freigeben"
         assert "url" not in reply_btn
+
+    def test_two_reply_buttons_get_distinct_action_ids(self):
+        # Live 2026-11-16: two buttons sharing "hermes_agent_reply" made Slack answer
+        # invalid_blocks ("already exists") and the card fell back to plain text.
+        md = (":::card\ntitle: Test\nAntwort wählen\n"
+              "button: [Ja](reply: Ja)\nbutton: [Nein](reply: Nein)\n"
+              "button: [Vielleicht](reply: Vielleicht)\n:::")
+        (card,) = render_blocks(md)
+        ids = [b["action_id"] for b in card["actions"]]
+        assert ids == ["hermes_agent_reply_0", "hermes_agent_reply_1", "hermes_agent_reply_2"]
+        assert all(AGENT_REPLY_ACTION_RE.match(i) for i in ids)
+
+    def test_reply_action_pattern_is_exact(self):
+        assert AGENT_REPLY_ACTION_RE.match("hermes_agent_reply")  # BusinessOS fast-lane stop button
+        assert AGENT_REPLY_ACTION_RE.match("hermes_agent_reply_12")
+        for other in ("hermes_agent_reply_", "hermes_agent_reply_x", "hermes_agent_replyx",
+                      "hermes_agent_reply_1_2", "xhermes_agent_reply", "hermes_agent_menu"):
+            assert not AGENT_REPLY_ACTION_RE.match(other), other
 
     def test_body_only_card_is_valid(self):
         blocks = render_blocks(":::card\nnur ein Body\n:::")
@@ -106,6 +125,24 @@ class TestCarouselDirective:
         blocks = render_blocks(md)
         assert _types(blocks) == ["carousel"]
         assert [c["title"]["text"] for c in blocks[0]["elements"]] == ["K1", "K2"]
+
+    def test_carousel_action_ids_unique_across_cards(self):
+        # The carousel is one block: Slack rejects repeated action_ids anywhere in it.
+        md = (
+            ":::carousel\n"
+            ":::card\ntitle: K1\nBody 1\nbutton: [Ja](reply: ja K1)\n"
+            "button: [Link](https://elbdev.de/a)\n:::\n"
+            ":::card\ntitle: K2\nBody 2\nbutton: [Ja](reply: ja K2)\n"
+            "button: [Nein](reply: nein K2)\n:::\n"
+            ":::"
+        )
+        blocks = render_blocks(md)
+        assert _types(blocks) == ["carousel"]
+        ids = [b["action_id"] for c in blocks[0]["elements"] for b in c["actions"]]
+        assert len(ids) == len(set(ids)) == 4
+        assert all(AGENT_REPLY_ACTION_RE.match(i) for i in ids if not i.startswith("hermes_card_url_"))
+        values = [b.get("value") for c in blocks[0]["elements"] for b in c["actions"]]
+        assert values == ["ja K1", None, "ja K2", "nein K2"]
 
     def test_single_card_degrades_to_vertical_card(self):
         md = ":::carousel\n:::card\ntitle: K1\nBody\n:::\n:::"

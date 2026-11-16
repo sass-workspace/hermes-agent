@@ -156,7 +156,7 @@ class TestAgentReplyButton:
     async def test_handler_registered_for_fixed_action_id(self):
         adapter, _ = _make_adapter()
         src = Path(_repo, "plugins", "platforms", "slack", "adapter.py").read_text()
-        assert 'self._app.action("hermes_agent_reply")' in src
+        assert 'self._app.action(AGENT_REPLY_ACTION_RE)' in src
         assert 'self._app.action("hermes_agent_menu")' in src
 
     @pytest.mark.asyncio

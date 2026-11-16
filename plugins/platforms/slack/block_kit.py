@@ -53,9 +53,14 @@ MIN_CAROUSEL_CARDS = 2  # ours, not Slack's: a one-card carousel is worse than a
 MAX_MARKDOWN_TEXT = 12000
 # Renderer headroom below the cumulative cap (mirrors the adapter's margin)
 MARKDOWN_SEGMENT_MAX = 11500
-# Fixed action_id for agent-authored reply buttons; the adapter registers ONE
-# Bolt handler for it and derives the session from the interaction payload.
+# action_id prefix for agent-authored reply buttons. Slack rejects a block whose
+# action_ids repeat (``invalid_blocks``: "already exists"), so a card's buttons
+# carry ``hermes_agent_reply_<n>``; the adapter's ONE Bolt handler matches the
+# bare id and every numbered one (AGENT_REPLY_ACTION_RE) and derives the session
+# from the interaction payload. Senders outside this module (BusinessOS fast lane)
+# still post a single button with the bare id.
 AGENT_REPLY_ACTION_ID = "hermes_agent_reply"
+AGENT_REPLY_ACTION_RE = re.compile(r"^hermes_agent_reply(?:_\d+)?$")
 # Same contract for overflow-menu selections (the handler reads
 # ``selected_option.value`` instead of ``value``; semantics are identical).
 AGENT_MENU_ACTION_ID = "hermes_agent_menu"
@@ -533,7 +538,7 @@ def _parse_button(spec: str, style: Optional[str], index: int) -> Optional[Dict[
         # than clamp, so the card falls back and nothing mutated is dispatched.
         if not text or len(text) > MAX_BUTTON_VALUE:
             return None
-        btn["action_id"] = AGENT_REPLY_ACTION_ID
+        btn["action_id"] = f"{AGENT_REPLY_ACTION_ID}_{index}"
         btn["value"] = text
     elif url and url.lower().startswith(("http://", "https://")):
         btn["url"] = url
@@ -655,6 +660,14 @@ def _parse_carousel(inner: List[str], mrkdwn_fn) -> Optional[Block]:
         cards.append(card)
     if not (MIN_CAROUSEL_CARDS <= len(cards) <= MAX_CAROUSEL_CARDS):
         return None
+    # The carousel is ONE block: its cards' buttons were numbered per card, so
+    # renumber them across the carousel or Slack rejects the repeated action_ids.
+    n_btn = 0
+    for card in cards:
+        for btn in card.get("actions", ()):
+            prefix = (f"{AGENT_REPLY_ACTION_ID}_" if "value" in btn else "hermes_card_url_")
+            btn["action_id"] = f"{prefix}{n_btn}"
+            n_btn += 1
     return {"type": "carousel", "elements": cards}
 
 

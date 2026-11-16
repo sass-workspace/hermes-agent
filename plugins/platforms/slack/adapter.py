@@ -62,8 +62,8 @@ from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
 
 try:  # sibling modules; support both package and flat plugin-dir import
     from .block_kit import (
-        group_mrkdwn_text, group_notification_text, partition_blocks, payload_size, render_blocks,
-        sanitize_blocks, strip_directives)
+        AGENT_REPLY_ACTION_RE, group_mrkdwn_text, group_notification_text, partition_blocks,
+        payload_size, render_blocks, sanitize_blocks, strip_directives)
     from .adapter_slash_lane import SlashHandoffLanes
     from .adapter_slash_payload import slash_command_text, slash_thread_id
     from .adapter_reactions_context import slack_reactions_marker
@@ -78,8 +78,8 @@ except ImportError:  # pragma: no cover - plugin loaded outside package context
         append_forwards, files_with_forwarded, is_forward, own_bot_ids, shared_message_sections,
         slack_file_marker as _slack_file_marker)
     from block_kit import (  # type: ignore
-        group_mrkdwn_text, group_notification_text, partition_blocks, payload_size, render_blocks,
-        sanitize_blocks, strip_directives)
+        AGENT_REPLY_ACTION_RE, group_mrkdwn_text, group_notification_text, partition_blocks,
+        payload_size, render_blocks, sanitize_blocks, strip_directives)
     from adapter_slash_lane import SlashHandoffLanes  # type: ignore
     from adapter_slash_payload import slash_command_text, slash_thread_id  # type: ignore
     from adapter_reactions_context import slack_reactions_marker  # type: ignore
@@ -1707,10 +1707,12 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, BasePlatformA
         for _action_id in self._CONFIRM_CHOICES:
             self._app.action(_action_id)(self._handle_slash_confirm_action)
         self._app.action("hermes_feedback")(self._handle_feedback_action)
-        # Agent-authored reply buttons and overflow menus (block_kit ``:::card``): one fixed
-        # action_id each; the value carries the instruction text, dispatched into the thread's
-        # session as the clicker's message (see _handle_agent_reply_action).
-        self._app.action("hermes_agent_reply")(self._handle_agent_reply_action)
+        # Agent-authored reply buttons and overflow menus (block_kit ``:::card``): the value
+        # carries the instruction text, dispatched into the thread's session as the clicker's
+        # message (see _handle_agent_reply_action). Reply buttons are numbered per block
+        # (``hermes_agent_reply_<n>``: Slack rejects repeated action_ids); the bare id is still
+        # sent by single-button senders outside the adapter.
+        self._app.action(AGENT_REPLY_ACTION_RE)(self._handle_agent_reply_action)
         self._app.action("hermes_agent_menu")(self._handle_agent_reply_action)
         # Link buttons — on agent-authored cards (``hermes_card_url_N``) and on notices other
         # senders post through this app (``businessos_ops_link_N``) — open their URL client-side,

@@ -139,7 +139,7 @@ class TestSendMessageBlocks:
         await adapter.send("C1", md)
         kwargs = client.chat_postMessage.await_args.kwargs
         assert [b["type"] for b in kwargs["blocks"]] == ["card", "context"]
-        assert kwargs["blocks"][0]["actions"][0]["action_id"] == "hermes_agent_reply"
+        assert kwargs["blocks"][0]["actions"][0]["action_id"] == "hermes_agent_reply_0"
         # The text fallback (notifications, old clients) sheds the scaffolding
         # and never carries the reply instruction.
         assert ":::" not in kwargs["text"]

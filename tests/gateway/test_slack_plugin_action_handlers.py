@@ -230,8 +230,11 @@ class TestSlackAdapterPluginActionWiring:
         }
         for name, cbs in matching.items():
             assert len(cbs) == 1, f"{name} must be handled by exactly one registration ({patterns})"
-        # An unrelated id is not swallowed by the link-button patterns.
-        assert not any(aid.match("hermes_agent_reply") for aid, _ in registered if hasattr(aid, "match"))
+        # Reply-button ids (bare and numbered) reach exactly one registration — the agent-reply
+        # handler — and are not swallowed by the link-button patterns.
+        for name in ("hermes_agent_reply", "hermes_agent_reply_0", "hermes_agent_reply_2"):
+            cbs = [cb for aid, cb in registered if hasattr(aid, "match") and aid.match(name)]
+            assert cbs == [adapter._handle_agent_reply_action], (name, patterns)
 
         ack = AsyncMock()
         dispatch = MagicMock()
