@@ -1345,6 +1345,8 @@ platform:
       choice_n: "Auswahl {n}"
       other: "✏️ Sonstiges…"
       expired: "⏳ Diese Abfrage ist abgelaufen — bitte senden Sie eine neue Anfrage. (von {user})"
+      expired_late: "⏳ Keine Antwort in der Zeit — ein Klick unten geht trotzdem an den Bot, als Ihre Antwort in diesem Thread."
+      late_answer: "Antwort auf deine frühere Frage: {choice}"
       awaiting: "✏️ Warte auf eingegebene Antwort von {user}…"
       resolved: "✅ {user}: {choice}"
     feedback:

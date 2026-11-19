@@ -101,6 +101,56 @@ def test_timeout_retires_the_native_card_with_the_expired_notice():
     assert "expired" in adapter.retired[0][1].lower()
 
 
+class _KeepAdapter(_CardAdapter):
+    def __init__(self):
+        super().__init__()
+        self.kept: list[tuple[str, str]] = []
+
+    async def keep_clarify_card_after_timeout(self, clarify_id, notice):
+        self.kept.append((clarify_id, notice))
+
+
+def test_a_timeout_keeps_the_card_answerable_where_the_adapter_can():
+    """elbDev 2026-11-19: a timed-out card keeps its choices (the adapter decides how)."""
+    adapter = _KeepAdapter()
+    reply, labels = _run_clarify(adapter)
+    assert reply["outcome"] == "timed_out"
+    assert len(adapter.kept) == 1 and adapter.retired == []
+    assert "Clarify card keep failed to schedule" in labels
+
+
+def test_a_cancelled_clarify_is_retired_never_kept():
+    """A stop or reset is not a timeout: the card loses its buttons as before."""
+    from tools import clarify_gateway as cm
+    adapter = _KeepAdapter()
+    _reply, _labels = _run_clarify(adapter, answers=(cm.CANCELLED,))
+    assert adapter.kept == [] and len(adapter.retired) == 1
+
+
+def test_a_waiter_cleared_before_its_time_is_not_a_timeout():
+    """A stop or reset while the card is sent clears the waiter early; it reads "did not
+    respond" like a timeout, but the card is retired, never kept (Codex pass 2)."""
+    from tools import clarify_gateway as cm
+    adapter = _KeepAdapter()
+    with patch("tools.clarify_gateway.get_clarify_timeout", return_value=60.0), \
+            patch.object(cm, "wait_for_response", return_value=None):
+        from gateway.run_turn_runner import TurnRunner
+        runner = object.__new__(TurnRunner)
+        runner._approval_owner = None
+        runner._ctx = SimpleNamespace(
+            _status_adapter=adapter, _status_chat_id="C1", _status_thread_metadata={},
+            session_key="sk1", stream_consumer_holder=[None])
+
+        class _Fut:
+            def __init__(self, r): self._r = r
+            def result(self, timeout=None): return self._r
+
+        runner._schedule = lambda coro, label: _Fut(asyncio.run(coro))
+        runner._close_native_stream_boundary = lambda *a, **k: None
+        runner._clarify_callback_sync(_ONE_QUESTION)
+    assert adapter.kept == [] and len(adapter.retired) == 1
+
+
 def test_timeout_schedules_nothing_for_adapters_without_a_card():
     _response, labels = _run_clarify(_TextAdapter())
     assert labels == ["Clarify send failed to schedule"]

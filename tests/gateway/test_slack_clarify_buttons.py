@@ -240,6 +240,88 @@ class TestSlackSendClarify:
         assert mock_client.chat_update.await_count == 1
         assert not cm._entries["cid-retire"].event.is_set()
 
+    @staticmethod
+    async def _late_setup(cid, ts, choices, update=None):
+        from tools import clarify_gateway as cm
+        adapter = _make_adapter()
+        _attach_auth_runner(adapter)
+        client = adapter._team_clients["T1"]
+        client.chat_postMessage = AsyncMock(return_value={"ts": ts})
+        client.chat_update = update or AsyncMock()
+        cm.register(cid, "sk-" + cid, "Wie adressieren?", choices)
+        await adapter.send_clarify(chat_id="C1", question="Wie adressieren?", choices=choices,
+                                   clarify_id=cid, session_key="sk-" + cid)
+        return adapter, client
+
+    @pytest.mark.asyncio
+    async def test_a_timed_out_card_keeps_its_choices_as_reply_buttons(self):
+        """elbDev 2026-11-19: a question waited an hour and expired; the answer had to be typed
+        again. On a timeout the choices stay, as agent-reply buttons whose click is the clicker's
+        message in the thread, prefixed so no fast-lane word, slash command or ``url_`` value
+        is read from it; the old clarify click stays a no-op."""
+        from plugins.platforms.slack.block_kit import AGENT_REPLY_ACTION_RE
+        adapter, client = await self._late_setup("cid-late", "1.3", ["ja", "/stop"])
+
+        await adapter.keep_clarify_card_after_timeout("cid-late", "⏳ expired")
+
+        kwargs = client.chat_update.call_args.kwargs
+        actions = [b for b in kwargs["blocks"] if b["type"] == "actions"]
+        elements = actions[0]["elements"]
+        assert [e["action_id"] for e in elements] == ["hermes_agent_reply_0", "hermes_agent_reply_1"]
+        assert all(AGENT_REPLY_ACTION_RE.match(e["action_id"]) for e in elements)
+        assert [e["value"] for e in elements] == ["Answer to your earlier question: ja",
+                                                  "Answer to your earlier question: /stop"]
+        assert elements[0]["text"]["text"] == "1. ja"
+        assert "Wie adressieren?" in kwargs["blocks"][0]["text"]["text"]
+        await adapter._handle_clarify_action(AsyncMock(), {
+            "message": {"ts": "1.3", "blocks": kwargs["blocks"]},
+            "channel": {"id": "C1"}, "user": {"name": "norbert", "id": "U_N"},
+        }, {"action_id": "hermes_clarify_choice_0", "value": "cid-late|0"})
+        assert client.chat_update.await_count == 1
+        assert "cid-late" not in adapter._clarify_choices
+
+    @pytest.mark.asyncio
+    async def test_retire_still_drops_the_buttons(self):
+        """Answered, cancelled, reset: retire_clarify_card drops the buttons and the choices."""
+        adapter, client = await self._late_setup("cid-can", "1.4", ["a", "b"])
+        await adapter.retire_clarify_card("cid-can", "↩️ cancelled")
+        assert all(b["type"] != "actions" for b in client.chat_update.call_args.kwargs["blocks"])
+        assert "cid-can" not in adapter._clarify_choices
+
+    @pytest.mark.asyncio
+    async def test_choices_that_cant_be_buttons_get_the_plain_notice(self):
+        for cid, choices in (("cid-6", ["a", "b", "c", "d", "e", "f"]), ("cid-long", ["x" * 1900, "b"])):
+            adapter, client = await self._late_setup(cid, "1.6", choices)
+            await adapter.keep_clarify_card_after_timeout(cid, "⏳ expired")
+            kwargs = client.chat_update.call_args.kwargs
+            assert kwargs["text"] == "⏳ expired"
+            assert all(b["type"] != "actions" for b in kwargs["blocks"])
+
+    @pytest.mark.asyncio
+    async def test_a_late_card_slack_refuses_falls_back_to_the_plain_notice(self):
+        update = AsyncMock(side_effect=[RuntimeError("invalid_blocks"), None])
+        adapter, client = await self._late_setup("cid-ref", "1.5", ["a", "b"], update=update)
+        await adapter.keep_clarify_card_after_timeout("cid-ref", "⏳ expired")
+        assert client.chat_update.await_count == 2
+        assert client.chat_update.call_args.kwargs["text"] == "⏳ expired"
+
+    @pytest.mark.asyncio
+    async def test_a_click_after_the_waiter_ended_shows_expiry_and_no_buttons(self):
+        """The waiter ended (timeout or stop) before the gateway retired the card: the click
+        can't tell which, so it shows expiry; no reply buttons appear (Codex pass 2)."""
+        from tools import clarify_gateway as cm
+        adapter, client = await self._late_setup("cid-race", "1.7", ["a", "b"])
+        with cm._lock:
+            cm._entries.pop("cid-race", None)
+        await adapter._handle_clarify_action(AsyncMock(), {
+            "message": {"ts": "1.7", "blocks": []},
+            "channel": {"id": "C1"}, "user": {"name": "norbert", "id": "U_N"},
+        }, {"action_id": "hermes_clarify_choice_0", "value": "cid-race|0"})
+        assert all(b["type"] != "actions" for b in client.chat_update.call_args.kwargs["blocks"])
+        assert "cid-race" not in adapter._clarify_choices
+        await adapter.keep_clarify_card_after_timeout("cid-race", "⏳ expired")
+        assert client.chat_update.await_count == 1
+
     @pytest.mark.asyncio
     async def test_other_click_keeps_the_card_retirable_until_the_clarify_ends(self):
         """'Other' is not terminal: the clarify stays pending for typed text, so a later

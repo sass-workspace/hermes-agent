@@ -1404,6 +1404,8 @@ platform:
       choice_n: "choice {n}"
       other: "✏️ Other…"
       expired: "⏳ This prompt expired — please send a new request. (by {user})"
+      expired_late: "⏳ No answer in time — a click below still goes to the bot, as your reply in this thread."
+      late_answer: "Answer to your earlier question: {choice}"
       awaiting: "✏️ Awaiting typed answer from {user}…"
       resolved: "✅ {user}: {choice}"
     feedback:

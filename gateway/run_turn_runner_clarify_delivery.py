@@ -32,6 +32,10 @@ SEND_ACK_WINDOW = 15
 WITHDRAWN = "clarify_withdrawn"
 
 
+# The waiter's answer when nobody replied in time; the gateway tells a timeout from a stop or
+# reset by it (a timed-out card may stay answerable, see keep_clarify_card_after_timeout).
+CLARIFY_TIMEOUT_PREFIX = "[user did not respond within "
+
 def text_fallback_coro(adapter, **send_kwargs):
     """The base numbered-text ``send_clarify`` as a fresh coroutine, or ``None`` when the adapter has
     no native override — its ``send_clarify`` already IS the text path, so retrying it would only
@@ -124,7 +128,7 @@ def _clarify_send_then_wait(fut, *, clarify_id: str, session_key: str, clarify_m
     if response == clarify_mod.CANCELLED:
         return response, False
     if response is None or response == "":
-        return f"[user did not respond within {int(timeout / 60)}m]", False
+        return f"{CLARIFY_TIMEOUT_PREFIX}{int(timeout / 60)}m]", False
     return response, True
 
 

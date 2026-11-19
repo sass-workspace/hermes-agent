@@ -1117,6 +1117,8 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, BasePlatformA
         # clarify_id → (channel_id, message_ts, rendered_question) so the gateway can retire a
         # card whose clarify ended without a click (timeout, reset, superseding prose).
         self._clarify_messages: dict[str, tuple[str, str, str]] = {}
+        # clarify_id → its choices, so a card retired on timeout keeps them as reply buttons.
+        self._clarify_choices: dict[str, list[str]] = {}
         # Model picker state keyed by workspace message marker (team_id, ts) →
         # picker context (providers, session_key, on_model_selected, stage).
         # Mirrors _approval_resolved / _clarify_resolved: bounded, and the
@@ -5805,6 +5807,9 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, BasePlatformA
             response_channel = str((result.raw_response or {}).get("channel") or chat_id)
             self._clarify_messages[clarify_id] = (response_channel, result.message_id, question_text)
             self._trim_oldest_dict_entries(self._clarify_messages, self._CLARIFY_MESSAGE_MAX)
+            if choices:
+                self._clarify_choices[clarify_id] = [str(c) for c in choices]
+                self._trim_oldest_dict_entries(self._clarify_choices, self._CLARIFY_MESSAGE_MAX)
         return result
 
     def _is_interactive_user_authorized(
@@ -6151,12 +6156,59 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, BasePlatformA
         Keyed by clarify_id, so a late call cannot touch a newer prompt; no-op once resolved.
         """
         target = self._clarify_messages.pop(clarify_id, None)
+        choices = self._clarify_choices.pop(clarify_id, None)
         if target is None:
             return
         channel_id, msg_ts, question_text = target
         # A late action handler must be a no-op while the best-effort chat.update is in flight.
         self._clarify_resolved[msg_ts] = True
         await self._update_clarify_message(channel_id, msg_ts, question_text, notice)
+
+    async def keep_clarify_card_after_timeout(self, clarify_id: str, notice: str) -> None:
+        """A clarify nobody answered in time: keep its choices as agent-reply buttons, so a later
+        click goes to the bot as the clicker's message in the thread — the path a typed reply
+        takes (``_handle_agent_reply_action``: authorization, channel gates, one dispatch per
+        click). The gateway calls this only on a real timeout; a stop, reset or answer retires
+        the card as before. Cards whose choices can't be buttons get the plain notice.
+        elbDev 2026-11-19: a question waited an hour, expired, and had to be asked again."""
+        target = self._clarify_messages.pop(clarify_id, None)
+        choices = self._clarify_choices.pop(clarify_id, None)
+        if target is None:
+            return
+        channel_id, msg_ts, question_text = target
+        self._clarify_resolved[msg_ts] = True
+        if choices and await self._late_clarify_card(channel_id, msg_ts, question_text, choices):
+            return
+        await self._update_clarify_message(channel_id, msg_ts, question_text, notice)
+
+    _LATE_CLARIFY_MAX_CHOICES: ClassVar[int] = 5
+
+    async def _late_clarify_card(
+        self, channel_id: str, msg_ts: str, question_text: str, choices: list[str]) -> bool:
+        """Rewrite a timed-out clarify card: the question, a note, and each choice as an agent
+        reply button whose value is "<answer prefix> <choice>" (never a bare word the fast lane,
+        a slash command or the ``url_`` placeholder rule would read). False (nothing changed)
+        when the choices can't be buttons or Slack refused the update."""
+        values = [t("platform.slack.clarify.late_answer", choice=str(c)) for c in choices]
+        if (not 0 < len(choices) <= self._LATE_CLARIFY_MAX_CHOICES
+                or any(len(v) > 1900 for v in values) or len(set(values)) != len(values)):
+            return False
+        numbered = len(choices) > 1
+        buttons = [self._button(
+            (f"{i + 1}. " if numbered else "") + (str(c)[:68] or str(i + 1)),
+            f"hermes_agent_reply_{i}", v, emoji=True) for i, (c, v) in enumerate(zip(choices, values))]
+        note = t("platform.slack.clarify.expired_late")
+        blocks = [
+            {"type": "section", "text": {"type": "mrkdwn", "text": question_text or "Clarification"}},
+            {"type": "context", "elements": [{"type": "mrkdwn", "text": note}]},
+            {"type": "actions", "elements": buttons}]
+        try:
+            await self._get_client(channel_id).chat_update(
+                channel=channel_id, ts=msg_ts, text=note, blocks=blocks)
+            return True
+        except Exception as e:
+            logger.warning("[Slack] Failed to keep a timed-out clarify card answerable: %s", e)
+            return False
 
     async def _handle_clarify_action(self, ack, body, action) -> None:
         """Handle a clarify button click (a choice or "Other") from Block Kit."""
@@ -6182,6 +6234,7 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, BasePlatformA
             if not _clarify_mod.mark_awaiting_text(clarify_id):
                 # Entry evicted/gateway restarted — a typed answer would go nowhere.
                 self._clarify_messages.pop(clarify_id, None)
+                self._clarify_choices.pop(clarify_id, None)
                 await self._update_clarify_message(channel_id, msg_ts, original_text, expired_text)
                 return
             # Not terminal: the clarify stays pending for typed text, so keep the card entry —
@@ -6196,6 +6249,7 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, BasePlatformA
             return
         # A choice click is terminal either way (✅ or expired): the card no longer needs retiring.
         self._clarify_messages.pop(clarify_id, None)
+        self._clarify_choices.pop(clarify_id, None)
         # Canonical choice text from the entry; positional fallback on timeout/reset race.
         resolved_text: Optional[str] = None
         try:
@@ -6218,7 +6272,8 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, BasePlatformA
                 user_id)
             logger.debug("Slack clarify choice text (id=%s): %.100r", clarify_id, resolved_text)
         else:
-            # Entry evicted/gateway restarted — show expiry, not a misleading ✓.
+            # Entry evicted/gateway restarted/timed out or cancelled just before retirement — show
+            # expiry, not a misleading ✓ (a click can't tell a timeout from a stop here).
             await self._update_clarify_message(channel_id, msg_ts, original_text, expired_text)
             logger.warning(
                 "[Slack] clarify resolve returned False (id=%s) — expired/reset", clarify_id)

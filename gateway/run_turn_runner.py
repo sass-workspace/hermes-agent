@@ -685,7 +685,7 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
         """One card: register, send, wait, then retire it (no answer) or re-arm (answer).
         Returns ``(response, answered)``; the caller decides what "no answer" means."""
         from gateway.run_turn_runner_clarify_delivery import (
-            UNDELIVERED_NO_SURFACE, _clarify_send_then_wait, text_fallback_coro)
+            CLARIFY_TIMEOUT_PREFIX, UNDELIVERED_NO_SURFACE, _clarify_send_then_wait, text_fallback_coro)
         from tools import clarify_gateway as clarify_mod
         import uuid
         ctx = self._ctx
@@ -733,9 +733,11 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
         # have posted with a late ack. Only a definitive failure tears down the registration;
         # ambiguous falls through to the bounded wait so a late reply resolves. A definitive
         # failure — immediate or late — retries once as plain text before giving up.
+        waited_from = time.monotonic()
         response, answered = _clarify_send_then_wait(
             fut, clarify_id=clarify_id, session_key=session_key, clarify_mod=clarify_mod,
             fallback=_text_fallback)
+        waited = time.monotonic() - waited_from
         if self._approval_owner is not None:
             authority, session_id, generation = self._approval_owner
             authority.sessions[session_id].controls.snapshot(session_id, generation)
@@ -744,8 +746,21 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
         if not answered:
             # No answer arrived (timeout, /new, run end): retire the native card so it stops
             # looking answerable. Adapters without a persistent card have no such method.
+            # A real timeout on an adapter that can keep the choices answerable does that
+            # instead (a later click reaches the bot as a reply; elbDev 2026-11-19).
             retire = getattr(type(ctx._status_adapter), "retire_clarify_card", None)
-            if callable(retire):
+            keep = getattr(type(ctx._status_adapter), "keep_clarify_card_after_timeout", None)
+            # A timeout is the full wait running out; a stop or reset while the card was still
+            # being sent clears the waiter early and also reads "did not respond" (Codex).
+            limit = float(clarify_mod.get_clarify_timeout() or 0)
+            timed_out = (response != clarify_mod.CANCELLED and isinstance(response, str)
+                         and response.startswith(CLARIFY_TIMEOUT_PREFIX)
+                         and limit > 0 and waited >= limit * 0.9)
+            if timed_out and callable(keep):
+                self._schedule(
+                    keep(ctx._status_adapter, clarify_id, _clarify_expired_notice()),
+                    "Clarify card keep failed to schedule")
+            elif callable(retire):
                 self._schedule(
                     retire(ctx._status_adapter, clarify_id, _clarify_expired_notice()),
                     "Clarify card retire failed to schedule")
