@@ -1362,3 +1362,36 @@ class TestDiscoveryMetadataFromMatchedSession:
         hit = next(r for r in result["results"] if r["session_id"] == "s_night")
         assert hit["title"] == "Night ibuprofen plan"
         assert "2025" not in hit["when"]
+
+
+class TestOwnProfileOnly:
+    """elbDev fork: ``session_search.own_profile_only`` keeps a profile to its own sessions."""
+
+    def test_another_profile_is_refused_when_switched_on(self, db, tmp_path, monkeypatch):
+        import tools.session_search_tool as tool
+        other_home = tmp_path / "scout_home"
+        other_home.mkdir()
+        other = SessionDB(other_home / "state.db")
+        other.create_session("s_scout", source="cli")
+        other.append_message("s_scout", role="user", content="secret")
+        other._conn.commit()
+        from hermes_cli import profiles as profiles_mod
+        monkeypatch.setattr(profiles_mod, "normalize_profile_name", lambda n: n)
+        monkeypatch.setattr(profiles_mod, "validate_profile_name", lambda n: None)
+        monkeypatch.setattr(profiles_mod, "profile_exists", lambda n: True)
+        monkeypatch.setattr(profiles_mod, "get_profile_dir", lambda n: other_home)
+        monkeypatch.setattr(tool, "_own_profile_only", lambda: True)
+        result = json.loads(session_search(session_id="s_scout", profile="scout", db=db))
+        assert result["success"] is False
+        assert "secret" not in json.dumps(result)
+        monkeypatch.setattr(tool, "_own_profile_only", lambda: False)
+        allowed = json.loads(session_search(session_id="s_scout", profile="scout", db=db))
+        assert allowed["success"] is True
+
+    def test_the_switch_reads_the_profile_config(self, monkeypatch):
+        import tools.session_search_tool as tool
+        from hermes_cli import config as config_mod
+        monkeypatch.setattr(config_mod, "load_config", lambda: {"session_search": {"own_profile_only": True}})
+        assert tool._own_profile_only() is True
+        monkeypatch.setattr(config_mod, "load_config", lambda: {"session_search": {"own_profile_only": "yes"}})
+        assert tool._own_profile_only() is False

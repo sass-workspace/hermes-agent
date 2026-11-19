@@ -543,6 +543,17 @@ def _discover(db, query: str, role_filter: Optional[list[str]], limit: int, sort
         "session_search(session_id=..., around_message_id=match_message_id)."))
 
 
+def _own_profile_only() -> bool:
+    """``session_search.own_profile_only: true`` in the active profile's config: this profile never
+    reads another profile's sessions, whatever process serves it (elbDev fork: a host whose bots
+    are separate agents keeps each one's chats to itself, the default profile included)."""
+    try:
+        from hermes_cli.config import cfg_get, load_config
+        return cfg_get(load_config(), "session_search", "own_profile_only", default=False) is True
+    except Exception:
+        return False
+
+
 def _cross_profile_reads_confined() -> bool:
     """True when the calling task may read only its own profile's store.
 
@@ -560,6 +571,8 @@ def _cross_profile_reads_confined() -> bool:
     from hermes_cli.profiles import get_profile_dir
     from hermes_constants import get_hermes_home, hermes_home_key
     from tools.approval_context import is_local_interactive_session
+    if _own_profile_only():
+        return True
     if not serves_routed_profile() or is_local_interactive_session():
         return False
     return hermes_home_key(get_hermes_home()) != hermes_home_key(get_profile_dir("default"))
