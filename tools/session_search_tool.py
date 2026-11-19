@@ -10,6 +10,7 @@ No LLM calls — every shape returns actual DB messages.
 
 import json
 import logging
+from pathlib import Path
 import re
 import time
 from datetime import datetime, timezone, UTC
@@ -431,6 +432,16 @@ def _discover(db, query: str, role_filter: Optional[list[str]], limit: int, sort
         "session_search(session_id=..., around_message_id=match_message_id)."))
 
 
+def _own_profile_only() -> bool:
+    """``session_search.own_profile_only: true`` in the active profile's config: this profile never
+    reads another profile's sessions (elbDev fork: a host whose bots are separate agents)."""
+    try:
+        from hermes_cli.config import cfg_get, load_config
+        return cfg_get(load_config(), "session_search", "own_profile_only", default=False) is True
+    except Exception:
+        return False
+
+
 def _resolve_profile_db(profile: str):
     """Another profile's ``state.db`` opened read-only (safe on a live DB); None = current."""
     if profile is None or not str(profile).strip():
@@ -439,6 +450,10 @@ def _resolve_profile_db(profile: str):
     from hermes_state import SessionDB
     canon = profiles_mod.normalize_profile_name(profile)
     profiles_mod.validate_profile_name(canon)
+    if _own_profile_only():
+        from hermes_constants import get_hermes_home
+        if Path(profiles_mod.get_profile_dir(canon)).resolve() != Path(get_hermes_home()).resolve():
+            raise PermissionError("this profile may only search its own sessions")
     if not profiles_mod.profile_exists(canon):
         raise ValueError(f"profile '{canon}' does not exist")
     return SessionDB(db_path=profiles_mod.get_profile_dir(canon) / "state.db", read_only=True)
