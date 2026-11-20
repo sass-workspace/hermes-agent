@@ -2010,3 +2010,313 @@ class TestRunEventsHeadFlush:
             assert first, "no body byte arrived before the first event"
 
             resp.close()
+
+
+# ---------------------------------------------------------------------------
+# POST /v1/runs/stop-by-key — stop the run a key started, or close the key
+# ---------------------------------------------------------------------------
+
+
+def _stop_by_key_app(adapter: APIServerAdapter) -> web.Application:
+    app = _create_runs_app(adapter)
+    app.router.add_post("/v1/runs/stop-by-key", adapter._handle_stop_run_by_key)
+    return app
+
+
+class TestStopByKey:
+    def test_route_is_in_the_table_before_the_run_id_routes_matter(self, adapter):
+        routes = adapter._http_route_table()
+        assert ("POST", "/v1/runs/stop-by-key", adapter._handle_stop_run_by_key) in routes
+
+    @pytest.mark.asyncio
+    async def test_stops_the_running_run_the_key_started(self, adapter, tmp_path):
+        _use_idempotency_db(adapter, tmp_path / "idem.db")
+        app = _stop_by_key_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent, agent_ready, _ = _make_slow_agent()
+                mock_create.return_value = mock_agent
+                started = await cli.post("/v1/runs", json={"input": "hello"},
+                                         headers={"Idempotency-Key": "local-run-1"})
+                assert started.status == 202
+                run_id = (await started.json())["run_id"]
+                agent_ready.wait(timeout=3.0)
+                await asyncio.sleep(0.1)
+
+                stop = await cli.post("/v1/runs/stop-by-key", json={"idempotency_key": "local-run-1"})
+                assert stop.status == 200
+                assert await stop.json() == {"status": "stopped", "run_id": run_id, "run_status": "stopping"}
+                mock_agent.interrupt.assert_called_once_with("Stop requested via API")
+                await async_wait_until(lambda: run_id not in adapter._active_run_tasks, timeout=5,
+                                       what="the stopped run retired")
+                status = await (await cli.get(f"/v1/runs/{run_id}")).json()
+                assert status["status"] == "cancelled"
+
+                # A second stop of the same key still finds the (now finished) run.
+                again = await cli.post("/v1/runs/stop-by-key", json={"idempotency_key": "local-run-1"})
+                assert again.status == 200
+                body = await again.json()
+                assert (body["status"], body["run_id"]) == ("stopped", run_id)
+
+    @pytest.mark.asyncio
+    async def test_unused_key_is_closed_and_a_later_start_is_refused(self, adapter, tmp_path):
+        _use_idempotency_db(adapter, tmp_path / "idem.db")
+        app = _stop_by_key_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                closed = await cli.post("/v1/runs/stop-by-key", json={"idempotency_key": "never-started"})
+                assert closed.status == 200
+                assert await closed.json() == {"status": "closed"}
+
+                late = await cli.post("/v1/runs", json={"input": "hello"},
+                                      headers={"Idempotency-Key": "never-started"})
+                assert late.status == 409
+                assert (await late.json())["error"]["code"] == "idempotency_key_conflict"
+                mock_create.assert_not_called()
+
+                # Closing again is idempotent.
+                assert await (await cli.post(
+                    "/v1/runs/stop-by-key", json={"idempotency_key": "never-started"})).json() == {"status": "closed"}
+                # Another key is untouched.
+                with patch.object(adapter, "_create_agent") as create2:
+                    agent = MagicMock()
+                    agent.run_conversation.return_value = {"final_response": "done"}
+                    agent.session_prompt_tokens = agent.session_completion_tokens = agent.session_total_tokens = 0
+                    create2.return_value = agent
+                    other = await cli.post("/v1/runs", json={"input": "hello"},
+                                           headers={"Idempotency-Key": "other-key"})
+                    assert other.status == 202
+
+    @pytest.mark.asyncio
+    async def test_stop_while_the_start_is_still_admitting(self, adapter, tmp_path):
+        """The app's stop races its own start: the key is reserved but the run has no task yet.
+        The run must end cancelled without a turn ever running."""
+        _use_idempotency_db(adapter, tmp_path / "idem.db")
+        app = _stop_by_key_app(adapter)
+        gate, entered = asyncio.Event(), asyncio.Event()
+
+        async def slow_bot_chat(*_a, **_k):
+            entered.set()
+            await gate.wait()
+            return None
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create, \
+                 patch.object(adapter, "_admit_to_live_bot_chat", side_effect=slow_bot_chat):
+                start = asyncio.create_task(cli.post(
+                    "/v1/runs", json={"input": "hello", "session_id": "chat-1"},
+                    headers={"Idempotency-Key": "racing-key"}))
+                await asyncio.wait_for(entered.wait(), 5)
+                stop = await cli.post("/v1/runs/stop-by-key", json={"idempotency_key": "racing-key"})
+                assert stop.status == 200
+                body = await stop.json()
+                assert body["status"] == "stopped" and body["run_status"] == "stopping"
+                run_id = body["run_id"]
+                gate.set()
+                started = await asyncio.wait_for(start, 5)
+                assert started.status == 202
+                assert (await started.json())["run_id"] == run_id
+                await async_wait_until(lambda: run_id not in adapter._active_run_tasks, timeout=5,
+                                       what="the stopped run retired")
+                assert adapter._run_statuses[run_id]["status"] == "cancelled"
+                mock_create.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("body", [
+        {}, {"idempotency_key": ""}, {"idempotency_key": " x"}, {"idempotency_key": "a b"},
+        {"idempotency_key": "x" * 256}, {"idempotency_key": 5}, {"idempotency_key": "k", "extra": 1},
+        ["idempotency_key"],
+    ])
+    async def test_invalid_body_is_400_and_closes_nothing(self, adapter, tmp_path, body):
+        _use_idempotency_db(adapter, tmp_path / "idem.db")
+        async with TestClient(TestServer(_stop_by_key_app(adapter))) as cli:
+            resp = await cli.post("/v1/runs/stop-by-key", json=body)
+            assert resp.status == 400
+        assert adapter._run_idempotency_store.lookup(
+            adapter._run_idempotency_scope(MagicMock(headers={})), "k", "fp") == ("missing", None)
+
+    @pytest.mark.asyncio
+    async def test_requires_the_same_auth_as_starting(self, auth_adapter, tmp_path):
+        _use_idempotency_db(auth_adapter, tmp_path / "idem.db")
+        async with TestClient(TestServer(_stop_by_key_app(auth_adapter))) as cli:
+            resp = await cli.post("/v1/runs/stop-by-key", json={"idempotency_key": "k"})
+            assert resp.status == 401
+            ok = await cli.post("/v1/runs/stop-by-key", json={"idempotency_key": "k"},
+                                headers={"Authorization": "Bearer sk-secret"})
+            assert await ok.json() == {"status": "closed"}
+
+    @pytest.mark.asyncio
+    async def test_keys_are_scoped_per_caller(self, adapter, tmp_path):
+        """A key closed in one auth/profile namespace leaves the same key elsewhere free."""
+        _use_idempotency_db(adapter, tmp_path / "idem.db")
+        store = adapter._run_idempotency_store
+        default_scope = adapter._run_idempotency_scope(MagicMock(headers={}))
+        async with TestClient(TestServer(_stop_by_key_app(adapter))) as cli:
+            token = _api_request_profile.set("worker")
+            try:
+                worker_scope = adapter._run_idempotency_scope(MagicMock(headers={}))
+            finally:
+                _api_request_profile.reset(token)
+            assert worker_scope != default_scope
+            assert await (await cli.post(
+                "/v1/runs/stop-by-key", json={"idempotency_key": "shared"})).json() == {"status": "closed"}
+        assert store.lookup(default_scope, "shared", "fp")[0] == "conflict"
+        assert store.lookup(worker_scope, "shared", "fp") == ("missing", None)
+
+
+@pytest.mark.asyncio
+async def test_stop_by_key_is_served_under_the_profile_prefix(tmp_path, monkeypatch, request):
+    """``/p/<profile>/v1/runs/stop-by-key`` answers with that profile's key and namespace."""
+    from agent import secret_scope as ss
+    from gateway.config import GatewayConfig
+    from types import SimpleNamespace
+
+    root = tmp_path / "root"
+    for home in (root, root / "profiles" / "worker"):
+        home.mkdir(parents=True, exist_ok=True)
+        (home / "config.yaml").write_text("{}\n", encoding="utf-8")
+    (root / "profiles" / "worker" / ".env").write_text(
+        "API_SERVER_KEY=worker-profile-key-123456\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    ss.set_multiplex_active(True)
+    request.addfinalizer(lambda: ss.set_multiplex_active(False))
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={"key": "default-listener-key-123456"}))
+    adapter.gateway_runner = SimpleNamespace(config=GatewayConfig(multiplex_profiles=True))
+    _use_idempotency_db(adapter, tmp_path / "idem.db")
+    app = web.Application(middlewares=[adapter._make_profile_prefix_middleware()])
+    for method, path, handler in adapter._http_route_table():
+        if path.startswith("/v1/runs"):
+            app.router.add_route(method, path, handler)
+            app.router.add_route(method, f"/p/{{profile}}{path}", handler)
+    async with TestClient(TestServer(app)) as cli:
+        wrong = await cli.post("/p/worker/v1/runs/stop-by-key", json={"idempotency_key": "k"},
+                               headers={"Authorization": "Bearer default-listener-key-123456"})
+        assert wrong.status == 401
+        ok = await cli.post("/p/worker/v1/runs/stop-by-key", json={"idempotency_key": "k"},
+                            headers={"Authorization": "Bearer worker-profile-key-123456"})
+        assert ok.status == 200
+        assert await ok.json() == {"status": "closed"}
+    try:
+        adapter._run_idempotency_store.close()
+    except Exception:
+        pass
+
+
+async def _authority_runs(tmp_path, monkeypatch, answer, agent=None):
+    from types import SimpleNamespace
+
+    from gateway.config import GatewayConfig
+    from gateway.session import SessionStore
+    from gateway.session_authority import initialize_session_authority
+    from hermes_state import SessionDB
+    from tests.gateway.test_api_unknown_resolution import _adapter, _runs_client
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    store = SessionStore(tmp_path / "sessions", GatewayConfig())
+    db = SessionDB(tmp_path / "state.db")
+    runner = SimpleNamespace(_session_db=db, session_store=store, _draining=False, _handle_message=answer,
+                             _cached_agent_for=lambda route: agent)
+    authority = await initialize_session_authority(runner, profile_id="default", instance_id="api-stop-key")
+    adapter = _adapter(runner, db)
+    runner._adapter_for_source = lambda source: adapter
+    client = _runs_client(adapter)
+    await client.start_server()
+
+    async def close():
+        for task in list(adapter._active_run_tasks.values()):
+            task.cancel()
+        await client.close()
+        adapter._response_store.close()
+        adapter._run_idempotency_store.close()
+        db.close()
+        store.close_all_db_handles()
+    return authority, adapter, client, close
+
+
+@pytest.mark.asyncio
+async def test_stop_by_key_interrupts_an_authority_run(tmp_path, monkeypatch):
+    from tests.gateway.test_api_unknown_resolution import _AUTH_HEADERS
+
+    running, release = asyncio.Event(), asyncio.Event()
+
+    async def answer(event):
+        from gateway.session_results import execution_result
+        running.set()
+        await release.wait()
+        execution_result.get()["result"] = {"final_response": "late", "messages": []}
+        return "late"
+
+    agent = MagicMock()
+    agent.interrupt.side_effect = lambda *_a, **_k: release.set()
+    authority, adapter, client, close = await _authority_runs(tmp_path, monkeypatch, answer, agent)
+    try:
+        started = await client.post("/v1/runs", json={"input": "work", "session_id": "api-session"},
+                                    headers=_AUTH_HEADERS | {"Idempotency-Key": "auth-run"})
+        assert started.status == 202, await started.text()
+        run_id = (await started.json())["run_id"]
+        await asyncio.wait_for(running.wait(), 5)
+        stop = await client.post("/v1/runs/stop-by-key", json={"idempotency_key": "auth-run"},
+                                 headers=_AUTH_HEADERS)
+        assert stop.status == 200, await stop.text()
+        body = await stop.json()
+        assert (body["status"], body["run_id"], body["run_status"]) == ("stopped", run_id, "stopping")
+        agent.interrupt.assert_called()
+        # Another caller's namespace never sees the key.
+        from tests.gateway.test_api_unknown_resolution import _OTHER_AUTH_HEADERS
+        other = await client.post("/v1/runs/stop-by-key", json={"idempotency_key": "auth-run"},
+                                  headers=_OTHER_AUTH_HEADERS)
+        assert await other.json() == {"status": "closed"}
+    finally:
+        release.set()
+        await close()
+
+
+@pytest.mark.asyncio
+async def test_stop_by_key_during_authority_admission_never_runs_the_turn(tmp_path, monkeypatch):
+    from gateway import session_api_turn
+    from tests.gateway.test_api_unknown_resolution import _AUTH_HEADERS
+
+    executed = []
+
+    async def answer(event):
+        from gateway.session_results import execution_result
+        executed.append(event.text)
+        execution_result.get()["result"] = {"final_response": "ran", "messages": []}
+        return "ran"
+
+    authority, adapter, client, close = await _authority_runs(tmp_path, monkeypatch, answer)
+    real_admit = session_api_turn.admit_api_turn_async
+    entered, gate = asyncio.Event(), asyncio.Event()
+
+    async def slow_admit(*args, **kwargs):
+        entered.set()
+        await gate.wait()
+        return await real_admit(*args, **kwargs)
+
+    monkeypatch.setattr(session_api_turn, "admit_api_turn_async", slow_admit)
+    try:
+        start = asyncio.create_task(client.post(
+            "/v1/runs", json={"input": "work", "session_id": "api-session"},
+            headers=_AUTH_HEADERS | {"Idempotency-Key": "admitting"}))
+        await asyncio.wait_for(entered.wait(), 5)
+        stop = await client.post("/v1/runs/stop-by-key", json={"idempotency_key": "admitting"},
+                                 headers=_AUTH_HEADERS)
+        assert stop.status == 200, await stop.text()
+        body = await stop.json()
+        assert (body["status"], body["run_status"]) == ("stopped", "stopping")
+        gate.set()
+        started = await asyncio.wait_for(start, 5)
+        assert started.status == 202, await started.text()
+        run_id = (await started.json())["run_id"]
+        assert run_id == body["run_id"]
+        await async_wait_until(lambda: run_id not in adapter._active_run_tasks, timeout=5,
+                               what="the stopped run retired")
+        session = authority.sessions.get("api-session")
+        if session is not None and session.task is not None:
+            await asyncio.wait_for(asyncio.shield(session.task), 5)
+        assert executed == [], "a run stopped while admitting must never run its turn"
+        status = await (await client.get(f"/v1/runs/{run_id}", headers=_AUTH_HEADERS)).json()
+        assert status["status"] == "cancelled", status
+    finally:
+        gate.set()
+        await close()

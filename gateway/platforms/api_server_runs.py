@@ -7,6 +7,7 @@ import hashlib
 import json
 import logging
 import os
+import sqlite3
 import threading
 import time
 import uuid
@@ -284,6 +285,7 @@ def _initialize_run_state(self, *, store_factory) -> None:
 def _http_routes(self) -> list[tuple[str, str, Any]]:
     return [
         ("POST", "/v1/runs", self._handle_runs), ("GET", "/v1/runs/{run_id}", self._handle_get_run),
+        ("POST", "/v1/runs/stop-by-key", self._handle_stop_run_by_key),
         ("GET", "/v1/runs/{run_id}/events", self._handle_run_events),
         ("POST", "/v1/runs/{run_id}/approval", self._handle_run_approval),
         ("POST", "/v1/runs/{run_id}/clarify", self._handle_run_clarify),
@@ -406,7 +408,8 @@ def _make_run_event_callback(self, run_id: str, loop: asyncio.AbstractEventLoop,
 # and clarify share the grant's ``approve`` permission. Acknowledging a lost owner epoch
 # ends the run like a stop, so ``/resolve-unknown`` rides the ``stop`` permission.
 _ROOM_CONTROL_PERMISSIONS = {
-    "/stop": "stop", "/resolve-unknown": "stop", "/approval": "approve", "/clarify": "approve"}
+    "/stop": "stop", "/stop-by-key": "stop", "/resolve-unknown": "stop", "/approval": "approve",
+    "/clarify": "approve"}
 
 
 def _room_permission_for(request: web.Request) -> str:
@@ -889,6 +892,14 @@ async def _handle_runs(self, request: web.Request, *, _api_server) -> web.Respon
             idempotency_scope, idempotency_key, _openai_error)
         if refused is not None:
             return refused
+        if run_id in self._stopping_run_ids:
+            # A stop (by key) landed while this turn was being admitted: stop the admission now
+            # that it exists; ``_execute_run`` then ends the run ``cancelled``.
+            from gateway.platforms.api_server_authority_runs import stop_run
+            try:
+                await stop_run(self, run_id)
+            except Exception:  # health: allow BLE001 -- the run still ends cancelled below
+                logger.warning("[api_server] stop of run %s after admission failed", run_id, exc_info=True)
     self._activate_admitted_request()
     if admitted is not None:
         task = self._active_run_tasks[run_id] = asyncio.create_task(
@@ -1545,26 +1556,41 @@ async def _handle_steer_run(self, request: web.Request, *, _api_server) -> web.R
     return web.json_response({"object": "hermes.run.steer", "run_id": run_id, "accepted": True})
 
 
-async def _handle_stop_run(self, request: web.Request, *, _api_server) -> web.Response:
-    """POST /v1/runs/{run_id}/stop — interrupt a running agent."""
+def _admitting_here(self, run_id: str, status: Optional[dict[str, Any]]) -> bool:
+    """True while POST /v1/runs in THIS process reserved *run_id* but has not yet handed it to an
+    executor: its stream exists, no task does, and nothing has settled it."""
+    return (run_id in self._run_streams and run_id not in self._active_run_tasks
+            and (status or {}).get("status") not in TERMINAL_STATUSES)
+
+
+def _hold_stop_until_admitted(self, run_id: str) -> web.Response:
+    """Stop a run that is still being admitted: ``_handle_runs`` stops its admission once it exists
+    and ``_execute_run`` ends it ``cancelled`` before any turn starts."""
+    self._set_run_status(run_id, "stopping", last_event="run.stopping")
+    self._stopping_run_ids.add(run_id)
+    return web.json_response({"run_id": run_id, "status": "stopping"})
+
+
+async def _stop_owned_run(self, run_id, status, agent, task, *, _api_server) -> web.Response:
+    """Stop one run the caller owns (shared by ``/v1/runs/{id}/stop`` and ``/v1/runs/stop-by-key``)."""
     _openai_error = _api_server._openai_error
-    run_id, status, agent, task, err = _load_owned_run(
-        self, request, _api_server=_api_server, permission="stop", active_fallback=True)
-    if err is not None:
-        return err
     # A run whose turn a live Bot Chat owns (``_execute_run_via_live_owner``) is not an API
     # admission: its stop is the legacy in-process task cancel below, never ``stop_run``.
     if (getattr(self.gateway_runner, 'session_authority', None) is not None
-            and not (task is not None and status.get("delivery_id"))):
-        from gateway.platforms.api_server_authority_runs import stop_run, store_error_response
+            and not (task is not None and (status or {}).get("delivery_id"))):
+        from gateway.platforms.api_server_authority_runs import run_admission, stop_run, store_error_response
         from hermes_state_runtime import RuntimeStoreError
+        if _admitting_here(self, run_id, status) and await asyncio.to_thread(run_admission, self, run_id) is None:
+            return _hold_stop_until_admitted(self, run_id)
         try:
             return web.json_response(await stop_run(self, run_id))
         except RuntimeStoreError as exc:
             return store_error_response(_openai_error, exc)
-    if status.get("status") in TERMINAL_STATUSES:
-        return web.json_response(status)
+    if status is None or status.get("status") in TERMINAL_STATUSES:
+        return web.json_response(status) if status is not None else _run_not_found(_openai_error, run_id)
     if agent is None and task is None:
+        if _admitting_here(self, run_id, status):
+            return _hold_stop_until_admitted(self, run_id)
         return _json_error(
             _openai_error, f"Run is not active in this gateway process: {run_id}",
             code="run_not_active", status=409)
@@ -1577,6 +1603,61 @@ async def _handle_stop_run(self, request: web.Request, *, _api_server) -> web.Re
         # run on the same session_id keeps its own); no-op if the run already finished.
         _api_server._reap_disconnected_agent_processes(agent, source="api_server_run_stop")
     return web.json_response({"run_id": run_id, "status": "stopping"})
+
+
+async def _handle_stop_run(self, request: web.Request, *, _api_server) -> web.Response:
+    """POST /v1/runs/{run_id}/stop — interrupt a running agent."""
+    run_id, status, agent, task, err = _load_owned_run(
+        self, request, _api_server=_api_server, permission="stop", active_fallback=True)
+    if err is not None:
+        return err
+    return await _stop_owned_run(self, run_id, status, agent, task, _api_server=_api_server)
+
+
+async def _handle_stop_run_by_key(self, request: web.Request, *, _api_server) -> web.Response:
+    """POST /v1/runs/stop-by-key ``{"idempotency_key": "<key>"}`` — stop the run a keyed
+    POST /v1/runs admitted, or close the key so nothing ever starts under it.
+
+    Same auth and namespace as starting the run (``_run_idempotency_scope``). The lookup and the
+    close are one write transaction (``find_or_close``), so a start racing this stop either is
+    found and stopped or is refused with ``idempotency_key_conflict`` (409). Replies
+    ``{"status": "stopped", "run_id", "run_status"}`` or ``{"status": "closed"}``."""
+    _openai_error = _api_server._openai_error
+    auth_err = self._check_run_auth(request, permission="stop")
+    if auth_err:
+        return auth_err
+    body, err = await self._read_json_body(request)
+    if err is not None:
+        return err
+    key = body.get("idempotency_key") if isinstance(body, dict) else None
+    if (not isinstance(key, str) or set(body) != {"idempotency_key"} or not key.strip()
+            or key != key.strip() or len(key) > 255 or any(ord(ch) < 33 or ord(ch) > 126 for ch in key)):
+        return _json_error(
+            _openai_error, "Body must be {\"idempotency_key\": <1-255 visible ASCII characters>}",
+            code="invalid_idempotency_key", status=400)
+    scope = self._run_idempotency_scope(request)
+    try:
+        outcome, record = await asyncio.to_thread(self._run_idempotency_store.find_or_close, scope, key)
+    except (sqlite3.Error, OSError):
+        return _json_error(
+            _openai_error, "Run store is unavailable.", err_type="server_error",
+            code="run_store_unavailable", status=503)
+    if outcome == "closed":
+        return web.json_response({"status": "closed"})
+    run_id = str(record["run_id"])
+    agent = self._active_run_agents.get(run_id)
+    task = self._active_run_tasks.get(run_id)
+    status = self._durable_run_status(request, run_id)
+    if status is None and (agent is not None or task is not None):
+        status = self._set_run_status(run_id, "running")
+    response = await _stop_owned_run(self, run_id, status, agent, task, _api_server=_api_server)
+    if response.status >= 400:
+        return response
+    with suppress(Exception):
+        stopped = json.loads(response.body)
+        return web.json_response(
+            {"status": "stopped", "run_id": run_id, "run_status": stopped.get("status")})
+    return web.json_response({"status": "stopped", "run_id": run_id})
 
 
 async def _handle_resolve_unknown_run(
