@@ -719,3 +719,46 @@ def test_run_job_records_the_session_it_runs_in(tmp_path, monkeypatch):
     assert ok and final == "ok"
     assert seen['at_construct'] == 'canonical-cron-session'
     assert get_execution('cron-owner-request')['session_id'] == 'canonical-cron-session'
+
+
+def test_start_paths_fill_only_an_empty_session(monkeypatch, tmp_path):
+    """A late receipt (or owner start) must not undo finalization's move to the compression tip."""
+    executions = _point_ledger(monkeypatch, tmp_path)
+    record = executions.create_execution("job-late", source="cron")
+    executions.record_execution_session(record["id"], "cron-root")  # start path
+    executions.record_execution_session(record["id"], "cron-root-tip", replace=True)  # finalize
+    executions.record_execution_session(record["id"], "cron-root")  # late receipt
+    assert executions.get_execution(record["id"])["session_id"] == "cron-root-tip"
+    assert executions.set_execution_session(record["id"], "other", replace=False) is True
+    assert executions.get_execution(record["id"])["session_id"] == "cron-root-tip"
+
+
+def test_deferred_finalize_runs_in_the_registering_profile_context():
+    """A timed-out worker's late finalize resolves profile-scoped paths (the ledger) for the run's
+    profile: the done-callback runs in a copy of the registering context, not the worker's."""
+    import contextvars
+    import threading
+    from concurrent.futures import Future
+    from unittest.mock import MagicMock, patch
+
+    from cron.scheduler_detached_worker import defer_teardown_to_running_worker
+
+    marker = contextvars.ContextVar("test_profile_marker", default="launch-profile")
+    seen = []
+    future = Future()
+    token = marker.set("run-profile")
+    try:
+        with patch("cron.scheduler._finalize_cron_session",
+                   side_effect=lambda *a, **k: seen.append(marker.get())), \
+             patch("cron.scheduler._teardown_cron_agent"):
+            assert defer_teardown_to_running_worker(
+                future, MagicMock(), MagicMock(), "job", "Job", "cron-sid", execution_id="e1") is True
+            marker.reset(token)
+            token = None
+            worker = threading.Thread(target=future.set_result, args=({},))
+            worker.start()
+            worker.join(5)
+    finally:
+        if token is not None:
+            marker.reset(token)
+    assert seen == ["run-profile"]

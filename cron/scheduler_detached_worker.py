@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import contextlib
+import contextvars
 import subprocess
 import threading
 from typing import Optional
@@ -48,8 +49,12 @@ def defer_teardown_to_running_worker(
         finally:
             _teardown_cron_agent(agent, job_id)
 
+    # The callback runs on the worker's thread after run_job's context is gone: run it in a copy of
+    # the registering context so profile-scoped paths (the executions ledger) resolve to this
+    # run's profile, not the process's launch profile.
+    context = contextvars.copy_context()
     # Runs inline if the worker finished between done() and here — still exactly once.
-    future.add_done_callback(_finish)
+    future.add_done_callback(lambda done: context.run(_finish, done))
     return True
 
 
