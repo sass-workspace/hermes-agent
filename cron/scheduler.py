@@ -2140,7 +2140,7 @@ def _finalize_cron_session(session_db, agent, job_id: str, job_name: str, cron_s
     if execution_id and _final_cron_session_id != cron_session_id:
         # The run continued in a compression child: the ledger row points at the final session.
         from cron.executions import record_execution_session
-        record_execution_session(execution_id, _final_cron_session_id)
+        record_execution_session(execution_id, _final_cron_session_id, replace=True)
     # Title must persist BEFORE end_session()/close(). Run-time suffix keeps it unique against the
     # sessions.title index; the fallbacks below guarantee a non-blank title.
     try:

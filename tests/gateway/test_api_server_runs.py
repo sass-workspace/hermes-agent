@@ -2320,3 +2320,116 @@ async def test_stop_by_key_during_authority_admission_never_runs_the_turn(tmp_pa
     finally:
         gate.set()
         await close()
+
+
+@pytest.mark.asyncio
+async def test_stop_by_key_latches_before_its_admission_lookup(tmp_path, monkeypatch):
+    """The start commits its admission while the stop's lookup is still reading "none": the stop
+    was latched first, so the start handler stops the admission and no turn runs."""
+    import threading as _threading
+
+    from gateway import session_api_turn
+    from gateway.platforms import api_server_authority_runs
+    from tests.gateway.test_api_unknown_resolution import _AUTH_HEADERS
+
+    executed = []
+
+    async def answer(event):
+        from gateway.session_results import execution_result
+        executed.append(event.text)
+        execution_result.get()["result"] = {"final_response": "ran", "messages": []}
+        return "ran"
+
+    authority, adapter, client, close = await _authority_runs(tmp_path, monkeypatch, answer)
+    real_admit = session_api_turn.admit_api_turn_async
+    real_lookup = api_server_authority_runs.run_admission
+    entered, gate = asyncio.Event(), asyncio.Event()
+    admitted = _threading.Event()
+    stale_reads = []
+
+    async def slow_admit(*args, **kwargs):
+        entered.set()
+        await gate.wait()
+        try:
+            return await real_admit(*args, **kwargs)
+        finally:
+            admitted.set()
+
+    def stale_first_lookup(adapter_, run_id):
+        # Only the stop's off-loop lookup reads stale; the status projection reads on the loop.
+        if not stale_reads and _threading.current_thread() is not _threading.main_thread():
+            stale_reads.append(run_id)
+            loop.call_soon_threadsafe(gate.set)
+            admitted.wait(5)
+            time.sleep(0.2)  # the start handler has checked for a stop by now
+            return None  # the read predates the admission
+        return real_lookup(adapter_, run_id)
+
+    loop = asyncio.get_running_loop()
+    monkeypatch.setattr(session_api_turn, "admit_api_turn_async", slow_admit)
+    monkeypatch.setattr(api_server_authority_runs, "run_admission", stale_first_lookup)
+    try:
+        start = asyncio.create_task(client.post(
+            "/v1/runs", json={"input": "work", "session_id": "api-session"},
+            headers=_AUTH_HEADERS | {"Idempotency-Key": "lookup-race"}))
+        await asyncio.wait_for(entered.wait(), 5)
+        stop = await client.post("/v1/runs/stop-by-key", json={"idempotency_key": "lookup-race"},
+                                 headers=_AUTH_HEADERS)
+        assert stop.status == 200, await stop.text()
+        assert stale_reads, "the stop never took the admitting branch"
+        started = await asyncio.wait_for(start, 5)
+        run_id = (await started.json())["run_id"]
+        await async_wait_until(lambda: run_id not in adapter._active_run_tasks, timeout=5,
+                               what="the stopped run retired")
+        session = authority.sessions.get("api-session")
+        if session is not None and session.task is not None:
+            await asyncio.wait_for(asyncio.shield(session.task), 5)
+        assert executed == []
+        status = await (await client.get(f"/v1/runs/{run_id}", headers=_AUTH_HEADERS)).json()
+        assert status["status"] == "cancelled", status
+    finally:
+        gate.set()
+        admitted.set()
+        await close()
+
+
+@pytest.mark.asyncio
+async def test_refused_admission_after_a_stop_keeps_the_key_closed(tmp_path, monkeypatch):
+    from gateway import session_api_turn
+    from hermes_state_runtime import RuntimeStoreError
+    from tests.gateway.test_api_unknown_resolution import _AUTH_HEADERS
+
+    async def answer(event):
+        raise AssertionError("no turn may run")
+
+    authority, adapter, client, close = await _authority_runs(tmp_path, monkeypatch, answer)
+    entered, gate = asyncio.Event(), asyncio.Event()
+    calls = []
+
+    async def refusing_admit(*args, **kwargs):
+        calls.append(1)
+        entered.set()
+        await gate.wait()
+        raise RuntimeStoreError("runtime_draining")
+
+    monkeypatch.setattr(session_api_turn, "admit_api_turn_async", refusing_admit)
+    try:
+        body = {"input": "work", "session_id": "api-session"}
+        headers = _AUTH_HEADERS | {"Idempotency-Key": "refused"}
+        start = asyncio.create_task(client.post("/v1/runs", json=body, headers=headers))
+        await asyncio.wait_for(entered.wait(), 5)
+        stop = await client.post("/v1/runs/stop-by-key", json={"idempotency_key": "refused"},
+                                 headers=_AUTH_HEADERS)
+        assert (await stop.json())["status"] == "stopped"
+        gate.set()
+        refused = await asyncio.wait_for(start, 5)
+        assert refused.status >= 400
+        retry = await client.post("/v1/runs", json=body, headers=headers)
+        assert retry.status == 409, await retry.text()
+        assert (await retry.json())["error"]["code"] == "idempotency_key_conflict"
+        assert len(calls) == 1
+        assert await (await client.post("/v1/runs/stop-by-key", json={"idempotency_key": "refused"},
+                                        headers=_AUTH_HEADERS)).json() == {"status": "closed"}
+    finally:
+        gate.set()
+        await close()

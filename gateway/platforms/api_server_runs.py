@@ -272,6 +272,9 @@ def _initialize_run_state(self, *, store_factory) -> None:
     # (approval core resolves by session key, clients by run_id).
     self._run_idempotency_ids: set[str] = set()
     self._stopping_run_ids: set[str] = set()
+    # Runs a stop-by-key ended while they were still being admitted: their key stays closed even
+    # when the admission is then refused (a plain /stop leaves a refused key free for a retry).
+    self._stopped_by_key_run_ids: set[str] = set()
     self._shutdown_interrupted_run_ids: set[str] = set()
     self._run_shutdown_requested_at: Optional[float] = None
     # Streaming run id -> its canonical admission id, held while that request observes the turn.
@@ -614,7 +617,7 @@ def _forget_run(self, run_id: str, *tables) -> None:
 def _retire_live_run(self, run_id: str) -> None:
     """Retire agent/task/approval control state once the executor-backed task is done."""
     _forget_run(self, run_id, self._active_run_agents, self._active_run_tasks, self._run_approval_sessions,
-                self._stopping_run_ids, self._shutdown_interrupted_run_ids)
+                self._stopping_run_ids, self._shutdown_interrupted_run_ids, self._stopped_by_key_run_ids)
 
 
 def _drop_run_transport(self, run_id: str) -> None:
@@ -759,11 +762,16 @@ async def _admit_run_to_authority(
             return None
         # A refused admission owns no run: drop every reservation so an exact
         # retry is refused again instead of replaying a run nobody executes.
+        stopped = run_id in self._stopped_by_key_run_ids
         _forget_run(
             self, run_id, self._run_streams, self._run_streams_created, self._run_approval_sessions,
-            self._run_statuses, self._run_owners, self._run_idempotency_ids)
+            self._run_statuses, self._run_owners, self._run_idempotency_ids, self._stopped_by_key_run_ids)
         if idempotency_key:
             self._run_idempotency_store.forget(idempotency_scope, idempotency_key)
+            if stopped:
+                # A stop-by-key already answered "stopped" for this key: keep it closed, so a retry
+                # under the same key is refused instead of starting the work after all.
+                self._run_idempotency_store.find_or_close(idempotency_scope, idempotency_key)
         return store_error_response(_openai_error, exc)
     return None
 
@@ -1580,8 +1588,12 @@ async def _stop_owned_run(self, run_id, status, agent, task, *, _api_server) -> 
             and not (task is not None and (status or {}).get("delivery_id"))):
         from gateway.platforms.api_server_authority_runs import run_admission, stop_run, store_error_response
         from hermes_state_runtime import RuntimeStoreError
-        if _admitting_here(self, run_id, status) and await asyncio.to_thread(run_admission, self, run_id) is None:
-            return _hold_stop_until_admitted(self, run_id)
+        if _admitting_here(self, run_id, status):
+            # Latch the stop BEFORE yielding: if the start commits its admission while the lookup
+            # below runs, ``_handle_runs`` sees the latch after admission and stops it there.
+            held = _hold_stop_until_admitted(self, run_id)
+            if await asyncio.to_thread(run_admission, self, run_id) is None:
+                return held
         try:
             return web.json_response(await stop_run(self, run_id))
         except RuntimeStoreError as exc:
@@ -1650,6 +1662,8 @@ async def _handle_stop_run_by_key(self, request: web.Request, *, _api_server) ->
     status = self._durable_run_status(request, run_id)
     if status is None and (agent is not None or task is not None):
         status = self._set_run_status(run_id, "running")
+    if _admitting_here(self, run_id, status):
+        self._stopped_by_key_run_ids.add(run_id)
     response = await _stop_owned_run(self, run_id, status, agent, task, _api_server=_api_server)
     if response.status >= 400:
         return response

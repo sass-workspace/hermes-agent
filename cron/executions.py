@@ -285,16 +285,18 @@ def set_execution_occurrence(execution_id: str, instant: Optional[str]) -> None:
             raise RuntimeError("Cron occurrence could not be bound before dispatch")
 
 
-def set_execution_session(execution_id: str, session_id: Optional[str]) -> bool:
+def set_execution_session(execution_id: str, session_id: Optional[str], *, replace: bool = True) -> bool:
     """Record the session an attempt ran in. Metadata only: it is not part of the attempt's
     outcome, so it may still be set (or moved to a compression tip) after the row turned terminal.
-    Best effort: returns False when the row is gone or the id is empty, never raises on a
-    missing row."""
+    ``replace=False`` only fills an empty column: the run's start (receipt, owner ``run_job``) may
+    land after finalization already moved the row to its compression tip, and must not undo that.
+    Returns False when the row is gone or the id is empty; never raises on a missing row."""
     if not execution_id or not session_id:
         return False
+    guard = "COALESCE(session_id, '') != ?" if replace else "session_id IS NULL AND ? IS NOT NULL"
     with _transaction() as conn:
         cur = conn.execute(
-            "UPDATE executions SET session_id=? WHERE id=? AND COALESCE(session_id, '') != ?",
+            f"UPDATE executions SET session_id=? WHERE id=? AND {guard}",
             (str(session_id), str(execution_id), str(session_id)),
         )
         changed = cur.rowcount == 1
@@ -304,12 +306,15 @@ def set_execution_session(execution_id: str, session_id: Optional[str]) -> bool:
     return True
 
 
-def record_execution_session(execution_id: Optional[str], session_id: Optional[str]) -> None:
-    """``set_execution_session`` for run paths: a ledger failure must never fail the run."""
+def record_execution_session(
+    execution_id: Optional[str], session_id: Optional[str], *, replace: bool = False,
+) -> None:
+    """``set_execution_session`` for run paths: a ledger failure must never fail the run. Start
+    paths fill an empty column only; finalization passes ``replace=True`` for the compression tip."""
     if not execution_id or not session_id:
         return
     try:
-        set_execution_session(execution_id, session_id)
+        set_execution_session(execution_id, session_id, replace=replace)
     except Exception as exc:  # noqa: BLE001 - metadata only
         logger.debug("cron execution %s: failed to record session: %s", execution_id, exc)
 
