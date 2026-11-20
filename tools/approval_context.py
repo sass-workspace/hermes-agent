@@ -146,6 +146,17 @@ def get_current_turn_id(default: str = "") -> str:
     return _approval_turn_id.get() or default
 
 
+def bind_current_session_id(session_id: str) -> contextvars.Token[str] | None:
+    """Bind the executing agent's session id for code under an agent-level ("inline") tool, which
+    bypasses ``model_tools``' dispatch binding. ``None`` (nothing bound) for an empty id."""
+    return _approval_session_id.set(session_id) if session_id else None
+
+
+def reset_current_session_id(token: contextvars.Token[str] | None) -> None:
+    if token is not None:
+        _approval_session_id.reset(token)
+
+
 def get_current_session_id(default: str = "") -> str:
     """The Hermes session id of the executing tool call: the id bound around the dispatch
     (``set_current_observability_context``), else the session-scoped ``HERMES_SESSION_ID``

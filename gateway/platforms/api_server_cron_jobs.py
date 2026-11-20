@@ -84,8 +84,12 @@ async def handle_list_executions(adapter, request: web.Request) -> web.Response:
             return web.json_response({"error": "limit must be an integer"}, status=400)
         limit = max(1, min(limit, EXECUTIONS_MAX_LIMIT))
     try:
+        import asyncio
+
         from cron.executions import list_executions
-        rows = list_executions(job_id=job_id, limit=limit)
+        # Off the event loop: the ledger lock and SQLite busy waits must not stall the gateway.
+        # to_thread copies the context, so the /p/<profile>/ home scope still applies.
+        rows = await asyncio.to_thread(list_executions, job_id=job_id, limit=limit)
     except Exception as e:  # the HTTP boundary: a redacted 500, the traceback stays in the log
         logger.warning("Cron executions API failed for job %s", job_id, exc_info=True)
         return adapter._cron_error_response(e)

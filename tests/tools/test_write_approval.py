@@ -546,3 +546,27 @@ def test_records_without_source_keys_still_read_and_approve(hermes_home):
     out = handle_pending_subcommand(wa.MEMORY, ["approve", "all"], memory_store=store)
     assert "Approved 1" in out
     assert store.user_entries == ["legacy"]
+
+
+def test_inline_memory_write_names_the_agents_session(hermes_home, no_session_env, monkeypatch):
+    """``memory`` runs as an agent-level (inline) tool, outside model_tools' dispatch binding: the
+    staged record still names the agent's session (for the review fork, the reviewed chat)."""
+    from types import SimpleNamespace
+
+    from agent.inline_tool_executors import INLINE_TOOL_EXECUTORS
+    from tools.memory_tool import MemoryStore
+    from tools import write_approval as wa
+
+    _set_approval("memory", True)
+    monkeypatch.setenv("HERMES_SINGLE_QUERY_SESSION", "1")
+    store = MemoryStore()
+    store.load_from_disk()
+    agent = SimpleNamespace(session_id="reviewed-chat-7", _memory_store=store, _memory_manager=None)
+    ctx = SimpleNamespace(effective_task_id="", tool_call_id="c1")
+    out = json.loads(INLINE_TOOL_EXECUTORS["memory"](
+        agent, {"action": "add", "target": "memory", "content": "inline fact"}, ctx))
+    assert out.get("staged") is True, out
+    [record] = wa.list_pending("memory")
+    assert record["session_id"] == "reviewed-chat-7"
+    from tools.approval_context import get_current_session_id
+    assert get_current_session_id() == ""  # unbound again after the call

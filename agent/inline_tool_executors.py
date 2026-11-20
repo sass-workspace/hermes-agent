@@ -357,8 +357,16 @@ def _coerced(name: str, executor: InlineToolExecutor) -> InlineToolExecutor:
         from tools.hosted_tool_policy import hosted_tool_refusal
         if refusal := hosted_tool_refusal(name):  # the table is an execution primitive: same allowlist
             return json.dumps({"error": refusal}, ensure_ascii=False)
-        return call_with_arg_checks(
-            registry.get_entry(name), coerce_tool_args(name, args), lambda checked: executor(agent, checked, ctx))
+        # Inline tools skip model_tools' dispatch binding: bind the agent's own session id so a
+        # write staged here (memory) names the conversation it came from — for the review fork the
+        # reviewed conversation, whose id the fork adopts.
+        from tools.approval_context import bind_current_session_id, reset_current_session_id
+        token = bind_current_session_id(str(getattr(agent, "session_id", "") or ""))
+        try:
+            return call_with_arg_checks(
+                registry.get_entry(name), coerce_tool_args(name, args), lambda checked: executor(agent, checked, ctx))
+        finally:
+            reset_current_session_id(token)
     return _exec
 
 
