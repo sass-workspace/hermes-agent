@@ -430,3 +430,119 @@ def test_staged_hint_keeps_command_for_chat_gateway_platform(hermes_home, monkey
     monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
     r = _stage_one_memory_write()
     assert "/memory pending" in r["message"], r["message"]
+
+
+# ---------------------------------------------------------------------------
+# Staged records carry their source (session_id, run_kind)
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def no_session_env(monkeypatch):
+    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+
+
+def test_staged_record_names_the_bound_session_and_chat(hermes_home, no_session_env):
+    from tools import write_approval as wa
+    from tools.approval_context import reset_current_observability_context, set_current_observability_context
+
+    tokens = set_current_observability_context(turn_id="t1", tool_call_id="c1", session_id="sess-chat-1")
+    try:
+        record = wa.stage_write("memory", {"action": "add", "target": "user", "content": "x"},
+                                summary="x", origin="foreground")
+    finally:
+        reset_current_observability_context(tokens)
+    assert record["session_id"] == "sess-chat-1"
+    assert record["run_kind"] == "chat"
+    on_disk = wa.get_pending("memory", record["id"])
+    assert (on_disk["session_id"], on_disk["run_kind"]) == ("sess-chat-1", "chat")
+
+
+def test_staged_record_falls_back_to_the_session_env(hermes_home, monkeypatch):
+    from tools import write_approval as wa
+
+    monkeypatch.setenv("HERMES_SESSION_ID", "sess-env-2")
+    record = wa.stage_write("skills", {"action": "create", "name": "s"}, summary="s", origin="foreground")
+    assert record["session_id"] == "sess-env-2"
+
+
+def test_staged_record_without_a_session_is_null(hermes_home, no_session_env):
+    from tools import write_approval as wa
+
+    record = wa.stage_write("memory", {"action": "add", "target": "user", "content": "x"},
+                            summary="x", origin="foreground")
+    assert record["session_id"] is None
+    assert record["run_kind"] == "chat"
+    assert json.loads(wa._pending_path("memory", record["id"]).read_text())["session_id"] is None
+
+
+def test_staged_record_in_a_cron_run_is_cron(hermes_home, no_session_env):
+    from cron.execution_identity import enter_cron_execution, exit_cron_execution
+    from tools import write_approval as wa
+    from tools.skill_provenance import reset_current_write_origin, set_current_write_origin
+
+    token = enter_cron_execution({"id": "job1", "name": "Nightly"}, "exec1", {"source": "builtin"})
+    try:
+        assert wa.stage_write("memory", {"action": "add", "target": "memory", "content": "c"},
+                              summary="c", origin="foreground")["run_kind"] == "cron"
+        # A review fork inside the cron run is still the cron run's write.
+        origin = set_current_write_origin("background_review")
+        try:
+            assert wa.stage_write("memory", {"action": "add", "target": "memory", "content": "d"},
+                                  summary="d", origin="background_review")["run_kind"] == "cron"
+        finally:
+            reset_current_write_origin(origin)
+    finally:
+        exit_cron_execution(token)
+
+
+def test_staged_record_from_the_review_fork_is_background_review(hermes_home, no_session_env):
+    from tools import write_approval as wa
+    from tools.skill_provenance import reset_current_write_origin, set_current_write_origin
+
+    token = set_current_write_origin("background_review")
+    try:
+        record = wa.stage_write("skills", {"action": "create", "name": "s"}, summary="s",
+                                origin=wa.current_origin())
+    finally:
+        reset_current_write_origin(token)
+    assert (record["origin"], record["run_kind"]) == ("background_review", "background_review")
+
+
+def test_memory_tool_staging_records_its_source(hermes_home, no_session_env, monkeypatch):
+    """The real staging path (memory tool, headless) writes the keys."""
+    from tools.approval_context import reset_current_observability_context, set_current_observability_context
+    from tools.memory_tool import MemoryStore, memory_tool
+    from tools import write_approval as wa
+
+    _set_approval("memory", True)
+    monkeypatch.setenv("HERMES_SINGLE_QUERY_SESSION", "1")
+    store = MemoryStore()
+    store.load_from_disk()
+    tokens = set_current_observability_context(session_id="sess-tool-3")
+    try:
+        r = json.loads(memory_tool("add", "memory", "a fact", store=store))
+    finally:
+        reset_current_observability_context(tokens)
+    assert r["staged"] is True
+    [record] = wa.list_pending("memory")
+    assert (record["session_id"], record["run_kind"]) == ("sess-tool-3", "chat")
+
+
+def test_records_without_source_keys_still_read_and_approve(hermes_home):
+    """Records staged by an older build lack the keys; every reader keeps working."""
+    from hermes_cli.write_approval_commands import handle_pending_subcommand
+    from tools.memory_tool import MemoryStore
+    from tools import write_approval as wa
+
+    path = wa._pending_path("memory", "old00001")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({
+        "id": "old00001", "subsystem": "memory", "action": "add", "summary": "old",
+        "origin": "foreground", "created_at": 1.0,
+        "payload": {"action": "add", "target": "user", "content": "legacy"}}), encoding="utf-8")
+    [record] = wa.list_pending("memory")
+    assert "session_id" not in record and "run_kind" not in record
+    store = MemoryStore(); store.load_from_disk()
+    out = handle_pending_subcommand(wa.MEMORY, ["approve", "all"], memory_store=store)
+    assert "Approved 1" in out
+    assert store.user_entries == ["legacy"]
