@@ -2113,7 +2113,7 @@ def _final_response_from_result(result: dict, job_id: str, job_name: str, AIAgen
 
 
 def _finalize_cron_session(session_db, agent, job_id: str, job_name: str, cron_session_id: str,
-                           workdir: Optional[str] = None) -> None:
+                           workdir: Optional[str] = None, execution_id: Optional[str] = None) -> None:
     """Title, classify, end and release the cron session after the agent turn has returned."""
     # Bound every DB op so storage failure cannot hold the dispatch guard.
     _session_db = _BoundedCronSessionDB(session_db, job_id)
@@ -2137,6 +2137,10 @@ def _finalize_cron_session(session_db, agent, job_id: str, job_name: str, cron_s
             if _agent_session_id:
                 _final_cron_session_id = _agent_session_id
         logger.debug("Job '%s': failed to resolve cron compression tip: %s", job_id, e)
+    if execution_id and _final_cron_session_id != cron_session_id:
+        # The run continued in a compression child: the ledger row points at the final session.
+        from cron.executions import record_execution_session
+        record_execution_session(execution_id, _final_cron_session_id)
     # Title must persist BEFORE end_session()/close(). Run-time suffix keeps it unique against the
     # sessions.title index; the fallbacks below guarantee a non-blank title.
     try:
@@ -2574,6 +2578,8 @@ def run_job(
 
     _cron_session_id = (owner_execution[1] if owner_execution is not None else
                         f"cron_{job_id}_{_hermes_now().strftime('%Y%m%d_%H%M%S')}")
+    from cron.executions import record_execution_session
+    record_execution_session(execution_id, _cron_session_id)
     logger.info("Running job '%s' (ID: %s)", job_name, job_id)
     logger.info("Prompt: %s", prompt[:100])
 
@@ -2660,11 +2666,11 @@ def run_job(
         from cron.scheduler_detached_worker import defer_teardown_to_running_worker
         _worker_teardown_deferred = defer_teardown_to_running_worker(
             _worker_state.get("future"), _session_db, agent, job_id, job_name, _cron_session_id,
-            workdir=scope.workdir)
+            workdir=scope.workdir, execution_id=execution_id)
         scope.exit()
         if _session_db and not _worker_teardown_deferred:
             _finalize_cron_session(_session_db, agent, job_id, job_name, _cron_session_id,
-                                   workdir=scope.workdir)
+                                   workdir=scope.workdir, execution_id=execution_id)
         # Tear down the ephemeral agent or the gateway leaks fds per tick (EMFILE). With deferred
         # teardown, hand the live agent back: delivery needs a live async client.
         # Release subprocesses, terminal sandboxes, browser daemons, and the main OpenAI/httpx client held

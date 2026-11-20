@@ -109,6 +109,10 @@ def run_canonical_job(job, *, extra_prompt=None, cancel_event=None, execution_id
                 raise
         record['receipt'] = receipt
         await save()
+        # The ledger row names the session this fire runs in (the owner's ``cron:<job>:<id>`` chat),
+        # so a reader finds the run's transcript by execution id instead of parsing titles.
+        from cron.executions import record_execution_session
+        await asyncio.to_thread(record_execution_session, request_id, receipt.get('session_id'))
         delay, progress = .1, None
         while True:
             if cancel_event is not None and cancel_event.is_set():

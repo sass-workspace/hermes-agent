@@ -514,3 +514,208 @@ def test_history_orders_by_instant_across_dst_fall_back(monkeypatch, tmp_path):
     ]
     page = executions.list_executions(job_id="dst-job", before_claimed_at=later["claimed_at"])
     assert [r["id"] for r in page] == [earlier["id"]]
+
+
+# --- session recorded per attempt (Iris: routine results by execution, not by title) -----------
+
+def test_execution_records_its_session(monkeypatch, tmp_path):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    record = executions.create_execution("job-s", source="cron")
+    assert record["session_id"] is None
+
+    assert executions.set_execution_session(record["id"], "cron-sess-1") is True
+    assert executions.get_execution(record["id"])["session_id"] == "cron-sess-1"
+    # Same value again is still a success (idempotent), and a missing row is not.
+    assert executions.set_execution_session(record["id"], "cron-sess-1") is True
+    assert executions.set_execution_session("missing", "x") is False
+    assert executions.set_execution_session(record["id"], "") is False
+
+    # Metadata only: a terminal row still moves to its compression tip.
+    executions.mark_execution_running(record["id"])
+    executions.finish_execution(record["id"], success=True)
+    assert executions.set_execution_session(record["id"], "cron-sess-tip") is True
+    [listed] = executions.list_executions(job_id="job-s")
+    assert listed["status"] == "completed"
+    assert listed["session_id"] == "cron-sess-tip"
+
+
+def test_record_execution_session_never_raises(monkeypatch, tmp_path):
+    executions = _point_ledger(monkeypatch, tmp_path)
+
+    def boom(*_a, **_k):
+        raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(executions, "set_execution_session", boom)
+    executions.record_execution_session("exec", "sess")  # no exception
+    executions.record_execution_session(None, "sess")
+
+
+def test_ledger_without_session_column_gains_it(monkeypatch, tmp_path):
+    """A ledger written by an older build opens with the new column, rows intact."""
+    path = tmp_path / "cron" / "executions.db"
+    path.parent.mkdir(parents=True)
+    conn = sqlite3.connect(path)
+    conn.execute(
+        """CREATE TABLE executions (
+             id TEXT PRIMARY KEY, job_id TEXT NOT NULL, source TEXT NOT NULL,
+             process_id TEXT NOT NULL, pid INTEGER NOT NULL, process_started_at INTEGER,
+             status TEXT NOT NULL CHECK(status IN
+               ('claimed','running','completed','failed','unknown','cancelled','missed')),
+             handoff_pending INTEGER NOT NULL DEFAULT 0, handoff_started_at REAL,
+             claimed_at TEXT NOT NULL, started_at TEXT, finished_at TEXT, error TEXT,
+             delivery_outcome TEXT, scheduled_instant TEXT, progress_at TEXT)"""
+    )
+    conn.execute(
+        "INSERT INTO executions (id, job_id, source, process_id, pid, status, claimed_at) "
+        "VALUES ('old', 'job-o', 'cron', 'p', 1, 'completed', '2026-11-01T00:00:00+00:00')"
+    )
+    conn.commit()
+    conn.close()
+    executions = _point_ledger(monkeypatch, tmp_path)
+
+    old = executions.get_execution("old")
+    assert old["session_id"] is None
+    assert executions.set_execution_session("old", "sess-old") is True
+    assert executions.get_execution("old")["session_id"] == "sess-old"
+
+
+def test_finalize_moves_the_row_to_the_compression_tip(monkeypatch, tmp_path):
+    from unittest.mock import MagicMock
+
+    from cron import scheduler
+
+    executions = _point_ledger(monkeypatch, tmp_path)
+    record = executions.create_execution("job-c", source="cron")
+    executions.set_execution_session(record["id"], "cron-root")
+    fake_db = MagicMock()
+    fake_db.get_compression_tip.side_effect = lambda sid: "cron-root-tip"
+    fake_db.session_lifecycle_statuses.return_value = {}
+    monkeypatch.setattr(scheduler, "_set_cron_session_title", lambda *_a, **_k: True)
+
+    scheduler._finalize_cron_session(fake_db, None, "job-c", "Job C", "cron-root",
+                                     execution_id=record["id"])
+
+    assert executions.get_execution(record["id"])["session_id"] == "cron-root-tip"
+    fake_db.end_session.assert_called_once_with("cron-root-tip", "cron_complete")
+
+
+def test_finalize_without_compression_keeps_the_session(monkeypatch, tmp_path):
+    from unittest.mock import MagicMock
+
+    from cron import scheduler
+
+    executions = _point_ledger(monkeypatch, tmp_path)
+    record = executions.create_execution("job-n", source="cron")
+    executions.set_execution_session(record["id"], "cron-root")
+    fake_db = MagicMock()
+    fake_db.get_compression_tip.side_effect = lambda sid: sid
+    fake_db.session_lifecycle_statuses.return_value = {}
+    monkeypatch.setattr(scheduler, "_set_cron_session_title", lambda *_a, **_k: True)
+
+    scheduler._finalize_cron_session(fake_db, None, "job-n", "Job N", "cron-root",
+                                     execution_id=record["id"])
+
+    assert executions.get_execution(record["id"])["session_id"] == "cron-root"
+
+
+def test_canonical_fire_records_the_owner_session_at_the_receipt(tmp_path, monkeypatch):
+    """The firer journals the owner's receipt ``{session_id, admission_id}``; the ledger row carries
+    that session id, the ``cron:<job>:<execution>`` chat the run's transcript lives in."""
+    import asyncio
+    import threading
+    from types import SimpleNamespace
+
+    from cron import executions as executions_mod
+    from cron import jobs, scheduler
+    from cron.executions import create_execution, get_execution, mark_execution_running
+    from cron.scheduler_authority import run_canonical_job
+    from gateway import run, session_cron
+    from gateway.config import GatewayConfig, Platform
+    from gateway.session import SessionStore
+    from gateway.session_authority import SessionAuthority
+    from gateway.session_contract import SessionRef
+    from gateway.session_local_recovery import local_adapter_map
+    from hermes_state import SessionDB
+    from hermes_state_runtime import begin_runtime_epoch, claim_session_input, settle_session_input
+
+    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
+    monkeypatch.setattr(executions_mod, 'EXECUTIONS_FILE', tmp_path / 'cron' / 'executions.db')
+    monkeypatch.setattr(jobs, 'get_job', lambda jid: {'id': jid, 'prompt': 'p', 'model': 'm'})
+    monkeypatch.setattr(run, '_load_gateway_config', lambda: {'model': {}, 'platform_toolsets': {'cli': []}})
+    execution = create_execution('job', source='cron')
+    mark_execution_running(execution['id'])
+    db = SessionDB(tmp_path / 'state.db')
+    runner = SimpleNamespace(_draining=False, session_store=SessionStore(tmp_path / 'sessions', GatewayConfig()),
+                             adapters={})
+    authority = SessionAuthority(runner, profile_id=str(tmp_path), instance_id='test', db=db,
+                                 epoch=begin_runtime_epoch(db, instance_id='test'))
+    runner.session_authority = authority
+    admitted = threading.Event()
+    monkeypatch.setattr(authority, '_schedule', lambda ref: admitted.set())
+    monkeypatch.setattr(scheduler, 'run_job',
+                        lambda job, *, extra_prompt, execution_id, cancel_event: (True, 'doc', 'answer', None))
+
+    async def probe():
+        session_cron.bind_owner(authority)
+        try:
+            firer = asyncio.create_task(asyncio.to_thread(run_canonical_job, {'id': 'job'},
+                                                          execution_id=execution['id']))
+            assert await asyncio.to_thread(admitted.wait, 10), firer
+            sid = next(iter(authority.sessions))
+            row = claim_session_input(db, epoch=authority.epoch, session_id=sid)
+            policy = local_adapter_map(authority)[Platform.LOCAL].policies[sid]
+            await session_cron.execute(authority, SessionRef(authority.profile_id, sid), row, policy)
+            settle_session_input(db, epoch=authority.epoch, admission_id=row['admission_id'],
+                                 generation=row['generation'], outcome='completed',
+                                 result={'result': {'cron_result': [True, 'doc', 'answer', None]}, 'usage': {}})
+            await asyncio.wait_for(firer, 10)
+            return sid
+        finally:
+            session_cron.unbind_owner(authority)
+
+    try:
+        sid = asyncio.run(probe())
+    finally:
+        db.close()
+    assert sid
+    assert get_execution(execution['id'])['session_id'] == sid
+
+
+def test_run_job_records_the_session_it_runs_in(tmp_path, monkeypatch):
+    """The owner-side ``run_job`` books its session id on the execution row before the agent
+    starts (it also covers runs whose firer never saw a receipt)."""
+    from unittest.mock import MagicMock, patch
+
+    from cron import executions as executions_mod
+    from cron.executions import _transaction, create_execution, get_execution
+    from tests.cron.test_scheduler import _run_owned_job
+
+    monkeypatch.setattr(executions_mod, 'EXECUTIONS_FILE', tmp_path / 'cron' / 'executions.db')
+    execution = create_execution('test-job', source='cron')
+    # The owner bridge admits under request id ``cron-owner-request``: that IS the row id.
+    with _transaction() as conn:
+        conn.execute("UPDATE executions SET id='cron-owner-request' WHERE id=?", (execution['id'],))
+    seen = {}
+
+    def construct(*_a, session_id, **_k):
+        seen['at_construct'] = get_execution('cron-owner-request')['session_id']
+        agent = MagicMock()
+        agent.run_conversation.return_value = {"final_response": "ok"}
+        return agent
+
+    fake_db = MagicMock()
+    fake_db.get_compression_tip.side_effect = lambda sid: sid
+    with patch("cron.scheduler._hermes_home", tmp_path), \
+         patch("cron.scheduler_delivery._resolve_origin", return_value=None), \
+         patch("hermes_cli.env_loader.load_hermes_dotenv"), \
+         patch("hermes_cli.env_loader.reset_secret_source_cache"), \
+         patch("hermes_state_registry.acquire", return_value=fake_db), \
+         patch("hermes_cli.runtime_provider.resolve_runtime_provider", return_value={
+             "api_key": "k", "base_url": "https://example.invalid/v1",
+             "provider": "openrouter", "api_mode": "chat_completions"}), \
+         patch("run_agent.AIAgent", side_effect=construct):
+        ok, _doc, final, _err = _run_owned_job({"id": "test-job", "name": "t", "prompt": "hello"},
+                                               tmp_path, fake_db)
+    assert ok and final == "ok"
+    assert seen['at_construct'] == 'canonical-cron-session'
+    assert get_execution('cron-owner-request')['session_id'] == 'canonical-cron-session'

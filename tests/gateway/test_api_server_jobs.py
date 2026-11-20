@@ -618,3 +618,160 @@ class TestCronPromptScanParity:
                 assert "Blocked" in data["error"] or "threat" in data["error"].lower()
                 mock_create.assert_not_called()
 
+
+
+# ---------------------------------------------------------------------------
+# Executions: each attempt with the session it ran in (Iris routine results)
+# ---------------------------------------------------------------------------
+
+def _executions_app(adapter: APIServerAdapter) -> web.Application:
+    app = _create_app(adapter)
+    app.router.add_get("/api/jobs/{job_id}/executions", adapter._handle_list_job_executions)
+    return app
+
+
+def _ledger(monkeypatch, tmp_path):
+    from cron import executions
+
+    monkeypatch.setattr(executions, "EXECUTIONS_FILE", tmp_path / "cron" / "executions.db")
+    return executions
+
+
+class TestJobExecutions:
+    @pytest.mark.asyncio
+    async def test_lists_newest_first_with_sessions(self, adapter, monkeypatch, tmp_path):
+        executions = _ledger(monkeypatch, tmp_path)
+        first = executions.create_execution(VALID_JOB_ID, source="cron")
+        executions.set_execution_session(first["id"], "cron-sess-a")
+        executions.mark_execution_running(first["id"])
+        executions.finish_execution(first["id"], success=True)
+        second = executions.create_execution(VALID_JOB_ID, source="cron")
+        executions.create_execution("other0job000", source="cron")
+        app = _executions_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True):
+                resp = await cli.get(f"/api/jobs/{VALID_JOB_ID}/executions")
+                assert resp.status == 200
+                data = await resp.json()
+        assert list(data) == ["executions"]
+        rows = data["executions"]
+        assert [r["id"] for r in rows] == [second["id"], first["id"]]
+        assert set(rows[0]) == {"id", "job_id", "status", "started_at", "finished_at", "session_id"}
+        assert rows[0]["session_id"] is None and rows[0]["status"] == "claimed"
+        assert rows[1]["session_id"] == "cron-sess-a"
+        assert rows[1]["status"] == "completed"
+        assert rows[1]["started_at"] and rows[1]["finished_at"]
+        assert all(r["job_id"] == VALID_JOB_ID for r in rows)
+
+    @pytest.mark.asyncio
+    async def test_limit_defaults_to_20_and_caps_at_100(self, adapter, monkeypatch, tmp_path):
+        executions = _ledger(monkeypatch, tmp_path)
+        for _ in range(105):
+            executions.create_execution(VALID_JOB_ID, source="cron")
+        app = _executions_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True):
+                default = await (await cli.get(f"/api/jobs/{VALID_JOB_ID}/executions")).json()
+                capped = await (await cli.get(f"/api/jobs/{VALID_JOB_ID}/executions?limit=500")).json()
+                three = await (await cli.get(f"/api/jobs/{VALID_JOB_ID}/executions?limit=3")).json()
+                floor = await (await cli.get(f"/api/jobs/{VALID_JOB_ID}/executions?limit=0")).json()
+                bad = await cli.get(f"/api/jobs/{VALID_JOB_ID}/executions?limit=abc")
+        assert len(default["executions"]) == 20
+        assert len(capped["executions"]) == 100
+        assert len(three["executions"]) == 3
+        assert len(floor["executions"]) == 1
+        assert bad.status == 400
+
+    @pytest.mark.asyncio
+    async def test_unknown_job_is_an_empty_list(self, adapter, monkeypatch, tmp_path):
+        _ledger(monkeypatch, tmp_path)
+        app = _executions_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True):
+                resp = await cli.get(f"/api/jobs/{VALID_JOB_ID}/executions")
+                assert resp.status == 200
+                assert await resp.json() == {"executions": []}
+
+    @pytest.mark.asyncio
+    async def test_invalid_job_id_auth_and_unavailable(self, adapter, auth_adapter, monkeypatch, tmp_path):
+        _ledger(monkeypatch, tmp_path)
+        async with TestClient(TestServer(_executions_app(adapter))) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True):
+                assert (await cli.get("/api/jobs/not-a-hex!/executions")).status == 400
+            with patch(f"{_MOD}._CRON_AVAILABLE", False):
+                assert (await cli.get(f"/api/jobs/{VALID_JOB_ID}/executions")).status == 501
+        async with TestClient(TestServer(_executions_app(auth_adapter))) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True):
+                assert (await cli.get(f"/api/jobs/{VALID_JOB_ID}/executions")).status == 401
+                ok = await cli.get(f"/api/jobs/{VALID_JOB_ID}/executions",
+                                   headers={"Authorization": "Bearer sk-secret"})
+                assert ok.status == 200
+
+    def test_route_is_in_the_table(self, adapter):
+        assert ("GET", "/api/jobs/{job_id}/executions",
+                adapter._handle_list_job_executions) in adapter._http_route_table()
+
+    @pytest.mark.asyncio
+    async def test_list_jobs_carries_the_session_on_latest_execution(self, adapter, monkeypatch, tmp_path):
+        """``GET /api/jobs`` reads ``latest_execution``/``live_execution`` with ``SELECT *``."""
+        from cron import jobs
+
+        executions = _ledger(monkeypatch, tmp_path)
+        row = executions.create_execution(VALID_JOB_ID, source="cron")
+        executions.set_execution_session(row["id"], "cron-sess-live")
+        monkeypatch.setattr(jobs, "load_jobs", lambda *a, **k: [dict(SAMPLE_JOB)])
+        app = _executions_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True), \
+                 patch(f"{_MOD}._cron_list", jobs.list_jobs):
+                data = await (await cli.get("/api/jobs?include_disabled=true")).json()
+        [job] = data["jobs"]
+        assert job["latest_execution"]["session_id"] == "cron-sess-live"
+        assert job["live_execution"]["session_id"] == "cron-sess-live"
+
+
+@pytest.mark.asyncio
+async def test_executions_route_serves_the_prefixed_profiles_ledger(tmp_path, monkeypatch, request):
+    """``/p/<profile>/api/jobs/{id}/executions`` reads THAT profile's ledger (the prefix
+    middleware scopes the home; the ledger resolves its path per transaction)."""
+    from cron import executions
+    from gateway.config import GatewayConfig
+    from hermes_cli.profiles import get_profile_dir
+
+    root = tmp_path / "root"
+    for home in (root, root / "profiles" / "worker"):
+        home.mkdir(parents=True, exist_ok=True)
+        (home / "config.yaml").write_text("{}\n", encoding="utf-8")
+    # A named profile answers only its own key, never the default listener's.
+    (root / "profiles" / "worker" / ".env").write_text("API_SERVER_KEY=worker-profile-key-123456\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    monkeypatch.setattr(executions, "EXECUTIONS_FILE", None)
+    from agent import secret_scope as ss
+    ss.set_multiplex_active(True)
+    request.addfinalizer(lambda: ss.set_multiplex_active(False))
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={"key": "test-key"}))
+    adapter.gateway_runner = SimpleNamespace(config=GatewayConfig(multiplex_profiles=True))
+
+    with adapter._profile_scope("worker"):
+        row = executions.create_execution(VALID_JOB_ID, source="cron")
+        executions.set_execution_session(row["id"], "worker-cron-sess")
+    assert (get_profile_dir("worker") / "cron" / "executions.db").exists()
+
+    app = web.Application(middlewares=[adapter._make_profile_prefix_middleware()])
+    for method, path, handler in adapter._http_route_table():
+        if path.startswith("/api/jobs"):
+            app.router.add_route(method, path, handler)
+            app.router.add_route(method, f"/p/{{profile}}{path}", handler)
+    async with TestClient(TestServer(app)) as cli:
+        with patch(f"{_MOD}._CRON_AVAILABLE", True):
+            wrong = await cli.get(f"/p/worker/api/jobs/{VALID_JOB_ID}/executions",
+                                  headers={"Authorization": "Bearer test-key"})
+            assert wrong.status == 401
+            prefixed = await cli.get(f"/p/worker/api/jobs/{VALID_JOB_ID}/executions",
+                                     headers={"Authorization": "Bearer worker-profile-key-123456"})
+            assert prefixed.status == 200
+            body = await prefixed.json()
+            plain = await (await cli.get(f"/api/jobs/{VALID_JOB_ID}/executions",
+                                         headers={"Authorization": "Bearer test-key"})).json()
+    assert [(r["id"], r["session_id"]) for r in body["executions"]] == [(row["id"], "worker-cron-sess")]
+    assert plain == {"executions": []}

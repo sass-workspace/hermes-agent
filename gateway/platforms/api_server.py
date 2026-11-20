@@ -1591,7 +1591,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             ("DELETE", "/api/jobs/{job_id}", self._handle_delete_job),
             ("POST", "/api/jobs/{job_id}/pause", self._handle_pause_job),
             ("POST", "/api/jobs/{job_id}/resume", self._handle_resume_job),
-            ("POST", "/api/jobs/{job_id}/run", self._handle_run_job)]
+            ("POST", "/api/jobs/{job_id}/run", self._handle_run_job),
+            ("GET", "/api/jobs/{job_id}/executions", self._handle_list_job_executions)]
         routes.extend(_room_grants._http_routes(self))
         routes.extend(_api_runs._http_routes(self))
         if _CRON_AVAILABLE:
@@ -3422,6 +3423,11 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
     async def _handle_resume_job(self, request: web.Request) -> web.Response:
         """POST /api/jobs/{job_id}/resume — resume a paused cron job."""
         return await self._job_lookup_or_mutate(request, _cron_resume, notify=True)
+
+    async def _handle_list_job_executions(self, request: web.Request) -> web.Response:
+        """GET /api/jobs/{job_id}/executions — the job's attempts, newest first, with sessions."""
+        from gateway.platforms.api_server_cron_jobs import handle_list_executions
+        return await handle_list_executions(self, request)
 
     async def _handle_run_job(self, request: web.Request) -> web.Response:
         """POST /api/jobs/{job_id}/run — trigger immediate execution."""

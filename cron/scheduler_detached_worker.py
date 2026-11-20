@@ -32,7 +32,7 @@ def _close_late_session_db_result(future: concurrent.futures.Future) -> None:
 
 def defer_teardown_to_running_worker(
     future: Optional[concurrent.futures.Future], session_db, agent, job_id: str, job_name: str,
-    cron_session_id: str, workdir: Optional[str] = None,
+    cron_session_id: str, workdir: Optional[str] = None, execution_id: Optional[str] = None,
 ) -> bool:
     """Return True when the worker is still running and its Future will finalize the session
     and tear the agent down on completion; False when the caller must do it now."""
@@ -44,7 +44,7 @@ def defer_teardown_to_running_worker(
         try:
             if session_db:
                 _finalize_cron_session(session_db, agent, job_id, job_name, cron_session_id,
-                                       workdir=workdir)
+                                       workdir=workdir, execution_id=execution_id)
         finally:
             _teardown_cron_agent(agent, job_id)
 

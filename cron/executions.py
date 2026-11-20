@@ -99,6 +99,9 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
     add_column_if_missing(conn, "executions", "delivery_outcome", "delivery_outcome TEXT")
     add_column_if_missing(conn, "executions", "scheduled_instant", "scheduled_instant TEXT")
     add_column_if_missing(conn, "executions", "progress_at", "progress_at TEXT")
+    # The session the attempt's agent turn ran in (its compression tip once finalized), so a
+    # reader maps a run to its transcript without parsing session titles.
+    add_column_if_missing(conn, "executions", "session_id", "session_id TEXT")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_executions_occurrence "
         "ON executions(job_id, scheduled_instant) WHERE status='completed'"
@@ -280,6 +283,35 @@ def set_execution_occurrence(execution_id: str, instant: Optional[str]) -> None:
         )
         if cur.rowcount != 1:
             raise RuntimeError("Cron occurrence could not be bound before dispatch")
+
+
+def set_execution_session(execution_id: str, session_id: Optional[str]) -> bool:
+    """Record the session an attempt ran in. Metadata only: it is not part of the attempt's
+    outcome, so it may still be set (or moved to a compression tip) after the row turned terminal.
+    Best effort: returns False when the row is gone or the id is empty, never raises on a
+    missing row."""
+    if not execution_id or not session_id:
+        return False
+    with _transaction() as conn:
+        cur = conn.execute(
+            "UPDATE executions SET session_id=? WHERE id=? AND COALESCE(session_id, '') != ?",
+            (str(session_id), str(execution_id), str(session_id)),
+        )
+        changed = cur.rowcount == 1
+        if not changed:
+            return conn.execute(
+                "SELECT 1 FROM executions WHERE id=?", (str(execution_id),)).fetchone() is not None
+    return True
+
+
+def record_execution_session(execution_id: Optional[str], session_id: Optional[str]) -> None:
+    """``set_execution_session`` for run paths: a ledger failure must never fail the run."""
+    if not execution_id or not session_id:
+        return
+    try:
+        set_execution_session(execution_id, session_id)
+    except Exception as exc:  # noqa: BLE001 - metadata only
+        logger.debug("cron execution %s: failed to record session: %s", execution_id, exc)
 
 
 def mark_execution_handoff_pending(execution_id: str) -> Optional[dict[str, Any]]:
