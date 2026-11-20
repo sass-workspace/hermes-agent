@@ -146,6 +146,19 @@ def get_current_turn_id(default: str = "") -> str:
     return _approval_turn_id.get() or default
 
 
+def get_current_session_id(default: str = "") -> str:
+    """The Hermes session id of the executing tool call: the id bound around the dispatch
+    (``set_current_observability_context``), else the session-scoped ``HERMES_SESSION_ID``
+    (contextvar first, process env last), else *default*."""
+    if session_id := _approval_session_id.get():
+        return session_id
+    try:
+        from gateway.session_context import get_session_env
+        return get_session_env("HERMES_SESSION_ID", default) or default
+    except Exception:
+        return os.getenv("HERMES_SESSION_ID", default) or default
+
+
 def get_current_session_key(default: str = "default") -> str:
     """Return the active session key: approval contextvar → session_context → os.environ."""
     if session_key := _approval_session_key.get():

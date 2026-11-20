@@ -84,6 +84,9 @@ def stage_write(subsystem: str, payload: dict[str, Any], *, summary: str, origin
         "id": pid, "subsystem": subsystem, "action": payload.get("action", ""),
         "summary": (summary or "").strip(), "origin": origin or "foreground",
         "created_at": time.time(), "payload": payload,
+        # Where the write came from, so a reviewer names its run instead of guessing by time.
+        # Added keys only: readers that predate them ignore them.
+        "session_id": current_session_id(), "run_kind": current_run_kind(),
     }
     try:
         atomic_json_write(_pending_path(subsystem, pid), record)
@@ -150,6 +153,25 @@ def current_origin() -> str:
         from tools.skill_provenance import get_current_write_origin
         return get_current_write_origin()
     return "foreground"
+
+
+def current_session_id() -> Optional[str]:
+    """The session the staging tool call runs in, or ``None`` when none is bound."""
+    with suppress(Exception):
+        from tools.approval_context import get_current_session_id
+        return get_current_session_id() or None
+    return None
+
+
+def current_run_kind() -> str:
+    """``cron`` inside a cron execution, ``background_review`` in the review fork, else ``chat``."""
+    with suppress(Exception):
+        from cron.execution_identity import current_cron_execution
+        if current_cron_execution() is not None:
+            return "cron"
+    if current_origin() == "background_review":
+        return "background_review"
+    return "chat"
 
 
 # --- Gate decision ---
