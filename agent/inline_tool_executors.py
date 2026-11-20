@@ -306,7 +306,15 @@ _RAW_INLINE_TOOL_EXECUTORS: dict[str, InlineToolExecutor] = {
 
 def _coerced(name: str, executor: InlineToolExecutor) -> InlineToolExecutor:
     def _exec(agent, args: dict, ctx: InlineToolContext) -> Any:
-        return executor(agent, coerce_tool_args(name, args), ctx)
+        # Inline tools skip model_tools' dispatch binding: bind the agent's own session id so a
+        # write staged here (memory) names the conversation it came from — for the review fork the
+        # reviewed conversation, whose id the fork adopts.
+        from tools.approval_context import bind_current_session_id, reset_current_session_id
+        token = bind_current_session_id(str(getattr(agent, "session_id", "") or ""))
+        try:
+            return executor(agent, coerce_tool_args(name, args), ctx)
+        finally:
+            reset_current_session_id(token)
     return _exec
 
 
